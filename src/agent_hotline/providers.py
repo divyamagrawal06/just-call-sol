@@ -85,5 +85,6 @@ def create_call_provider(settings: Settings) -> CallProvider:
 
 def _initial_message(request: ContactHumanRequest) -> str:
     return (
-        f"Hi, this is Agent Hotline. {request.summary} I need your decision: {request.question}"
+        "Wassup Divyam — it's your agent on the line. "
+        f"{request.summary} I need your call on one thing: {request.question}"
     )[:1200]

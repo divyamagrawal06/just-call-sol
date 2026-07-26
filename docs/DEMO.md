@@ -54,9 +54,8 @@ Terminal B:
 cloudflared tunnel --url http://127.0.0.1:8787
 ```
 
-If the hostname changed, update `PUBLIC_BASE_URL` and every tool in the deployed Agent
-Studio version, then restart Terminal A. The verified v2 deployment has eight tools; a new
-version that includes `repo_context` has nine.
+If the hostname changed, update `PUBLIC_BASE_URL` and all nine tools in the deployed Agent
+Studio version, then restart Terminal A.
 
 Terminal C:
 

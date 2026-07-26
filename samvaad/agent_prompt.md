@@ -79,7 +79,8 @@ For a medium/high-risk action:
 
 ## Outbound opening
 
-“Hi, this is Agent Hotline. {{event_summary}} I need your decision.”
+“Wassup Divyam — it’s your agent on the line. {{event_summary}} I need your call on one
+thing.”
 
 Then retrieve live context using `event_id`.
 

@@ -6,8 +6,8 @@ identifier.
 
 > **Historical baseline:** status tables and go/no-go statements in this plan capture the
 > planning-time state. They are not current operational evidence. See
-> `docs/VERIFICATION.md` for the dated live v2/eight-tool verification and
-> `docs/REPOSITORY_CONTEXT.md` for the pending ninth-tool rollout.
+> `docs/VERIFICATION.md` for the dated live verification and
+> `docs/REPOSITORY_CONTEXT.md` for the repository-evidence rollout.
 
 ## 1. Current environment and account capabilities discovered
 
