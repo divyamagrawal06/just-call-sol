@@ -478,6 +478,54 @@ def test_tool_manifest_has_all_endpoints_but_no_configured_secrets() -> None:
     assert "never-print-this-api-key" not in rendered
     assert "246810" not in rendered
     assert "{{ephemeral_confirmation_pin}}" in rendered
+    prepare_action = next(tool for tool in manifest.tools if tool.name == "prepare_action")
+    assert prepare_action.request_body_example == {
+        "event_id": "{{event_id}}",
+        "action_type": "{{action_type}}",
+        "action_reference": "{{action_reference}}",
+        "action_instruction": "{{action_instruction}}",
+        "action_turn_id": "{{action_turn_id}}",
+        "action_task": "{{action_task}}",
+        "action_cwd": ".",
+        "action_confirmed_thread_id": "{{action_confirmed_thread_id}}",
+        "action_target_ru": 0,
+        "action_pause_reason": "{{action_pause_reason}}",
+    }
+    assert set(prepare_action.input_bindings) == set(prepare_action.request_body_example)
+    assert prepare_action.input_bindings["event_id"].source == "Agent variable"
+    assert prepare_action.input_bindings["action_type"].source == "Let the agent decide"
+    assert prepare_action.input_bindings["action_cwd"].source == "Fixed value"
+    assert prepare_action.input_bindings["action_cwd"].fixed_value == "."
+    assert prepare_action.input_bindings["action_target_ru"].json_type == "integer"
+    for field in (
+        "action_reference",
+        "action_instruction",
+        "action_turn_id",
+        "action_task",
+        "action_confirmed_thread_id",
+        "action_target_ru",
+        "action_pause_reason",
+    ):
+        assert prepare_action.input_bindings[field].source == "Let the agent decide"
+    for undeclared_scope_field in (
+        "parameters",
+        "workspace_ref",
+        "thread_id",
+        "commit_or_state_hash",
+    ):
+        assert undeclared_scope_field not in prepare_action.request_body_example
+        assert undeclared_scope_field not in prepare_action.input_bindings
+    action_description = prepare_action.input_bindings["action_type"].description
+    for action_type in (
+        "thread.instruct",
+        "thread.interrupt",
+        "thread.spawn_root",
+        "thread.archive",
+        "demo.increase_db_ru_limit",
+        "demo.pause_deployment",
+        "demo.terminate_batch_runs",
+    ):
+        assert action_type in action_description
     record_decision = next(tool for tool in manifest.tools if tool.name == "record_decision")
     assert record_decision.request_body_example["outcome"] == "{{decision_outcome}}"
     assert record_decision.request_body_example == {
@@ -518,6 +566,124 @@ def test_tool_manifest_has_all_endpoints_but_no_configured_secrets() -> None:
     assert "Request value sources:" in markdown
     assert "Let the agent decide" in markdown
     assert "curl --request POST" in markdown
+
+
+@pytest.mark.parametrize(
+    ("action_type", "field_values", "expected_parameters"),
+    (
+        (
+            "thread.instruct",
+            {
+                "action_reference": "training-run",
+                "action_instruction": "Stop all active batch work.",
+            },
+            {
+                "reference": "training-run",
+                "instruction": "Stop all active batch work.",
+            },
+        ),
+        (
+            "thread.interrupt",
+            {
+                "action_reference": "training-run",
+                "action_turn_id": "turn-7",
+            },
+            {"reference": "training-run", "turn_id": "turn-7"},
+        ),
+        (
+            "thread.spawn_root",
+            {"action_task": "Investigate the database incident."},
+            {"task": "Investigate the database incident.", "cwd": "."},
+        ),
+        (
+            "thread.archive",
+            {
+                "action_reference": "old-task",
+                "action_confirmed_thread_id": "thread-123",
+            },
+            {"reference": "old-task", "confirmed_thread_id": "thread-123"},
+        ),
+        (
+            "demo.increase_db_ru_limit",
+            {"action_target_ru": "800"},
+            {"target_ru": 800},
+        ),
+        (
+            "demo.pause_deployment",
+            {"action_pause_reason": "incident-response"},
+            {"reason": "incident-response"},
+        ),
+        ("demo.terminate_batch_runs", {}, {}),
+    ),
+)
+def test_flat_samvaad_action_fields_map_to_strict_backend_parameters(
+    action_type: str,
+    field_values: dict[str, object],
+    expected_parameters: dict[str, object],
+) -> None:
+    payload: dict[str, object] = {
+        "event_id": "event-1",
+        "action_type": action_type,
+        "action_reference": "",
+        "action_instruction": "",
+        "action_turn_id": "",
+        "action_task": "",
+        "action_cwd": ".",
+        "action_confirmed_thread_id": "",
+        "action_target_ru": 0,
+        "action_pause_reason": "",
+        **field_values,
+    }
+
+    request = PrepareActionRequest.model_validate(payload)
+
+    assert request.parameters == expected_parameters
+    assert request.workspace_ref is None
+    assert request.thread_id is None
+    assert request.commit_or_state_hash is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {
+            "event_id": "event-1",
+            "action_type": "thread.spawn_root",
+            "action_task": "Investigate.",
+            "action_cwd": "C:/arbitrary/path",
+        },
+        {
+            "event_id": "event-1",
+            "action_type": "thread.spawn_root",
+            "action_cwd": ".",
+        },
+        {
+            "event_id": "event-1",
+            "action_type": "thread.interrupt",
+            "action_reference": "task-1",
+            "action_task": "Unrelated injected task.",
+            "action_cwd": ".",
+        },
+        {
+            "event_id": "event-1",
+            "action_type": "demo.increase_db_ru_limit",
+            "action_target_ru": 400,
+            "action_cwd": ".",
+        },
+        {
+            "event_id": "event-1",
+            "action_type": "thread.spawn_root",
+            "parameters": {"task": "Legacy task", "cwd": "."},
+            "action_task": "Conflicting task.",
+            "action_cwd": ".",
+        },
+    ),
+)
+def test_flat_samvaad_action_fields_reject_unsafe_or_ambiguous_payloads(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        PrepareActionRequest.model_validate(payload)
 
 
 def test_development_demo_tool_manifest_omits_authorization_everywhere() -> None:

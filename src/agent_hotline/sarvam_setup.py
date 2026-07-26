@@ -106,6 +106,7 @@ class SamvaadInputBinding(BaseModel):
     source: Literal["Agent variable", "Let the agent decide", "Fixed value"]
     description: str = Field(min_length=1, max_length=500)
     fixed_value: Any | None = None
+    json_type: Literal["string", "integer", "boolean", "array", "object"] | None = None
 
 
 class SamvaadToolDefinition(BaseModel):
@@ -452,16 +453,23 @@ def build_samvaad_tool_manifest(
         ),
         (
             "prepare_action",
-            "Prepare a registered action and receive its exact confirmation readback.",
+            (
+                "Prepare one allowlisted action from typed fields and receive its exact "
+                "confirmation readback."
+            ),
             "during_conversation",
             "/v1/sarvam/tools/prepare-action",
             {
                 "event_id": "{{event_id}}",
                 "action_type": "{{action_type}}",
-                "parameters": {},
-                "workspace_ref": "{{workspace_ref}}",
-                "thread_id": "{{thread_id}}",
-                "commit_or_state_hash": "{{commit_or_state_hash}}",
+                "action_reference": "{{action_reference}}",
+                "action_instruction": "{{action_instruction}}",
+                "action_turn_id": "{{action_turn_id}}",
+                "action_task": "{{action_task}}",
+                "action_cwd": ".",
+                "action_confirmed_thread_id": "{{action_confirmed_thread_id}}",
+                "action_target_ru": 0,
+                "action_pause_reason": "{{action_pause_reason}}",
             },
             {
                 "action_id": "prepared_action_id",
@@ -557,6 +565,94 @@ def build_samvaad_tool_manifest(
         )
         for name, description, run_phase, path, body, response_variables in specifications
     ]
+    prepare_index = next(index for index, tool in enumerate(tools) if tool.name == "prepare_action")
+    tools[prepare_index] = tools[prepare_index].model_copy(
+        update={
+            "input_bindings": {
+                "event_id": SamvaadInputBinding(
+                    source="Agent variable",
+                    json_type="string",
+                    description="Use the event_id created for this exact live call.",
+                ),
+                "action_type": SamvaadInputBinding(
+                    source="Let the agent decide",
+                    json_type="string",
+                    description=(
+                        "Choose exactly one: thread.instruct, thread.interrupt, "
+                        "thread.spawn_root, thread.archive, demo.increase_db_ru_limit, "
+                        "demo.pause_deployment, or demo.terminate_batch_runs."
+                    ),
+                ),
+                "action_reference": SamvaadInputBinding(
+                    source="Let the agent decide",
+                    json_type="string",
+                    description=(
+                        "Required only for thread.instruct, thread.interrupt, and "
+                        "thread.archive; use the unambiguous task reference returned by "
+                        "the thread tools. Send an empty string otherwise."
+                    ),
+                ),
+                "action_instruction": SamvaadInputBinding(
+                    source="Let the agent decide",
+                    json_type="string",
+                    description=(
+                        "Required only for thread.instruct. Send exactly the bounded "
+                        "instruction being prepared; send an empty string otherwise."
+                    ),
+                ),
+                "action_turn_id": SamvaadInputBinding(
+                    source="Let the agent decide",
+                    json_type="string",
+                    description=(
+                        "Optional active turn ID only for thread.interrupt; send an empty "
+                        "string to interrupt the selected task's current turn."
+                    ),
+                ),
+                "action_task": SamvaadInputBinding(
+                    source="Let the agent decide",
+                    json_type="string",
+                    description=(
+                        "Required only for thread.spawn_root. Send the bounded task for "
+                        "the new root agent; send an empty string otherwise."
+                    ),
+                ),
+                "action_cwd": SamvaadInputBinding(
+                    source="Fixed value",
+                    fixed_value=".",
+                    json_type="string",
+                    description=(
+                        "Keep fixed to the daemon's allowlisted current workspace. "
+                        "The voice model must never choose a filesystem path."
+                    ),
+                ),
+                "action_confirmed_thread_id": SamvaadInputBinding(
+                    source="Let the agent decide",
+                    json_type="string",
+                    description=(
+                        "Required only for thread.archive and must exactly match the "
+                        "inspected task ID. Send an empty string otherwise."
+                    ),
+                ),
+                "action_target_ru": SamvaadInputBinding(
+                    source="Let the agent decide",
+                    json_type="integer",
+                    description=(
+                        "Required only for demo.increase_db_ru_limit. Use an integer from "
+                        "401 through 10000; use 0 for every other action."
+                    ),
+                ),
+                "action_pause_reason": SamvaadInputBinding(
+                    source="Let the agent decide",
+                    json_type="string",
+                    description=(
+                        "For demo.pause_deployment choose owner-request, "
+                        "incident-response, or demo. Send empty to use owner-request; "
+                        "send empty for every other action."
+                    ),
+                ),
+            }
+        }
+    )
     record_index = next(index for index, tool in enumerate(tools) if tool.name == "record_decision")
     tools[record_index] = tools[record_index].model_copy(
         update={
@@ -702,6 +798,9 @@ def build_samvaad_tool_manifest(
             "Every outcome requires the dynamic confirmation_pin; its other dynamic "
             "decision fields are outcome and instruction, and confirmation_method is "
             "fixed to spoken_plus_dtmf.",
+            "prepare_action exposes only allowlisted typed fields. Its adapter rejects "
+            "arbitrary parameter objects, cross-action fields, and model-selected "
+            "filesystem paths before the existing readback/PIN/grant flow.",
             "Registered actions are authorized only by confirm_action's one-time grant and "
             "audited by execute_action. record_decision never grants a registered action.",
             "Never collect passwords, access keys, or one-time codes in spoken dialogue.",
@@ -757,7 +856,12 @@ def render_tool_manifest_markdown(manifest: SamvaadToolManifest) -> str:
                     if binding.source == "Fixed value"
                     else ""
                 )
-                lines.append(f"- `{field}`: **{binding.source}**{fixed} — {binding.description}")
+                value_type = (
+                    f"; JSON type `{binding.json_type}`" if binding.json_type is not None else ""
+                )
+                lines.append(
+                    f"- `{field}`: **{binding.source}**{fixed}{value_type} — {binding.description}"
+                )
         else:
             lines.append("- Follow the request body placeholders below.")
         lines.extend(

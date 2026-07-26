@@ -77,15 +77,44 @@ POST <PUBLIC_BASE_URL>/v1/sarvam/tools/prepare-action
 
 {
   "event_id": "<event_id>",
-  "action_type": "<registered action>",
-  "parameters": {},
-  "workspace_ref": "<opaque workspace ref>",
-  "thread_id": "<thread id>",
-  "commit_or_state_hash": "<current state hash>"
+  "action_type": "<agent-decided allowlisted action>",
+  "action_reference": "<agent-decided task reference, or empty>",
+  "action_instruction": "<agent-decided instruction, or empty>",
+  "action_turn_id": "<agent-decided active turn id, or empty>",
+  "action_task": "<agent-decided new root task, or empty>",
+  "action_cwd": ".",
+  "action_confirmed_thread_id": "<agent-decided exact inspected task id, or empty>",
+  "action_target_ru": "<agent-decided integer, or 0>",
+  "action_pause_reason": "<agent-decided enum, or empty>"
 }
 ```
 
 Run: during conversation, before any medium/high-risk confirmation.
+
+In Agent Studio configure `event_id` as **Agent variable**. Configure `action_type`,
+`action_reference`, `action_instruction`, `action_turn_id`, `action_task`,
+`action_confirmed_thread_id`, `action_target_ru`, and `action_pause_reason` as **Let the
+agent decide**. Configure `action_cwd` as the **Fixed value** `"."`; the model must never
+select a filesystem path. Do not add `parameters`, `workspace_ref`, `thread_id`, or
+`commit_or_state_hash` fields. The daemon binds workspace/thread scope from the live event
+and maps only these typed fields:
+
+- `thread.instruct`: `action_reference` and `action_instruction` are required.
+- `thread.interrupt`: `action_reference` is required; `action_turn_id` is optional.
+- `thread.spawn_root`: `action_task` is required and `action_cwd` stays fixed to `"."`.
+- `thread.archive`: `action_reference` and `action_confirmed_thread_id` are required.
+- `demo.increase_db_ru_limit`: `action_target_ru` is a required integer from 401–10000.
+- `demo.pause_deployment`: `action_pause_reason` is optional and restricted to
+  `owner-request`, `incident-response`, or `demo`.
+- `demo.terminate_batch_runs`: has no agent-decided parameters.
+
+Send empty strings for non-integer fields that do not apply to the selected action, and use
+`0` for an unused `action_target_ru`. The request model turns those sentinel slots into
+absence, rejects cross-action fields and arbitrary keys, and
+then passes the normalized `parameters` object to the existing strict coordinator/runbook
+validation. This flat adapter exists because Agent Studio binds HTTP request fields
+individually; it does not grant the model an arbitrary JSON object or a command surface.
+The exact readback, DTMF PIN, `confirm_action`, and one-time grant remain mandatory.
 
 ## `confirm_action`
 
