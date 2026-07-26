@@ -14,6 +14,7 @@
     "participant_lookup": "Let the agent decide from the caller's participant name, registration ID, email, or phone",
     "sheet_name": "Let the agent decide from the spoken CSV filename; default to sarvam_epoch_registration_tracker.csv"
   },
+  "response_template": "CSV lookup result: sheet_found={{sheet_found}}; sheet_name={{sheet_name}}; found={{found}}; registered={{registered}}; approval_status={{approval_status}}; verdict={{verdict}}; reason={{reason}}; gate_note={{gate_note}}.",
   "run_phase": "during_conversation",
   "authentication": "none"
 }
