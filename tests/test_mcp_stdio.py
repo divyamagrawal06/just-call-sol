@@ -48,12 +48,14 @@ async def test_stdio_server_initializes_lists_tools_and_returns_structured_failu
             listed = await session.list_tools()
             by_name = {tool.name: tool for tool in listed.tools}
             assert set(by_name) == {
+                "check_event_registration",
                 "contact_human",
                 "hotline_status",
                 "list_hotline_events",
                 "notify_human",
                 "query_repository_context",
                 "request_authentication",
+                "search_event_registrations",
             }
             assert by_name["contact_human"].inputSchema["required"] == [
                 "kind",
@@ -67,6 +69,18 @@ async def test_stdio_server_initializes_lists_tools_and_returns_structured_failu
             assert by_name["query_repository_context"].annotations is not None
             assert by_name["query_repository_context"].annotations.readOnlyHint is True
             assert "operation" in by_name["query_repository_context"].inputSchema["required"]
+            assert by_name["check_event_registration"].annotations is not None
+            assert by_name["check_event_registration"].annotations.readOnlyHint is True
+
+            registration_result = await session.call_tool(
+                "check_event_registration",
+                {"query": "SEP-26003"},
+            )
+            assert registration_result.isError is False
+            assert registration_result.structuredContent is not None
+            assert registration_result.structuredContent["verdict"] == "NO"
+            assert registration_result.structuredContent["approved"] is False
+            assert "does not match" in registration_result.structuredContent["reason"]
 
             result = await session.call_tool(
                 "contact_human",

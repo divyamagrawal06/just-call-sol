@@ -7,11 +7,13 @@ phone number, API key, callback URL, transcript, recording URL, or provider iden
 
 - The local daemon and its supervised Codex App Server child reported healthy.
 - The public HTTPS health route reached the daemon through the demo tunnel.
-- Sarvam Agent Studio version 2 was committed with all eight protected HTTP tools.
+- Sarvam Agent Studio version 4 was committed with all nine protected HTTP tools and the
+  personalized “Wassup Divyam” greeting; greeting translations were regenerated.
 - The Sarvam deployment reconciler reported one active `inbound_outbound` deployment on
-  version 2 with one bound number; a second reconciliation made no change.
-- A real outbound call connected through the CLI path, completed 11 conversational
-  messages over roughly 43 seconds, and the recipient confirmed that it worked.
+  version 4 with one bound number and the configured daily call window; a second
+  reconciliation made no change.
+- One bounded real outbound call was placed by a fresh Claude client through the installed
+  MCP tool and reached provider completion.
 - The completion callback reached the daemon. Because the conversation did not save an
   explicit decision through `record_decision`, the event closed without approval. This is
   the intended fail-closed behavior.
@@ -21,6 +23,9 @@ phone number, API key, callback URL, transcript, recording URL, or provider iden
 
 - `agent-hotline@personal` is installed and enabled in Codex.
 - Claude reports the `agent-hotline` stdio MCP server as connected.
+- Fresh Codex and Claude processes both discovered `contact_human` and
+  `query_repository_context`; each returned bounded, explicitly untrusted evidence from the
+  configured repository.
 - The native Codex App Server adapter completed initialization and thread-list smoke tests.
 - The MCP subprocess suite completed a real initialize/list-tools/tool-call exchange.
 
@@ -28,9 +33,7 @@ phone number, API key, callback URL, transcript, recording URL, or provider iden
 
 - The deterministic database-RU demo completed with a verified mock action and changed no
   real resource.
-- The full automated suite, lint, package build, plugin validation, CLI smoke tests, and
-  configured-secret scan are release gates. Exact final counts are recorded in the local
-  commit handoff rather than hard-coded here.
+- The final full automated suite passed 244 tests. Lint, formatting, and diff checks passed.
 
 ## Deployment boundary
 

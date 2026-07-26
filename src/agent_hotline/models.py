@@ -502,6 +502,8 @@ class TimelineKind(StrEnum):
     ACTION_PREPARED = "action_prepared"
     ACTION_CONFIRMED = "action_confirmed"
     ACTION_CONSUMED = "action_consumed"
+    ACTION_EXECUTION_SUCCEEDED = "action_execution_succeeded"
+    ACTION_EXECUTION_FAILED = "action_execution_failed"
     ACTION_EXPIRED = "action_expired"
     ACTION_CANCELLED = "action_cancelled"
     REPOSITORY_CONTEXT_EXPOSED = "repository_context_exposed"

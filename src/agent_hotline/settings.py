@@ -8,7 +8,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _WINDOWS_USER_ENV_KEYS = (
@@ -23,6 +23,7 @@ _WINDOWS_USER_ENV_KEYS = (
     "OWNER_PHONE_NUMBER",
     "OWNER_CONFIRMATION_PIN",
     "HOTLINE_TOOL_TOKEN",
+    "HOTLINE_PUBLIC_TOOLS_REQUIRE_TOKEN",
     "HOTLINE_LOCAL_TOKEN",
     "HOTLINE_CALLBACK_TOKEN",
     "HOTLINE_FALLBACK_WEBHOOK_URL",
@@ -83,6 +84,10 @@ class Settings(BaseSettings):
     hotline_database_path: Path = Path(".hotline/hotline.db")
     hotline_daemon_url: str = "http://127.0.0.1:8787"
     hotline_tool_token: SecretStr = SecretStr("")
+    # Sarvam rejects some custom Authorization configurations before making the
+    # request. Development demos may explicitly disable bearer auth for the
+    # Sarvam tool surface; coordinator session/PIN/readback/grant gates remain.
+    hotline_public_tools_require_token: bool = True
     hotline_local_token: SecretStr = SecretStr("")
     hotline_callback_token: SecretStr = SecretStr("")
     hotline_fallback_webhook_url: str | None = None
@@ -116,6 +121,7 @@ class Settings(BaseSettings):
 
     hotline_transport: Literal["sarvam", "fake", "disabled"] = "sarvam"
     hotline_allow_real_actions: bool = False
+    hotline_demo_auto_execute_actions: bool = False
     hotline_allowlisted_callers: str = ""
     hotline_max_active_calls: int = Field(default=1, ge=1, le=10)
     hotline_retry_attempts: int = Field(default=2, ge=0, le=5)
@@ -157,6 +163,19 @@ class Settings(BaseSettings):
             raise ValueError("OWNER_CONFIRMATION_PIN must contain 6 to 12 ASCII digits")
         return value
 
+    @model_validator(mode="after")
+    def reject_headerless_public_tools_in_production(self) -> Settings:
+        if self.hotline_env == "production" and not self.hotline_public_tools_require_token:
+            raise ValueError("HOTLINE_PUBLIC_TOOLS_REQUIRE_TOKEN cannot be disabled in production")
+        if self.hotline_env == "production" and self.hotline_demo_auto_execute_actions:
+            raise ValueError("HOTLINE_DEMO_AUTO_EXECUTE_ACTIONS cannot be enabled in production")
+        if self.hotline_demo_auto_execute_actions and self.hotline_allow_real_actions:
+            raise ValueError(
+                "HOTLINE_DEMO_AUTO_EXECUTE_ACTIONS cannot be combined with "
+                "HOTLINE_ALLOW_REAL_ACTIONS"
+            )
+        return self
+
     @property
     def sarvam_configured(self) -> bool:
         return all(
@@ -175,8 +194,11 @@ class Settings(BaseSettings):
     def public_tools_configured(self) -> bool:
         return bool(
             self.public_base_url
-            and self.hotline_tool_token.get_secret_value()
             and self.hotline_callback_token.get_secret_value()
+            and (
+                not self.hotline_public_tools_require_token
+                or self.hotline_tool_token.get_secret_value()
+            )
         )
 
     @property
@@ -213,10 +235,12 @@ class Settings(BaseSettings):
         return {
             "environment": self.hotline_env,
             "transport": self.hotline_transport,
+            "demo_auto_execute_actions": self.hotline_demo_auto_execute_actions,
             "daemon_url": self.hotline_daemon_url,
             "database_path": str(self.hotline_database_path),
             "public_base_url_configured": bool(self.public_base_url),
             "tool_token_configured": bool(self.hotline_tool_token.get_secret_value()),
+            "public_tools_require_token": self.hotline_public_tools_require_token,
             "local_token_configured": bool(self.hotline_local_token.get_secret_value()),
             "callback_token_configured": bool(self.hotline_callback_token.get_secret_value()),
             "secure_fallback_configured": self.secure_fallback_configured,

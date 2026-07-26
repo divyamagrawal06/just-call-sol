@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 from collections.abc import Mapping
 from datetime import timedelta
 from pathlib import Path
@@ -50,6 +51,7 @@ from .fallback_delivery import (
 from .models import (
     ActionKind,
     ActionScope,
+    ActionState,
     AgentType,
     ConfirmationMethod,
     ContactChannel,
@@ -95,6 +97,7 @@ from .security import (
 )
 from .settings import Settings
 from .storage import (
+    ActionAlreadyConsumedError,
     ActiveSessionError,
     DecisionAlreadyExistsError,
     FallbackLinkError,
@@ -133,6 +136,12 @@ _THREAD_ACTIONS: dict[str, tuple[ActionKind, RiskLevel]] = {
     "thread.spawn_root": (ActionKind.SPAWN_ROOT_THREAD, RiskLevel.MEDIUM),
     "thread.archive": (ActionKind.DEPLOYMENT, RiskLevel.HIGH),
 }
+_THREAD_STATUS_QUERY_ALIASES: dict[str, frozenset[str]] = {
+    "running": frozenset({"active"}),
+    "in progress": frozenset({"active"}),
+}
+_VOICE_THREAD_STATUS_QUERY_LIMIT = 10
+_VOICE_THREAD_QUERY_SCAN_LIMIT = 100
 
 
 class HotlineCoordinator:
@@ -182,6 +191,7 @@ class HotlineCoordinator:
             max_ttl_seconds=settings.hotline_fallback_ttl_seconds,
         )
         self._waiters: dict[str, asyncio.Event] = {}
+        self._demo_action_locks: dict[str, asyncio.Lock] = {}
 
     async def contact_human(self, request: ContactHumanRequest) -> ContactHumanResult:
         event = self._event_from_request(request)
@@ -310,7 +320,7 @@ class HotlineCoordinator:
     async def escalation_context(
         self, request: EscalationContextRequest
     ) -> EscalationContextResponse:
-        event = await self.store.require_event(request.event_id)
+        event = await self._require_live_voice_read_session(request.event_id)
         snapshot = await self.store.get_snapshot(event.event_id)
         decision = await self.store.get_decision(event.event_id)
         context = self._context_packet(event, snapshot)
@@ -442,7 +452,7 @@ class HotlineCoordinator:
 
     async def prepare_action(self, request: PrepareActionRequest) -> PrepareActionResponse:
         event = await self.store.require_event(request.event_id)
-        session_id = await self._require_live_session(event)
+        session_id = await self._require_live_voice_session(event)
         expires_at = utc_now() + timedelta(minutes=2)
         resolved_workspace = request.workspace_ref or event.workspace
         resolved_thread_id = request.thread_id or event.thread_id
@@ -501,7 +511,10 @@ class HotlineCoordinator:
             requires_confirmation=True,
             expires_at=expires_at,
         )
-        prepared = await self.store.prepare_action(prepared)
+        prepared = await self.store.prepare_action(
+            prepared,
+            dedupe_consumed=self.settings.hotline_demo_auto_execute_actions,
+        )
         nonce = self._signer.issue_nonce(
             subject=prepared.action_id,
             action_hash=prepared.action_hash,
@@ -511,6 +524,12 @@ class HotlineCoordinator:
             ),
             claims={"event_id": event.event_id},
         )
+        if self.settings.hotline_demo_auto_execute_actions:
+            return await self._demo_auto_execute_prepared_action(
+                prepared,
+                nonce=nonce,
+                impact=impact,
+            )
         return PrepareActionResponse(
             action_id=prepared.action_id,
             action_hash=prepared.action_hash,
@@ -520,12 +539,253 @@ class HotlineCoordinator:
             expires_at=prepared.expires_at,
         )
 
+    async def _demo_auto_execute_prepared_action(
+        self,
+        prepared: PreparedAction,
+        *,
+        nonce: str,
+        impact: str,
+    ) -> PrepareActionResponse:
+        lock = self._demo_action_locks.setdefault(prepared.action_id, asyncio.Lock())
+        async with lock:
+            action = await self.store.get_action(prepared.action_id)
+            if action is None:
+                raise NotFoundError(f"action {prepared.action_id!r} does not exist")
+
+            receipt = await self.store.get_action_execution(action.action_id)
+            if receipt is not None and (receipt.kind is TimelineKind.ACTION_EXECUTION_SUCCEEDED):
+                grant = await self.store.get_grant_for_action(action.action_id)
+                return self._demo_execution_receipt_response(
+                    action,
+                    receipt,
+                    nonce=nonce,
+                    impact=impact,
+                    grant_id=grant.grant_id if grant is not None else None,
+                    already_executed=True,
+                )
+
+            if action.state is ActionState.CONSUMED:
+                return await self._demo_consumed_action_response(
+                    action,
+                    receipt=receipt,
+                    nonce=nonce,
+                    impact=impact,
+                )
+
+            if receipt is not None and (receipt.kind is TimelineKind.ACTION_EXECUTION_FAILED):
+                retryable = receipt.details.get("retryable") is True
+                if not retryable or action.state is not ActionState.CONFIRMED:
+                    grant = await self.store.get_grant_for_action(action.action_id)
+                    return self._demo_execution_receipt_response(
+                        action,
+                        receipt,
+                        nonce=nonce,
+                        impact=impact,
+                        grant_id=grant.grant_id if grant is not None else None,
+                        already_executed=False,
+                    )
+
+            if action.state is ActionState.PREPARED:
+                try:
+                    grant = await self.store.confirm_action(
+                        action.action_id,
+                        owner_ref="owner_demo_auto_execute",
+                        confirmation_method=ConfirmationMethod.TRUSTED_LOCAL,
+                        confirmation_hash=action.confirmation_phrase_hash,
+                    )
+                except ActionAlreadyConsumedError:
+                    current = await self.store.get_action(action.action_id)
+                    if current is None:
+                        raise NotFoundError(f"action {action.action_id!r} does not exist") from None
+                    return await self._demo_consumed_action_response(
+                        current,
+                        receipt=await self.store.get_action_execution(action.action_id),
+                        nonce=nonce,
+                        impact=impact,
+                    )
+            elif action.state is ActionState.CONFIRMED:
+                grant = await self.store.get_grant_for_action(action.action_id)
+                if grant is None:
+                    raise RuntimeError("confirmed demo action has no durable grant")
+            else:
+                message = (
+                    f"This demo action is {action.state.value} and cannot be executed. "
+                    "No action was run."
+                )
+                return PrepareActionResponse(
+                    action_id=action.action_id,
+                    action_hash=action.action_hash,
+                    confirmation_nonce=nonce,
+                    risk=_contract_risk(action.risk.value),
+                    exact_readback=f"{impact} {message}",
+                    expires_at=action.expires_at,
+                    message_to_user=message,
+                    result={"status": action.state.value, "retryable": False},
+                )
+
+            try:
+                execution = await self.execute_action(
+                    ExecuteActionRequest(
+                        event_id=action.event_id,
+                        action_id=action.action_id,
+                        grant_id=grant.grant_id,
+                    )
+                )
+            except ActionAlreadyConsumedError:
+                current = await self.store.get_action(action.action_id)
+                if current is None:
+                    raise NotFoundError(f"action {action.action_id!r} does not exist") from None
+                return await self._demo_consumed_action_response(
+                    current,
+                    receipt=await self.store.get_action_execution(action.action_id),
+                    nonce=nonce,
+                    impact=impact,
+                )
+            except Exception as exc:
+                current = await self.store.get_action(action.action_id)
+                if current is None:
+                    raise NotFoundError(f"action {action.action_id!r} does not exist") from exc
+                retryable = current.state is ActionState.CONFIRMED
+                if retryable:
+                    message = (
+                        "Demo action execution failed before its one-time grant was "
+                        "consumed. The same prepared action can be retried safely."
+                    )
+                else:
+                    message = (
+                        "Demo action execution failed after its one-time grant was "
+                        "claimed. It will not be retried automatically, preventing a "
+                        "duplicate action."
+                    )
+                result: dict[str, Any] = {
+                    "status": "failed",
+                    "retryable": retryable,
+                    "error_type": type(exc).__name__,
+                }
+                logger.warning(
+                    "demo_auto_execution_failed action_id=%s retryable=%s error_type=%s",
+                    current.action_id,
+                    retryable,
+                    type(exc).__name__,
+                )
+                receipt = await self.store.record_action_execution(
+                    current.action_id,
+                    succeeded=False,
+                    message_to_user=message,
+                    result=result,
+                    retryable=retryable,
+                )
+                return self._demo_execution_receipt_response(
+                    current,
+                    receipt,
+                    nonce=nonce,
+                    impact=impact,
+                    grant_id=grant.grant_id,
+                    already_executed=False,
+                )
+
+            receipt = await self.store.record_action_execution(
+                action.action_id,
+                succeeded=True,
+                message_to_user=execution.message_to_user,
+                operation_id=execution.operation_id,
+                result=execution.result,
+            )
+            return self._demo_execution_receipt_response(
+                action,
+                receipt,
+                nonce=nonce,
+                impact=impact,
+                grant_id=execution.grant_id,
+                already_executed=False,
+            )
+
+    async def _demo_consumed_action_response(
+        self,
+        prepared: PreparedAction,
+        *,
+        receipt: TimelineEntry | None,
+        nonce: str,
+        impact: str,
+    ) -> PrepareActionResponse:
+        grant = await self.store.get_grant_for_action(prepared.action_id)
+        grant_id = grant.grant_id if grant is not None else None
+        if receipt is not None:
+            return self._demo_execution_receipt_response(
+                prepared,
+                receipt,
+                nonce=nonce,
+                impact=impact,
+                grant_id=grant_id,
+                already_executed=(receipt.kind is TimelineKind.ACTION_EXECUTION_SUCCEEDED),
+            )
+
+        message = (
+            "This exact action's one-time grant was already claimed, but no durable "
+            "completion receipt is available. It was not retried, preventing a "
+            "duplicate action."
+        )
+        return PrepareActionResponse(
+            action_id=prepared.action_id,
+            action_hash=prepared.action_hash,
+            confirmation_nonce=nonce,
+            risk=_contract_risk(prepared.risk.value),
+            exact_readback=f"{impact} {message}",
+            expires_at=prepared.expires_at,
+            executed=False,
+            already_executed=False,
+            grant_id=grant_id,
+            message_to_user=message,
+            result={"status": "outcome_unknown", "retryable": False},
+        )
+
+    @staticmethod
+    def _demo_execution_receipt_response(
+        prepared: PreparedAction,
+        receipt: TimelineEntry,
+        *,
+        nonce: str,
+        impact: str,
+        grant_id: str | None,
+        already_executed: bool,
+    ) -> PrepareActionResponse:
+        succeeded = receipt.kind is TimelineKind.ACTION_EXECUTION_SUCCEEDED
+        stored_message = receipt.details.get("message_to_user")
+        message = (
+            stored_message
+            if isinstance(stored_message, str)
+            else (
+                "The demo action completed." if succeeded else "The demo action did not complete."
+            )
+        )
+        stored_operation_id = receipt.details.get("operation_id")
+        operation_id = stored_operation_id if isinstance(stored_operation_id, str) else None
+        stored_result = receipt.details.get("result")
+        result = dict(stored_result) if isinstance(stored_result, dict) else {}
+        return PrepareActionResponse(
+            action_id=prepared.action_id,
+            action_hash=prepared.action_hash,
+            confirmation_nonce=nonce,
+            risk=_contract_risk(prepared.risk.value),
+            exact_readback=f"{impact} {message}",
+            expires_at=prepared.expires_at,
+            executed=succeeded,
+            already_executed=succeeded and already_executed,
+            grant_id=grant_id,
+            operation_id=operation_id,
+            message_to_user=message,
+            result=result,
+        )
+
     async def confirm_action(self, request: ConfirmActionRequest) -> ConfirmActionResponse:
         action = await self.store.get_action(request.action_id)
         if action is None or action.event_id != request.event_id:
             raise NotFoundError("prepared action does not match this event")
         event = await self.store.require_event(action.event_id)
-        await self._require_live_session(event, expected_session_id=action.session_id)
+        await self._require_live_voice_session(
+            event,
+            expected_session_id=action.session_id,
+        )
         if await self.store.repository_context_was_exposed(event.event_id):
             raise PermissionError("repository evidence events cannot authorize an action")
         if not self._owner_pin_verified(request.confirmation_pin):
@@ -567,6 +827,11 @@ class HotlineCoordinator:
             raise NotFoundError("prepared action does not match this event")
         if action.kind is not ActionKind.REGISTERED_RUNBOOK and self.controller is None:
             raise RuntimeError("Codex thread control is unavailable")
+        event = await self.store.require_event(action.event_id)
+        await self._require_live_voice_session(
+            event,
+            expected_session_id=action.session_id,
+        )
         await self.store.consume_action(
             request.grant_id,
             action_hash=action.action_hash,
@@ -683,32 +948,73 @@ class HotlineCoordinator:
         )
 
     async def list_threads(self, request: ThreadListRequest) -> dict[str, JsonValue]:
-        await self._require_allowlisted_inbound(request.event_id)
+        guard_started = time.monotonic()
+        try:
+            await self._require_live_voice_read_session(request.event_id)
+        finally:
+            logger.info(
+                "voice_list_threads_live_session_guard duration_ms=%.1f",
+                (time.monotonic() - guard_started) * 1000,
+            )
         if self.controller is None:
             raise RuntimeError("Codex thread control is unavailable")
-        candidates = await self.controller.list_candidates(limit=request.limit)
-        if request.query:
-            needle = request.query.casefold()
-            candidates = tuple(
-                item
-                for item in candidates
-                if needle
-                in " ".join(
-                    (item.thread_id, item.name or "", item.preview, Path(item.cwd).name)
-                ).casefold()
+        query = request.query.strip().casefold() if request.query else None
+        status_aliases = _THREAD_STATUS_QUERY_ALIASES.get(query) if query is not None else None
+        candidates = await self.controller.list_candidates(
+            limit=(
+                _VOICE_THREAD_STATUS_QUERY_LIMIT
+                if status_aliases is not None
+                else (_VOICE_THREAD_QUERY_SCAN_LIMIT if query else request.limit)
             )
+        )
+        if query:
+            if status_aliases is not None:
+                candidates = tuple(
+                    item for item in candidates if item.status.casefold() in status_aliases
+                )
+            else:
+                candidates = tuple(
+                    item
+                    for item in candidates
+                    if query
+                    in " ".join(
+                        (
+                            item.thread_id,
+                            item.name or "",
+                            item.preview,
+                            Path(item.cwd).name,
+                            item.status,
+                        )
+                    ).casefold()
+                )
         return {
             "threads": [
                 {
                     "thread_id": item.thread_id,
-                    "name": item.name,
+                    "name": (
+                        sanitize_untrusted_text(
+                            item.name,
+                            max_chars=300,
+                            known_secrets=self._known_secrets(),
+                        )
+                        if item.name is not None
+                        else None
+                    ),
                     "preview": sanitize_untrusted_text(
                         item.preview,
                         max_chars=500,
                         known_secrets=self._known_secrets(),
                     ),
-                    "workspace": Path(item.cwd).name,
-                    "status": item.status,
+                    "workspace": sanitize_untrusted_text(
+                        Path(item.cwd).name,
+                        max_chars=300,
+                        known_secrets=self._known_secrets(),
+                    ),
+                    "status": sanitize_untrusted_text(
+                        item.status,
+                        max_chars=100,
+                        known_secrets=self._known_secrets(),
+                    ),
                     "updated_at": item.updated_at,
                 }
                 for item in candidates[: request.limit]
@@ -716,7 +1022,7 @@ class HotlineCoordinator:
         }
 
     async def inspect_thread(self, request: ThreadInspectRequest) -> dict[str, JsonValue]:
-        await self._require_allowlisted_inbound(request.event_id)
+        await self._require_live_voice_read_session(request.event_id)
         if self.controller is None:
             raise RuntimeError("Codex thread control is unavailable")
         response = await self.controller.inspect_thread(request.reference)
@@ -1433,6 +1739,41 @@ class HotlineCoordinator:
         ):
             raise PermissionError("allowlisted inbound control session required")
         return event
+
+    async def _require_live_voice_read_session(self, event_id: str) -> EscalationEvent:
+        """Authorize read-only task discovery only while its voice session is live."""
+
+        event = await self.store.require_event(event_id)
+        await self._require_live_voice_session(event)
+        return event
+
+    async def _require_live_voice_session(
+        self,
+        event: EscalationEvent,
+        *,
+        expected_session_id: str | None = None,
+    ) -> str:
+        """Require a provider-correlated voice session for a public tool request."""
+
+        inbound = (
+            event.evidence.get("caller_allowlisted") is True
+            and event.evidence.get("direction") == "inbound"
+        )
+        if inbound:
+            await self._require_allowlisted_inbound(event.event_id)
+            return await self._require_live_session(
+                event,
+                expected_session_id=expected_session_id,
+                expected_direction=ContactDirection.INBOUND_CONTROL,
+                require_provider_correlation=True,
+                allowed_states={SessionState.CONNECTED, SessionState.DISCUSSING},
+            )
+        return await self._require_live_session(
+            event,
+            expected_session_id=expected_session_id,
+            expected_direction=ContactDirection.OUTBOUND_ESCALATION,
+            require_provider_correlation=True,
+        )
 
     def _owner_pin_verified(self, submitted: Any) -> bool:
         configured = self.settings.owner_confirmation_pin.get_secret_value()

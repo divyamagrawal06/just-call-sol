@@ -32,6 +32,7 @@ from .contracts import (
     ContactHumanResult,
     EscalationContextRequest,
     EscalationContextResponse,
+    EventRegistrationQuery,
     EventSummary,
     ExecuteActionRequest,
     ExecuteActionResponse,
@@ -52,6 +53,7 @@ from .contracts import (
 )
 from .coordinator import HotlineCoordinator
 from .dashboard import create_dashboard_router
+from .event_tracker import check_registration
 from .fallback_delivery import FallbackNotifier, create_fallback_notifier
 from .providers import CallProvider, create_call_provider
 from .runbooks import RunbookRegistry, create_default_registry
@@ -67,6 +69,7 @@ from .watchdog import AgentFailureWatchdog
 
 logger = logging.getLogger(__name__)
 _MAX_BODY_BYTES = 64 * 1024
+_CODEX_THREAD_PREWARM_TIMEOUT_SECONDS = 60.0
 _FALLBACK_ASSET_DIRECTORY = Path(__file__).with_name("fallback_assets")
 _FALLBACK_SECURITY_HEADERS = {
     "Cache-Control": "no-store, max-age=0",
@@ -192,6 +195,9 @@ async def _runtime_lifespan(app: FastAPI) -> AsyncIterator[None]:
             monitor_task = asyncio.create_task(
                 _monitor_codex(codex, coordinator, escalation_tasks),
                 name="agent-hotline-codex-watchdog",
+            )
+            await controller.prewarm_voice_candidates(
+                timeout_seconds=_CODEX_THREAD_PREWARM_TIMEOUT_SECONDS
             )
 
     app.state.settings = settings
@@ -471,9 +477,20 @@ def _install_routes(app: FastAPI) -> None:
         return await _coordinator(request).query_repository(payload)
 
     @app.post(
+        "/v1/demo/sarvam/check-registration",
+        summary="Check a Sarvam Epoch registration (unauthenticated demo)",
+    )
+    async def demo_event_registration_tool(
+        payload: EventRegistrationQuery,
+    ) -> dict[str, Any]:
+        """Demo-only public tool: deliberately has no auth or session requirement."""
+
+        return check_registration(payload.query)
+
+    @app.post(
         "/v1/sarvam/tools/context",
         response_model=EscalationContextResponse,
-        dependencies=[Depends(_require_tool_token), Depends(_rate_limit_public)],
+        dependencies=[Depends(_require_public_tool_token), Depends(_rate_limit_public)],
     )
     async def context_tool(
         payload: EscalationContextRequest,
@@ -484,7 +501,7 @@ def _install_routes(app: FastAPI) -> None:
     @app.post(
         "/v1/sarvam/tools/record-instruction",
         response_model=RecordInstructionResponse,
-        dependencies=[Depends(_require_tool_token), Depends(_rate_limit_public)],
+        dependencies=[Depends(_require_public_tool_token), Depends(_rate_limit_public)],
     )
     async def instruction_tool(
         payload: RecordInstructionRequest,
@@ -495,7 +512,7 @@ def _install_routes(app: FastAPI) -> None:
     @app.post(
         "/v1/sarvam/tools/prepare-action",
         response_model=PrepareActionResponse,
-        dependencies=[Depends(_require_tool_token), Depends(_rate_limit_public)],
+        dependencies=[Depends(_require_public_tool_token), Depends(_rate_limit_public)],
     )
     async def prepare_action_tool(
         payload: PrepareActionRequest,
@@ -506,7 +523,7 @@ def _install_routes(app: FastAPI) -> None:
     @app.post(
         "/v1/sarvam/tools/confirm-action",
         response_model=ConfirmActionResponse,
-        dependencies=[Depends(_require_tool_token), Depends(_rate_limit_public)],
+        dependencies=[Depends(_require_public_tool_token), Depends(_rate_limit_public)],
     )
     async def confirm_action_tool(
         payload: ConfirmActionRequest,
@@ -517,7 +534,7 @@ def _install_routes(app: FastAPI) -> None:
     @app.post(
         "/v1/sarvam/tools/execute-action",
         response_model=ExecuteActionResponse,
-        dependencies=[Depends(_require_tool_token), Depends(_rate_limit_public)],
+        dependencies=[Depends(_require_public_tool_token), Depends(_rate_limit_public)],
     )
     async def execute_action_tool(
         payload: ExecuteActionRequest,
@@ -528,7 +545,7 @@ def _install_routes(app: FastAPI) -> None:
     @app.post(
         "/v1/sarvam/tools/begin-inbound",
         response_model=BeginInboundSessionResponse,
-        dependencies=[Depends(_require_tool_token), Depends(_rate_limit_public)],
+        dependencies=[Depends(_require_public_tool_token), Depends(_rate_limit_public)],
     )
     async def begin_inbound_tool(
         payload: BeginInboundSessionRequest,
@@ -538,7 +555,7 @@ def _install_routes(app: FastAPI) -> None:
 
     @app.post(
         "/v1/sarvam/tools/threads/list",
-        dependencies=[Depends(_require_tool_token), Depends(_rate_limit_public)],
+        dependencies=[Depends(_require_public_tool_token), Depends(_rate_limit_public)],
     )
     async def list_threads_tool(
         payload: ThreadListRequest,
@@ -548,7 +565,7 @@ def _install_routes(app: FastAPI) -> None:
 
     @app.post(
         "/v1/sarvam/tools/threads/inspect",
-        dependencies=[Depends(_require_tool_token), Depends(_rate_limit_public)],
+        dependencies=[Depends(_require_public_tool_token), Depends(_rate_limit_public)],
     )
     async def inspect_thread_tool(
         payload: ThreadInspectRequest,
@@ -560,7 +577,7 @@ def _install_routes(app: FastAPI) -> None:
         "/v1/sarvam/tools/repository-context",
         response_model=RepositoryContextResponse,
         dependencies=[
-            Depends(_require_tool_token),
+            Depends(_require_public_tool_token),
             Depends(_rate_limit_repository_context),
         ],
     )
@@ -594,11 +611,14 @@ async def _require_local_token(
     _verify_bearer(authorization, expected, unavailable_status=503)
 
 
-async def _require_tool_token(
+async def _require_public_tool_token(
     request: Request,
     authorization: str | None = Header(default=None),
 ) -> None:
-    expected = _settings(request).hotline_tool_token.get_secret_value()
+    settings = _settings(request)
+    if not settings.hotline_public_tools_require_token:
+        return
+    expected = settings.hotline_tool_token.get_secret_value()
     _verify_bearer(authorization, expected, unavailable_status=503)
 
 

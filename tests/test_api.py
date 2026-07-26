@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 import pytest_asyncio
 
+import agent_hotline.api as api_module
 from agent_hotline.api import create_app
+from agent_hotline.codex_protocol import ThreadCandidate, ThreadControlResult
 from agent_hotline.models import (
     ContactDirection,
     ContactSession,
@@ -27,11 +31,60 @@ CALLBACK_TOKEN = "callback-test-token-123456"
 OWNER_PIN = "246810"
 
 
+class FakeThreadController:
+    def __init__(self) -> None:
+        self.extra_candidates: tuple[ThreadCandidate, ...] = ()
+        self.list_limits: list[int] = []
+        self.spawn_calls: list[tuple[str, str]] = []
+
+    async def list_candidates(
+        self,
+        *,
+        limit: int = 100,
+        archived: bool = False,
+    ) -> tuple[ThreadCandidate, ...]:
+        del archived
+        self.list_limits.append(limit)
+        return (
+            ThreadCandidate(
+                thread_id="thread-running",
+                name="Active task",
+                preview="Continue the active repository task.",
+                cwd="C:/workspace/just-call-sol",
+                status="active",
+                updated_at=1,
+            ),
+            *self.extra_candidates,
+        )[:limit]
+
+    async def inspect_thread(self, reference: str) -> dict[str, Any]:
+        return {
+            "thread": {
+                "id": reference,
+                "name": "Active task",
+                "preview": "Continue the active repository task.",
+                "cwd": "C:/workspace/just-call-sol",
+                "status": "active",
+                "turns": [],
+            }
+        }
+
+    async def spawn_root(self, *, task: str, cwd: str) -> ThreadControlResult:
+        self.spawn_calls.append((task, cwd))
+        return ThreadControlResult(
+            action="spawned",
+            thread_id="thread-demo-spawned",
+            turn_id="turn-demo-spawned",
+            response={},
+        )
+
+
 @dataclass(slots=True)
 class APIHarness:
     client: httpx.AsyncClient
     provider: FakeCallProvider
     store: SQLiteStore
+    controller: FakeThreadController
 
 
 @pytest_asyncio.fixture
@@ -43,6 +96,7 @@ async def api(tmp_path: Path) -> AsyncIterator[APIHarness]:
         hotline_transport="fake",
         hotline_local_token=LOCAL_TOKEN,
         hotline_tool_token=TOOL_TOKEN,
+        hotline_public_tools_require_token=True,
         hotline_callback_token=CALLBACK_TOKEN,
         owner_phone_number="+919876543210",
         owner_confirmation_pin=OWNER_PIN,
@@ -50,7 +104,12 @@ async def api(tmp_path: Path) -> AsyncIterator[APIHarness]:
         codex_app_server_enabled=False,
     )
     provider = FakeCallProvider()
-    app = create_app(settings=settings, provider=provider)
+    controller = FakeThreadController()
+    app = create_app(
+        settings=settings,
+        provider=provider,
+        controller=controller,  # type: ignore[arg-type]
+    )
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
         async with httpx.AsyncClient(
@@ -61,6 +120,58 @@ async def api(tmp_path: Path) -> AsyncIterator[APIHarness]:
                 client=client,
                 provider=provider,
                 store=app.state.store,
+                controller=controller,
+            )
+
+
+@pytest.mark.asyncio
+async def test_public_demo_registration_tool_needs_no_auth(api: APIHarness) -> None:
+    response = await api.client.post(
+        "/v1/demo/sarvam/check-registration",
+        json={"query": "SEP-26003"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["verdict"] == "NO"
+    assert payload["approved"] is False
+    assert "does not match" in payload["reason"]
+
+
+@pytest_asyncio.fixture
+async def auto_execute_api(tmp_path: Path) -> AsyncIterator[APIHarness]:
+    settings = Settings(
+        _env_file=None,
+        hotline_env="development",
+        hotline_database_path=tmp_path / "auto-execute.sqlite3",
+        hotline_transport="fake",
+        hotline_local_token=LOCAL_TOKEN,
+        hotline_tool_token=TOOL_TOKEN,
+        hotline_public_tools_require_token=True,
+        hotline_callback_token=CALLBACK_TOKEN,
+        owner_phone_number="+919876543210",
+        owner_confirmation_pin=OWNER_PIN,
+        hotline_demo_auto_execute_actions=True,
+        codex_app_server_enabled=False,
+    )
+    provider = FakeCallProvider()
+    controller = FakeThreadController()
+    app = create_app(
+        settings=settings,
+        provider=provider,
+        controller=controller,  # type: ignore[arg-type]
+    )
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            yield APIHarness(
+                client=client,
+                provider=provider,
+                store=app.state.store,
+                controller=controller,
             )
 
 
@@ -98,6 +209,69 @@ async def _wait_for_provider_call(provider: FakeCallProvider) -> tuple[str, obje
     pytest.fail("fake call provider was not invoked")
 
 
+async def test_runtime_startup_prewarms_unfiltered_top_ten_with_sixty_second_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, float | None]] = []
+
+    class StubCodexClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def register_server_request_handler(self, _method: str, _handler: object) -> None:
+            pass
+
+        async def start(self) -> dict[str, object]:
+            calls.append(("start", None))
+            return {}
+
+        async def close(self) -> None:
+            calls.append(("close", None))
+
+    class StubThreadController:
+        def __init__(
+            self,
+            _client: StubCodexClient,
+            *,
+            workspace_roots: list[Path],
+        ) -> None:
+            assert workspace_roots == [tmp_path.resolve()]
+
+        async def prewarm_voice_candidates(self, *, timeout_seconds: float) -> bool:
+            calls.append(("prewarm-started", timeout_seconds))
+            await asyncio.sleep(0)
+            calls.append(("prewarm", timeout_seconds))
+            return True
+
+    async def idle_monitor(*_args: object) -> None:
+        calls.append(("monitor", None))
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(api_module, "CodexAppServerClient", StubCodexClient)
+    monkeypatch.setattr(api_module, "SafeThreadController", StubThreadController)
+    monkeypatch.setattr(api_module, "_monitor_codex", idle_monitor)
+    settings = Settings(
+        _env_file=None,
+        hotline_env="test",
+        hotline_database_path=tmp_path / "runtime-prewarm.sqlite3",
+        hotline_transport="fake",
+        codex_app_server_enabled=True,
+        codex_app_server_cwd=tmp_path,
+    )
+    app = create_app(settings=settings)
+
+    async with app.router.lifespan_context(app):
+        assert calls == [
+            ("start", None),
+            ("prewarm-started", 60.0),
+            ("monitor", None),
+            ("prewarm", 60.0),
+        ]
+
+    assert calls[-1] == ("close", None)
+
+
 async def test_api_authentication_boundaries_are_separate_and_fail_closed(
     api: APIHarness,
 ) -> None:
@@ -111,6 +285,10 @@ async def test_api_authentication_boundaries_are_separate_and_fail_closed(
         "/v1/sarvam/tools/context",
         json={"event_id": "evt_does-not-exist"},
         headers=_local_headers(),
+    )
+    missing_tool_token = await api.client.post(
+        "/v1/sarvam/tools/context",
+        json={"event_id": "evt_does-not-exist"},
     )
     accepted_auth = await api.client.post(
         "/v1/sarvam/tools/context",
@@ -138,6 +316,7 @@ async def test_api_authentication_boundaries_are_separate_and_fail_closed(
     assert missing.status_code == 401
     assert invalid.status_code == 403
     assert crossed_tokens.status_code == 403
+    assert missing_tool_token.status_code == 401
     assert accepted_auth.status_code == 404
     assert blocking_notify.status_code == 422
     assert invalid_callback.status_code == 404
@@ -145,6 +324,7 @@ async def test_api_authentication_boundaries_are_separate_and_fail_closed(
         missing,
         invalid,
         crossed_tokens,
+        missing_tool_token,
         accepted_auth,
         blocking_notify,
         invalid_callback,
@@ -153,6 +333,148 @@ async def test_api_authentication_boundaries_are_separate_and_fail_closed(
         assert LOCAL_TOKEN not in response.text
         assert TOOL_TOKEN not in response.text
         assert CALLBACK_TOKEN not in response.text
+
+
+async def test_development_demo_can_omit_bearer_for_all_sarvam_tools(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        hotline_env="test",
+        hotline_database_path=tmp_path / "headerless-demo.sqlite3",
+        hotline_transport="fake",
+        hotline_public_tools_require_token=False,
+        hotline_tool_token="",
+        hotline_local_token=LOCAL_TOKEN,
+        hotline_callback_token=CALLBACK_TOKEN,
+        public_base_url="https://voice.example.test",
+        owner_phone_number="+919876543210",
+        owner_confirmation_pin=OWNER_PIN,
+        hotline_allowlisted_callers="+12025550147",
+        codex_app_server_enabled=False,
+    )
+    assert settings.public_tools_configured is True
+    app = create_app(settings=settings, provider=FakeCallProvider())
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            missing_event = "evt_does-not-exist"
+            requests = (
+                (
+                    "/v1/sarvam/tools/context",
+                    {"event_id": missing_event},
+                ),
+                (
+                    "/v1/sarvam/tools/record-instruction",
+                    {
+                        "event_id": missing_event,
+                        "outcome": "deny",
+                        "instruction": "Do not continue.",
+                        "confirmation_pin": OWNER_PIN,
+                    },
+                ),
+                (
+                    "/v1/sarvam/tools/prepare-action",
+                    {
+                        "event_id": missing_event,
+                        "action_type": "demo.pause_deployment",
+                        "parameters": {},
+                    },
+                ),
+                (
+                    "/v1/sarvam/tools/confirm-action",
+                    {
+                        "event_id": missing_event,
+                        "action_id": "act_missing",
+                        "confirmation_nonce": "nonce-missing",
+                        "exact_confirmation": "confirm the missing action",
+                        "confirmation_method": "spoken_plus_dtmf",
+                        "confirmation_pin": OWNER_PIN,
+                    },
+                ),
+                (
+                    "/v1/sarvam/tools/execute-action",
+                    {
+                        "event_id": missing_event,
+                        "action_id": "act_missing",
+                        "grant_id": "grant_missing",
+                    },
+                ),
+                (
+                    "/v1/sarvam/tools/threads/list",
+                    {"event_id": missing_event, "limit": 10},
+                ),
+                (
+                    "/v1/sarvam/tools/threads/inspect",
+                    {"event_id": missing_event, "reference": "thread-missing"},
+                ),
+                (
+                    "/v1/sarvam/tools/repository-context",
+                    {
+                        "event_id": missing_event,
+                        "operation": "status",
+                        "confirmation_pin": OWNER_PIN,
+                    },
+                ),
+            )
+            responses = [await client.post(path, json=payload) for path, payload in requests]
+            inbound = await client.post(
+                "/v1/sarvam/tools/begin-inbound",
+                json={
+                    "caller_phone_number": "+12025550148",
+                    "interaction_id": "headerless-unlisted",
+                },
+            )
+            local_api = await client.post(
+                "/v1/escalations/contact",
+                json=_contact_payload(wait_for_decision=False),
+            )
+
+    assert all(response.status_code == 404 for response in responses)
+    assert inbound.status_code == 200
+    assert inbound.json()["accepted"] is False
+    assert local_api.status_code == 401
+
+
+def test_production_rejects_headerless_sarvam_tool_configuration() -> None:
+    with pytest.raises(
+        ValueError,
+        match="HOTLINE_PUBLIC_TOOLS_REQUIRE_TOKEN cannot be disabled in production",
+    ):
+        Settings(
+            _env_file=None,
+            hotline_env="production",
+            hotline_public_tools_require_token=False,
+        )
+
+
+def test_production_rejects_demo_action_auto_execution() -> None:
+    with pytest.raises(
+        ValueError,
+        match="HOTLINE_DEMO_AUTO_EXECUTE_ACTIONS cannot be enabled in production",
+    ):
+        Settings(
+            _env_file=None,
+            hotline_env="production",
+            hotline_public_tools_require_token=True,
+            hotline_demo_auto_execute_actions=True,
+        )
+
+
+def test_demo_action_auto_execution_rejects_real_runbooks() -> None:
+    with pytest.raises(
+        ValueError,
+        match="HOTLINE_DEMO_AUTO_EXECUTE_ACTIONS cannot be combined",
+    ):
+        Settings(
+            _env_file=None,
+            hotline_env="development",
+            hotline_demo_auto_execute_actions=True,
+            hotline_allow_real_actions=True,
+        )
 
 
 async def test_contact_waiter_is_woken_by_authoritative_mid_call_decision(
@@ -465,6 +787,9 @@ async def test_no_answer_webhook_wakes_waiter_without_creating_approval(
     )
     assert prepared.status_code == 200
     prepared_payload = prepared.json()
+    assert prepared_payload["executed"] is False
+    assert prepared_payload["already_executed"] is False
+    assert prepared_payload["grant_id"] is None
     exact_phrase = prepared_payload["exact_readback"].rsplit("say exactly: ", 1)[1]
 
     webhook = await api.client.post(
@@ -649,6 +974,53 @@ async def test_prepare_confirm_execute_runbook_is_exact_and_one_time(
     assert replay.status_code == 409
 
 
+async def test_demo_prepare_auto_executes_spawn_once_and_dedupes_retry(
+    auto_execute_api: APIHarness,
+) -> None:
+    created = await auto_execute_api.client.post(
+        "/v1/escalations/contact",
+        json=_contact_payload(wait_for_decision=False),
+        headers=_local_headers(),
+    )
+    event_id = created.json()["event_id"]
+    request = {
+        "event_id": event_id,
+        "action_type": "thread.spawn_root",
+        "action_task": "Investigate the database incident.",
+        "action_cwd": ".",
+    }
+
+    first = await auto_execute_api.client.post(
+        "/v1/sarvam/tools/prepare-action",
+        json=request,
+        headers=_tool_headers(),
+    )
+    retry = await auto_execute_api.client.post(
+        "/v1/sarvam/tools/prepare-action",
+        json=request,
+        headers=_tool_headers(),
+    )
+
+    assert first.status_code == 200
+    assert first.json()["executed"] is True
+    assert first.json()["already_executed"] is False
+    assert first.json()["result"] == {
+        "action": "spawned",
+        "thread_id": "thread-demo-spawned",
+        "turn_id": "turn-demo-spawned",
+    }
+    assert retry.status_code == 200
+    assert retry.json()["executed"] is True
+    assert retry.json()["already_executed"] is True
+    assert retry.json()["action_id"] == first.json()["action_id"]
+    assert retry.json()["action_hash"] == first.json()["action_hash"]
+    assert auto_execute_api.controller.spawn_calls == [("Investigate the database incident.", ".")]
+    timeline = await auto_execute_api.store.list_timeline(event_id=event_id, limit=100)
+    assert [entry.kind.value for entry in timeline].count("action_prepared") == 1
+    assert [entry.kind.value for entry in timeline].count("action_confirmed") == 1
+    assert [entry.kind.value for entry in timeline].count("action_consumed") == 1
+
+
 async def test_inbound_control_discloses_nothing_to_unallowlisted_callers(
     api: APIHarness,
 ) -> None:
@@ -699,8 +1071,199 @@ async def test_inbound_control_discloses_nothing_to_unallowlisted_callers(
     assert replay.json()["accepted"] is True
     assert replay.json()["identity_verified"] is False
     assert replay.json()["event_id"] == accepted.json()["event_id"]
+    listed = await api.client.post(
+        "/v1/sarvam/tools/threads/list",
+        json={"event_id": accepted.json()["event_id"], "limit": 10},
+        headers=_tool_headers(),
+    )
+    inspected = await api.client.post(
+        "/v1/sarvam/tools/threads/inspect",
+        json={"event_id": accepted.json()["event_id"], "reference": "thread-running"},
+        headers=_tool_headers(),
+    )
+    assert listed.status_code == 200
+    assert inspected.status_code == 200
     events = await api.store.list_events(limit=10)
     assert [event.event_id for event in events] == [accepted.json()["event_id"]]
+
+
+async def test_thread_reads_accept_only_a_provider_correlated_live_outbound_call(
+    api: APIHarness,
+) -> None:
+    created = await api.client.post(
+        "/v1/escalations/contact",
+        json=_contact_payload(wait_for_decision=False),
+        headers=_local_headers(),
+    )
+    assert created.status_code == 200
+    event_id = created.json()["event_id"]
+
+    listed = await api.client.post(
+        "/v1/sarvam/tools/threads/list",
+        json={"event_id": event_id, "limit": 10},
+        headers=_tool_headers(),
+    )
+    inspected = await api.client.post(
+        "/v1/sarvam/tools/threads/inspect",
+        json={"event_id": event_id, "reference": "thread-running"},
+        headers=_tool_headers(),
+    )
+
+    assert listed.status_code == 200
+    assert [item["thread_id"] for item in listed.json()["threads"]] == ["thread-running"]
+    assert inspected.status_code == 200
+    assert inspected.json()["thread_id"] == "thread-running"
+
+    completed = await api.client.post(
+        f"/v1/sarvam/webhooks/instant-outbound/{CALLBACK_TOKEN}",
+        json={
+            "attempt_id": f"fake-attempt-{event_id}",
+            "status": "connected",
+            "duration": 5.0,
+            "channel_info": {"direction": "outbound"},
+        },
+    )
+    stale = await api.client.post(
+        "/v1/sarvam/tools/threads/list",
+        json={"event_id": event_id, "limit": 10},
+        headers=_tool_headers(),
+    )
+    stale_inspection = await api.client.post(
+        "/v1/sarvam/tools/threads/inspect",
+        json={"event_id": event_id, "reference": "thread-running"},
+        headers=_tool_headers(),
+    )
+
+    assert completed.status_code == 200
+    assert stale.status_code == 403
+    assert stale_inspection.status_code == 403
+
+
+async def test_thread_list_uses_warm_cache_for_exact_running_status_queries(
+    api: APIHarness,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    created = await api.client.post(
+        "/v1/escalations/contact",
+        json=_contact_payload(wait_for_decision=False),
+        headers=_local_headers(),
+    )
+    event_id = created.json()["event_id"]
+    decoys = tuple(
+        ThreadCandidate(
+            thread_id=f"thread-decoy-{index}",
+            name=f"Decoy {index}",
+            preview="An unrelated historical task.",
+            cwd="C:/workspace/just-call-sol",
+            status="idle",
+            updated_at=0,
+        )
+        for index in range(10)
+    )
+    api.controller.extra_candidates = (
+        ThreadCandidate(
+            thread_id="thread-idle-history",
+            name="Historical task",
+            preview="A running total is documented here.",
+            cwd="C:/workspace/just-call-sol",
+            status="idle",
+            updated_at=0,
+        ),
+        *decoys,
+        ThreadCandidate(
+            thread_id="thread-active-beyond-cache",
+            name="Late active task",
+            preview="This match is beyond the cached top ten.",
+            cwd="C:/workspace/just-call-sol",
+            status="active",
+            updated_at=0,
+        ),
+    )
+    caplog.set_level(logging.INFO, logger="agent_hotline.coordinator")
+
+    active = await api.client.post(
+        "/v1/sarvam/tools/threads/list",
+        json={"event_id": event_id, "query": "active", "limit": 10},
+        headers=_tool_headers(),
+    )
+    running = await api.client.post(
+        "/v1/sarvam/tools/threads/list",
+        json={"event_id": event_id, "query": "running", "limit": 25},
+        headers=_tool_headers(),
+    )
+    in_progress = await api.client.post(
+        "/v1/sarvam/tools/threads/list",
+        json={"event_id": event_id, "query": "in progress", "limit": 10},
+        headers=_tool_headers(),
+    )
+    absent = await api.client.post(
+        "/v1/sarvam/tools/threads/list",
+        json={"event_id": event_id, "query": "definitely-absent", "limit": 10},
+        headers=_tool_headers(),
+    )
+
+    assert [item["thread_id"] for item in active.json()["threads"]] == [
+        "thread-running",
+        "thread-active-beyond-cache",
+    ]
+    assert [item["thread_id"] for item in running.json()["threads"]] == ["thread-running"]
+    assert [item["thread_id"] for item in in_progress.json()["threads"]] == ["thread-running"]
+    assert absent.json()["threads"] == []
+    assert api.controller.list_limits[-4:] == [100, 10, 10, 100]
+    duration_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "agent_hotline.coordinator"
+        and record.getMessage().startswith("voice_list_threads_live_session_guard")
+    ]
+    assert len(duration_messages) == 4
+    assert all("duration_ms=" in message for message in duration_messages)
+    assert all(event_id not in message for message in duration_messages)
+    assert all("running" not in message for message in duration_messages)
+
+
+async def test_thread_reads_reject_an_uncorrelated_outbound_session(api: APIHarness) -> None:
+    event = EscalationEvent(kind="status", summary="Uncorrelated outbound call.")
+    await api.store.create_event(event)
+    await api.store.transition_event(event.event_id, EventState.QUEUED)
+    await api.store.transition_event(event.event_id, EventState.DIALING)
+    await api.store.create_session(
+        ContactSession(
+            event_id=event.event_id,
+            direction=ContactDirection.OUTBOUND_ESCALATION,
+            state=SessionState.DIALING,
+        )
+    )
+
+    rejected = await api.client.post(
+        "/v1/sarvam/tools/threads/list",
+        json={"event_id": event.event_id, "limit": 10},
+        headers=_tool_headers(),
+    )
+    rejected_inspection = await api.client.post(
+        "/v1/sarvam/tools/threads/inspect",
+        json={"event_id": event.event_id, "reference": "thread-running"},
+        headers=_tool_headers(),
+    )
+    rejected_context = await api.client.post(
+        "/v1/sarvam/tools/context",
+        json={"event_id": event.event_id},
+        headers=_tool_headers(),
+    )
+    rejected_action = await api.client.post(
+        "/v1/sarvam/tools/prepare-action",
+        json={
+            "event_id": event.event_id,
+            "action_type": "demo.pause_deployment",
+            "parameters": {},
+        },
+        headers=_tool_headers(),
+    )
+
+    assert rejected.status_code == 403
+    assert rejected_inspection.status_code == 403
+    assert rejected_context.status_code == 403
+    assert rejected_action.status_code == 403
 
 
 async def test_missing_owner_pin_configuration_denies_grants_and_approvals(

@@ -195,6 +195,134 @@ class PrepareActionRequest(BaseModel):
     workspace_ref: str | None = Field(default=None, max_length=500)
     thread_id: str | None = Field(default=None, max_length=200)
     commit_or_state_hash: str | None = Field(default=None, max_length=200)
+    action_reference: str | None = Field(default=None, min_length=1, max_length=200)
+    action_instruction: str | None = Field(default=None, min_length=1, max_length=12_000)
+    action_turn_id: str | None = Field(default=None, min_length=1, max_length=200)
+    action_task: str | None = Field(default=None, min_length=1, max_length=12_000)
+    action_cwd: Literal["."] | None = None
+    action_confirmed_thread_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+    )
+    action_target_ru: int | None = Field(default=None, ge=401, le=10_000)
+    action_pause_reason: Literal["owner-request", "incident-response", "demo"] | None = None
+
+    @field_validator(
+        "action_reference",
+        "action_instruction",
+        "action_turn_id",
+        "action_task",
+        "action_cwd",
+        "action_confirmed_thread_id",
+        "action_target_ru",
+        "action_pause_reason",
+        mode="before",
+    )
+    @classmethod
+    def empty_agent_decided_fields_are_absent(cls, value: object) -> object | None:
+        """Let one flat HTTP tool leave fields for other action types empty."""
+
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("action_target_ru", mode="before")
+    @classmethod
+    def zero_target_ru_is_absent(cls, value: object) -> object | None:
+        """Keep the conditional RU slot JSON-typed when another action is selected."""
+
+        if value in (0, "0"):
+            return None
+        return value
+
+    @model_validator(mode="after")
+    def map_typed_agent_fields_to_parameters(self) -> PrepareActionRequest:
+        """Map Agent Studio's flat typed fields into the existing strict action contract.
+
+        Agent Studio exposes request-body fields individually, so the managed voice
+        model cannot reliably construct a conditionally typed arbitrary JSON object.
+        These fields are a deliberately small adapter for the actions exposed by the
+        voice manifest. The coordinator and runbook registry remain authoritative.
+        """
+
+        flat_values: dict[str, Any | None] = {
+            "action_reference": self.action_reference,
+            "action_instruction": self.action_instruction,
+            "action_turn_id": self.action_turn_id,
+            "action_task": self.action_task,
+            "action_cwd": self.action_cwd,
+            "action_confirmed_thread_id": self.action_confirmed_thread_id,
+            "action_target_ru": self.action_target_ru,
+            "action_pause_reason": self.action_pause_reason,
+        }
+        supplied = {name for name, value in flat_values.items() if value is not None}
+        if not supplied:
+            return self
+        if self.parameters:
+            raise ValueError("parameters cannot be combined with typed agent action fields")
+
+        field_map: dict[str, dict[str, str]] = {
+            "thread.instruct": {
+                "action_reference": "reference",
+                "action_instruction": "instruction",
+            },
+            "thread.interrupt": {
+                "action_reference": "reference",
+                "action_turn_id": "turn_id",
+            },
+            "thread.spawn_root": {
+                "action_task": "task",
+                "action_cwd": "cwd",
+            },
+            "thread.archive": {
+                "action_reference": "reference",
+                "action_confirmed_thread_id": "confirmed_thread_id",
+            },
+            "demo.increase_db_ru_limit": {
+                "action_target_ru": "target_ru",
+            },
+            "demo.pause_deployment": {
+                "action_pause_reason": "reason",
+            },
+            "demo.terminate_batch_runs": {},
+        }
+        required_fields: dict[str, frozenset[str]] = {
+            "thread.instruct": frozenset({"action_reference", "action_instruction"}),
+            "thread.interrupt": frozenset({"action_reference"}),
+            "thread.spawn_root": frozenset({"action_task", "action_cwd"}),
+            "thread.archive": frozenset({"action_reference", "action_confirmed_thread_id"}),
+            "demo.increase_db_ru_limit": frozenset({"action_target_ru"}),
+            "demo.pause_deployment": frozenset(),
+            "demo.terminate_batch_runs": frozenset(),
+        }
+        try:
+            selected_fields = field_map[self.action_type]
+        except KeyError as exc:
+            raise ValueError(
+                "typed agent action fields support only the voice action allowlist"
+            ) from exc
+
+        # ``action_cwd`` is fixed to "." in the Samvaad manifest. It is present
+        # for every call but is relevant only when spawning a root task.
+        supplied_for_action = supplied - (
+            {"action_cwd"} if self.action_type != "thread.spawn_root" else set()
+        )
+        unexpected = supplied_for_action - set(selected_fields)
+        if unexpected:
+            raise ValueError(
+                f"{self.action_type} does not accept typed fields: {sorted(unexpected)}"
+            )
+        missing = required_fields[self.action_type] - supplied
+        if missing:
+            raise ValueError(f"{self.action_type} requires typed fields: {sorted(missing)}")
+
+        self.parameters = {
+            parameter_name: flat_values[field_name]
+            for field_name, parameter_name in selected_fields.items()
+            if flat_values[field_name] is not None
+        }
+        return self
 
 
 class PrepareActionResponse(BaseModel):
@@ -206,6 +334,12 @@ class PrepareActionResponse(BaseModel):
     risk: Literal["read_only", "low", "medium", "high"]
     exact_readback: str
     expires_at: datetime
+    executed: bool = False
+    already_executed: bool = False
+    grant_id: str | None = None
+    operation_id: str | None = None
+    message_to_user: str | None = None
+    result: dict[str, Any] = Field(default_factory=dict)
 
 
 class ConfirmActionRequest(BaseModel):
@@ -284,6 +418,14 @@ class ThreadInspectRequest(BaseModel):
 
     event_id: str = Field(min_length=1, max_length=100)
     reference: str = Field(min_length=1, max_length=200)
+
+
+class EventRegistrationQuery(BaseModel):
+    """Intentionally minimal request for the unauthenticated event demo."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(min_length=1, max_length=200)
 
 
 class RepositoryContextQuery(BaseModel):

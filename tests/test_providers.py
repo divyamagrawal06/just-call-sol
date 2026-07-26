@@ -57,6 +57,10 @@ async def test_provider_omits_flat_agent_state_override() -> None:
     app_overrides = seen["app_config"]["app_overrides"]  # type: ignore[index]
     assert "initial_state_name" not in app_overrides
     assert app_overrides["initial_language_name"] == "English"
+    assert app_overrides["initial_bot_message"] == (
+        "Wassup Divyam — it's your agent on the line. Database requests are failing. "
+        "I need your call on one thing: Should the agent pause or retry?"
+    )
 
 
 @pytest.mark.asyncio

@@ -13,10 +13,11 @@ telephony, speech recognition, speech output, interruption, and conversational t
 | Provisioned phone number | Active |
 | Draft Agent app | Present |
 | Configured app version | Read from `SARVAM_APP_VERSION` |
-| Agent HTTP tools | Verified live v2 has eight; the next source manifest has nine |
-| Inbound deployment | One v2 deployment verified active on 26 July 2026 |
+| Agent HTTP tools | Nine protected tools verified in the live app |
+| Inbound deployment | One version 4 deployment verified active on 26 July 2026 |
 | Public Hotline URL | Read from `PUBLIC_BASE_URL` |
 | Completed real Hotline call | Outbound call and callback verified on 26 July 2026 |
+| Live greeting | Personalized opening committed with regenerated translations |
 
 These are dated verification results, not a claim of perpetual provider health. See
 `docs/VERIFICATION.md` for the sanitized evidence and rerun the read-only checks before a
@@ -155,7 +156,10 @@ POST ${PUBLIC_BASE_URL}/v1/sarvam/tools/threads/list
 POST ${PUBLIC_BASE_URL}/v1/sarvam/tools/threads/inspect
 ```
 
-These provide bounded inbound task discovery and inspection after `begin_inbound`.
+These provide bounded task discovery and inspection during a provider-correlated live voice
+session. Inbound calls must first pass `begin_inbound` and remain correlated by
+`interaction_id`; outbound calls use the `attempt_id` linked when the daemon dialed. These
+read-only results do not verify identity or authorize a decision or mutation.
 
 ### `repo_context`
 
@@ -192,11 +196,9 @@ must:
 
 1. Open the existing draft Agent app.
 2. Add the prompt and input variables.
-3. Add the exact nine source-manifest tools: `begin_inbound`, `get_context`,
+3. Add the exact nine live tools: `begin_inbound`, `get_context`,
    `record_decision`, `prepare_action`, `confirm_action`, `execute_action`, `list_threads`,
-   `inspect_thread`, and `repo_context`. The verified live v2 deployment has the earlier
-   eight-tool set; adding `repo_context` requires a newly committed app version and
-   deployment reconciliation.
+   `inspect_thread`, and `repo_context`.
 4. Store the bearer token in tool secrets/headers.
 5. Select a low-latency managed voice and model.
 6. Enable barge-in and the desired English/Hindi behavior.
@@ -269,8 +271,7 @@ uv run agent-hotline doctor --live
 
 Proceed to the live demo only when all are true:
 
-- the tunnel URL is configured in the daemon and every tool in the selected app version
-  (eight in the verified v2 deployment; nine after the `repo_context` rollout);
+- the tunnel URL is configured in the daemon and all nine tools in the selected app version;
 - the tool bearer header reaches the daemon;
 - context lookup works against a persisted synthetic event;
 - the provider accepts the exact app/version/connection tuple;
