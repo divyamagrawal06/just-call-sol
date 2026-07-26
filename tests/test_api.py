@@ -124,6 +124,19 @@ async def api(tmp_path: Path) -> AsyncIterator[APIHarness]:
             )
 
 
+@pytest.mark.asyncio
+async def test_public_demo_registration_tool_needs_no_auth(api: APIHarness) -> None:
+    response = await api.client.post(
+        "/v1/demo/sarvam/check-registration",
+        json={"query": "SEP-26003"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["verdict"] == "NO"
+    assert payload["approved"] is False
+    assert "does not match" in payload["reason"]
+
 
 @pytest_asyncio.fixture
 async def auto_execute_api(tmp_path: Path) -> AsyncIterator[APIHarness]:

@@ -420,6 +420,14 @@ class ThreadInspectRequest(BaseModel):
     reference: str = Field(min_length=1, max_length=200)
 
 
+class EventRegistrationQuery(BaseModel):
+    """Intentionally minimal request for the unauthenticated event demo."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(min_length=1, max_length=200)
+
+
 class RepositoryContextQuery(BaseModel):
     """A bounded, read-only repository evidence request.
 

@@ -32,6 +32,7 @@ from .contracts import (
     ContactHumanResult,
     EscalationContextRequest,
     EscalationContextResponse,
+    EventRegistrationQuery,
     EventSummary,
     ExecuteActionRequest,
     ExecuteActionResponse,
@@ -52,6 +53,7 @@ from .contracts import (
 )
 from .coordinator import HotlineCoordinator
 from .dashboard import create_dashboard_router
+from .event_tracker import check_registration
 from .fallback_delivery import FallbackNotifier, create_fallback_notifier
 from .providers import CallProvider, create_call_provider
 from .runbooks import RunbookRegistry, create_default_registry
@@ -473,6 +475,17 @@ def _install_routes(app: FastAPI) -> None:
         request: Request,
     ) -> RepositoryContextResponse:
         return await _coordinator(request).query_repository(payload)
+
+    @app.post(
+        "/v1/demo/sarvam/check-registration",
+        summary="Check a Sarvam Epoch registration (unauthenticated demo)",
+    )
+    async def demo_event_registration_tool(
+        payload: EventRegistrationQuery,
+    ) -> dict[str, Any]:
+        """Demo-only public tool: deliberately has no auth or session requirement."""
+
+        return check_registration(payload.query)
 
     @app.post(
         "/v1/sarvam/tools/context",

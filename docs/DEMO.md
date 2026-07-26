@@ -4,6 +4,30 @@ The demo proves one outcome: a blocked coding agent calls its owner, answers a f
 from live evidence, receives a scoped decision, and resumes without the owner opening the
 laptop.
 
+## Sarvam Epoch gate-check tool
+
+The same MCP server exposes a CSV-backed read-only demo tool:
+
+- `check_event_registration(query)` returns a `YES`, `NO`, or `HOLD` verdict, the
+  registration reason, check-in state, and gate note.
+- `search_event_registrations(query, limit)` finds candidates when a name or organization
+  is incomplete.
+
+The default data source is
+`outputs/sarvam_epoch_event_tracker/sarvam_epoch_registration_tracker.csv`. Override it
+with `SARVAM_EPOCH_CSV` if the file is moved.
+
+After installing the local package/plugin, restart the agent host so it refreshes the MCP
+tool list. A reliable stage prompt is:
+
+```text
+There is a dispute at the Sarvam Epoch entrance. Check whether SEP-26003 is approved.
+Give only the verdict, recorded reason, and gate instruction.
+```
+
+Expected verdict: `NO`. For an ambiguity demonstration, query `Rohan Mehta`; the tool
+returns `HOLD` and asks for a registration ID because two records share that name.
+
 ## Fixed scenario
 
 A deterministic Codex task has completed a rate-limiter change. Its tests pass, but the

@@ -19,8 +19,12 @@ from .contracts import (
     RepositoryContextQuery,
     RepositoryContextResponse,
 )
+from .event_tracker import check_registration, search_registrations
 
 SERVER_INSTRUCTIONS = (
+    "For a disputed Sarvam Epoch gate admission, call check_event_registration with the "
+    "participant's registration ID, name, email, or phone. Treat YES as approved, NO as "
+    "not approved, and HOLD as requiring coordinator review. "
     "Use contact_human when autonomous work is blocked on a real human decision, "
     "clarification, authentication handoff, or urgent incident. Supply a compact, "
     "factual snapshot and proposed actions. The result is scoped to that event; never "
@@ -34,6 +38,46 @@ mcp = FastMCP(
     instructions=SERVER_INSTRUCTIONS,
     log_level="WARNING",
 )
+
+
+@mcp.tool(
+    title="Check Sarvam Epoch participant approval",
+    description=(
+        "Look up a Sarvam Epoch participant by registration ID, full name, email, or "
+        "phone and return a gate verdict: YES, NO, or HOLD, with the recorded reason. "
+        "Use this before admitting a participant whose approval is disputed."
+    ),
+    annotations=ToolAnnotations(
+        title="Check Sarvam Epoch participant approval",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+    structured_output=True,
+)
+def check_event_registration(query: str) -> dict[str, object]:
+    return check_registration(query)
+
+
+@mcp.tool(
+    title="Search Sarvam Epoch registrations",
+    description=(
+        "Search the Sarvam Epoch demo CSV by partial registration ID, participant name, "
+        "email, phone, or organization. Use this only to find the precise record before "
+        "calling check_event_registration."
+    ),
+    annotations=ToolAnnotations(
+        title="Search Sarvam Epoch registrations",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+    structured_output=True,
+)
+def search_event_registrations(query: str, limit: int = 10) -> dict[str, object]:
+    return search_registrations(query, limit)
 
 
 @mcp.tool(
