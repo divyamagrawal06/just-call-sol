@@ -57,6 +57,7 @@ def configured_settings(**overrides: object) -> Settings:
         "owner_phone_number": SecretStr("+918000000002"),
         "owner_confirmation_pin": SecretStr("246810"),
         "hotline_tool_token": SecretStr("never-print-this-tool-token"),
+        "hotline_public_tools_require_token": True,
         "public_base_url": "https://voice.example.test",
     }
     values.update(overrides)
@@ -467,6 +468,12 @@ def test_tool_manifest_has_all_endpoints_but_no_configured_secrets() -> None:
     assert all(tool.url.startswith("https://voice.example.test/") for tool in manifest.tools)
     assert "/v1/sarvam/tools/confirm-action" in rendered
     assert "${HOTLINE_TOOL_TOKEN}" in rendered
+    assert all(
+        tool.headers["Authorization"] == "Bearer ${HOTLINE_TOOL_TOKEN}" for tool in manifest.tools
+    )
+    assert all(
+        "Authorization: Bearer ${HOTLINE_TOOL_TOKEN}" in tool.curl for tool in manifest.tools
+    )
     assert "never-print-this-tool-token" not in rendered
     assert "never-print-this-api-key" not in rendered
     assert "246810" not in rendered
@@ -511,6 +518,22 @@ def test_tool_manifest_has_all_endpoints_but_no_configured_secrets() -> None:
     assert "Request value sources:" in markdown
     assert "Let the agent decide" in markdown
     assert "curl --request POST" in markdown
+
+
+def test_development_demo_tool_manifest_omits_authorization_everywhere() -> None:
+    manifest = build_samvaad_tool_manifest(
+        configured_settings(hotline_public_tools_require_token=False)
+    )
+    rendered = manifest.model_dump_json()
+    markdown = render_tool_manifest_markdown(manifest)
+
+    assert manifest.authentication["type"] == "none-development-demo"
+    assert all(tool.headers == {"Content-Type": "application/json"} for tool in manifest.tools)
+    assert all("Authorization" not in tool.curl for tool in manifest.tools)
+    assert '"Authorization":' not in rendered
+    assert "${HOTLINE_TOOL_TOKEN}" not in rendered
+    assert "Authentication: intentionally omitted" in markdown
+    assert "Production configuration rejects this mode" in markdown
 
 
 def test_each_live_tool_body_matches_its_current_daemon_schema() -> None:

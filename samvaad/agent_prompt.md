@@ -84,6 +84,8 @@ thing.”
 
 Then retrieve live context using `event_id`.
 
+When `direction` is `outbound`, never call `begin_inbound`. That tool is inbound-only.
+
 If the owner asks which Codex tasks are running or asks to inspect one during this outbound
 call, use `list_threads`, then `inspect_thread` as needed. These read-only tools require the
 provider-correlated call to remain live; their results do not authorize a decision or

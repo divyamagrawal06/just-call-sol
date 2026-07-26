@@ -153,6 +153,10 @@ async def test_api_authentication_boundaries_are_separate_and_fail_closed(
         json={"event_id": "evt_does-not-exist"},
         headers=_local_headers(),
     )
+    missing_tool_token = await api.client.post(
+        "/v1/sarvam/tools/context",
+        json={"event_id": "evt_does-not-exist"},
+    )
     accepted_auth = await api.client.post(
         "/v1/sarvam/tools/context",
         json={"event_id": "evt_does-not-exist"},
@@ -179,6 +183,7 @@ async def test_api_authentication_boundaries_are_separate_and_fail_closed(
     assert missing.status_code == 401
     assert invalid.status_code == 403
     assert crossed_tokens.status_code == 403
+    assert missing_tool_token.status_code == 401
     assert accepted_auth.status_code == 404
     assert blocking_notify.status_code == 422
     assert invalid_callback.status_code == 404
@@ -186,6 +191,7 @@ async def test_api_authentication_boundaries_are_separate_and_fail_closed(
         missing,
         invalid,
         crossed_tokens,
+        missing_tool_token,
         accepted_auth,
         blocking_notify,
         invalid_callback,
@@ -194,6 +200,122 @@ async def test_api_authentication_boundaries_are_separate_and_fail_closed(
         assert LOCAL_TOKEN not in response.text
         assert TOOL_TOKEN not in response.text
         assert CALLBACK_TOKEN not in response.text
+
+
+async def test_development_demo_can_omit_bearer_for_all_sarvam_tools(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        hotline_env="test",
+        hotline_database_path=tmp_path / "headerless-demo.sqlite3",
+        hotline_transport="fake",
+        hotline_public_tools_require_token=False,
+        hotline_tool_token="",
+        hotline_local_token=LOCAL_TOKEN,
+        hotline_callback_token=CALLBACK_TOKEN,
+        public_base_url="https://voice.example.test",
+        owner_phone_number="+919876543210",
+        owner_confirmation_pin=OWNER_PIN,
+        hotline_allowlisted_callers="+12025550147",
+        codex_app_server_enabled=False,
+    )
+    assert settings.public_tools_configured is True
+    app = create_app(settings=settings, provider=FakeCallProvider())
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            missing_event = "evt_does-not-exist"
+            requests = (
+                (
+                    "/v1/sarvam/tools/context",
+                    {"event_id": missing_event},
+                ),
+                (
+                    "/v1/sarvam/tools/record-instruction",
+                    {
+                        "event_id": missing_event,
+                        "outcome": "deny",
+                        "instruction": "Do not continue.",
+                        "confirmation_pin": OWNER_PIN,
+                    },
+                ),
+                (
+                    "/v1/sarvam/tools/prepare-action",
+                    {
+                        "event_id": missing_event,
+                        "action_type": "demo.pause_deployment",
+                        "parameters": {},
+                    },
+                ),
+                (
+                    "/v1/sarvam/tools/confirm-action",
+                    {
+                        "event_id": missing_event,
+                        "action_id": "act_missing",
+                        "confirmation_nonce": "nonce-missing",
+                        "exact_confirmation": "confirm the missing action",
+                        "confirmation_method": "spoken_plus_dtmf",
+                        "confirmation_pin": OWNER_PIN,
+                    },
+                ),
+                (
+                    "/v1/sarvam/tools/execute-action",
+                    {
+                        "event_id": missing_event,
+                        "action_id": "act_missing",
+                        "grant_id": "grant_missing",
+                    },
+                ),
+                (
+                    "/v1/sarvam/tools/threads/list",
+                    {"event_id": missing_event, "limit": 10},
+                ),
+                (
+                    "/v1/sarvam/tools/threads/inspect",
+                    {"event_id": missing_event, "reference": "thread-missing"},
+                ),
+                (
+                    "/v1/sarvam/tools/repository-context",
+                    {
+                        "event_id": missing_event,
+                        "operation": "status",
+                        "confirmation_pin": OWNER_PIN,
+                    },
+                ),
+            )
+            responses = [await client.post(path, json=payload) for path, payload in requests]
+            inbound = await client.post(
+                "/v1/sarvam/tools/begin-inbound",
+                json={
+                    "caller_phone_number": "+12025550148",
+                    "interaction_id": "headerless-unlisted",
+                },
+            )
+            local_api = await client.post(
+                "/v1/escalations/contact",
+                json=_contact_payload(wait_for_decision=False),
+            )
+
+    assert all(response.status_code == 404 for response in responses)
+    assert inbound.status_code == 200
+    assert inbound.json()["accepted"] is False
+    assert local_api.status_code == 401
+
+
+def test_production_rejects_headerless_sarvam_tool_configuration() -> None:
+    with pytest.raises(
+        ValueError,
+        match="HOTLINE_PUBLIC_TOOLS_REQUIRE_TOKEN cannot be disabled in production",
+    ):
+        Settings(
+            _env_file=None,
+            hotline_env="production",
+            hotline_public_tools_require_token=False,
+        )
 
 
 async def test_contact_waiter_is_woken_by_authoritative_mid_call_decision(
@@ -831,9 +953,25 @@ async def test_thread_reads_reject_an_uncorrelated_outbound_session(api: APIHarn
         json={"event_id": event.event_id, "reference": "thread-running"},
         headers=_tool_headers(),
     )
+    rejected_context = await api.client.post(
+        "/v1/sarvam/tools/context",
+        json={"event_id": event.event_id},
+        headers=_tool_headers(),
+    )
+    rejected_action = await api.client.post(
+        "/v1/sarvam/tools/prepare-action",
+        json={
+            "event_id": event.event_id,
+            "action_type": "demo.pause_deployment",
+            "parameters": {},
+        },
+        headers=_tool_headers(),
+    )
 
     assert rejected.status_code == 403
     assert rejected_inspection.status_code == 403
+    assert rejected_context.status_code == 403
+    assert rejected_action.status_code == 403
 
 
 async def test_missing_owner_pin_configuration_denies_grants_and_approvals(

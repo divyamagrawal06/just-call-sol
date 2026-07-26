@@ -310,7 +310,7 @@ class HotlineCoordinator:
     async def escalation_context(
         self, request: EscalationContextRequest
     ) -> EscalationContextResponse:
-        event = await self.store.require_event(request.event_id)
+        event = await self._require_live_voice_read_session(request.event_id)
         snapshot = await self.store.get_snapshot(event.event_id)
         decision = await self.store.get_decision(event.event_id)
         context = self._context_packet(event, snapshot)
@@ -442,7 +442,7 @@ class HotlineCoordinator:
 
     async def prepare_action(self, request: PrepareActionRequest) -> PrepareActionResponse:
         event = await self.store.require_event(request.event_id)
-        session_id = await self._require_live_session(event)
+        session_id = await self._require_live_voice_session(event)
         expires_at = utc_now() + timedelta(minutes=2)
         resolved_workspace = request.workspace_ref or event.workspace
         resolved_thread_id = request.thread_id or event.thread_id
@@ -525,7 +525,10 @@ class HotlineCoordinator:
         if action is None or action.event_id != request.event_id:
             raise NotFoundError("prepared action does not match this event")
         event = await self.store.require_event(action.event_id)
-        await self._require_live_session(event, expected_session_id=action.session_id)
+        await self._require_live_voice_session(
+            event,
+            expected_session_id=action.session_id,
+        )
         if await self.store.repository_context_was_exposed(event.event_id):
             raise PermissionError("repository evidence events cannot authorize an action")
         if not self._owner_pin_verified(request.confirmation_pin):
@@ -567,6 +570,11 @@ class HotlineCoordinator:
             raise NotFoundError("prepared action does not match this event")
         if action.kind is not ActionKind.REGISTERED_RUNBOOK and self.controller is None:
             raise RuntimeError("Codex thread control is unavailable")
+        event = await self.store.require_event(action.event_id)
+        await self._require_live_voice_session(
+            event,
+            expected_session_id=action.session_id,
+        )
         await self.store.consume_action(
             request.grant_id,
             action_hash=action.action_hash,
@@ -1438,25 +1446,36 @@ class HotlineCoordinator:
         """Authorize read-only task discovery only while its voice session is live."""
 
         event = await self.store.require_event(event_id)
+        await self._require_live_voice_session(event)
+        return event
+
+    async def _require_live_voice_session(
+        self,
+        event: EscalationEvent,
+        *,
+        expected_session_id: str | None = None,
+    ) -> str:
+        """Require a provider-correlated voice session for a public tool request."""
+
         inbound = (
             event.evidence.get("caller_allowlisted") is True
             and event.evidence.get("direction") == "inbound"
         )
         if inbound:
             await self._require_allowlisted_inbound(event.event_id)
-            await self._require_live_session(
+            return await self._require_live_session(
                 event,
+                expected_session_id=expected_session_id,
                 expected_direction=ContactDirection.INBOUND_CONTROL,
                 require_provider_correlation=True,
                 allowed_states={SessionState.CONNECTED, SessionState.DISCUSSING},
             )
-        else:
-            await self._require_live_session(
-                event,
-                expected_direction=ContactDirection.OUTBOUND_ESCALATION,
-                require_provider_correlation=True,
-            )
-        return event
+        return await self._require_live_session(
+            event,
+            expected_session_id=expected_session_id,
+            expected_direction=ContactDirection.OUTBOUND_ESCALATION,
+            require_provider_correlation=True,
+        )
 
     def _owner_pin_verified(self, submitted: Any) -> bool:
         configured = self.settings.owner_confirmation_pin.get_secret_value()

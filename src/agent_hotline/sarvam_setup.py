@@ -390,10 +390,12 @@ def build_samvaad_tool_manifest(
     normalized_base_url = _normalize_public_base_url(
         base_url or settings.public_base_url or PUBLIC_BASE_URL_PLACEHOLDER
     )
-    headers = {
-        "Authorization": f"Bearer {TOOL_TOKEN_PLACEHOLDER}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Content-Type": "application/json"}
+    if settings.hotline_public_tools_require_token:
+        headers = {
+            "Authorization": f"Bearer {TOOL_TOKEN_PLACEHOLDER}",
+            **headers,
+        }
     specifications: Sequence[
         tuple[
             str,
@@ -662,18 +664,37 @@ def build_samvaad_tool_manifest(
             }
         }
     )
-    return SamvaadToolManifest(
-        base_url=normalized_base_url,
-        authentication={
+    authentication = (
+        {
             "type": "bearer",
             "header": "Authorization",
             "value_placeholder": f"Bearer {TOOL_TOKEN_PLACEHOLDER}",
             "secret_source": "HOTLINE_TOOL_TOKEN",
-        },
+        }
+        if settings.hotline_public_tools_require_token
+        else {
+            "type": "none-development-demo",
+            "scope": "/v1/sarvam/tools/*",
+            "production_allowed": "false",
+            "remaining_gates": "live_session,pin,exact_readback,scoped_grant,rate_limit",
+        }
+    )
+    authentication_note = (
+        "Store HOTLINE_TOOL_TOKEN in Agent Studio's secret header configuration; "
+        "never place it in agent variables or dialogue."
+        if settings.hotline_public_tools_require_token
+        else (
+            "Development demo mode omits Authorization from Sarvam tools because the "
+            "provider rejects the configured secret header. Production rejects this mode; "
+            "live-session, PIN, readback, grant, and rate-limit gates remain enforced."
+        )
+    )
+    return SamvaadToolManifest(
+        base_url=normalized_base_url,
+        authentication=authentication,
         tools=tools,
         safety_notes=[
-            "Store HOTLINE_TOOL_TOKEN in Agent Studio's secret header configuration; "
-            "never place it in agent variables or dialogue.",
+            authentication_note,
             "Voice and caller ID alone do not verify identity.",
             "Pass the owner PIN only as the ephemeral confirmation_pin request field; "
             "never save it as an agent variable, response mapping, or transcript note.",
@@ -699,15 +720,21 @@ def build_samvaad_tool_manifest(
 def render_tool_manifest_markdown(manifest: SamvaadToolManifest) -> str:
     """Render a copy/paste-oriented secret-free manifest."""
 
+    authentication_description = (
+        "Authentication: bearer header using the `HOTLINE_TOOL_TOKEN` secret. "
+        "The snippets below contain a placeholder, never the configured value."
+        if manifest.authentication.get("type") == "bearer"
+        else (
+            "Authentication: intentionally omitted for this development demo's Sarvam "
+            "tool surface. Production configuration rejects this mode."
+        )
+    )
     lines = [
         "# Sarvam Samvaad HTTP tool setup",
         "",
         f"Base URL: `{manifest.base_url}`",
         "",
-        (
-            "Authentication: bearer header using the `HOTLINE_TOOL_TOKEN` secret. "
-            "The snippets below contain a placeholder, never the configured value."
-        ),
+        authentication_description,
         "",
     ]
     for tool in manifest.tools:
@@ -897,14 +924,12 @@ def _tool_definition(
 ) -> SamvaadToolDefinition:
     url = f"{base_url}{path}"
     compact_body = json.dumps(body, sort_keys=True, separators=(",", ":"))
-    curl = "\n".join(
-        (
-            f"curl --request POST '{url}' \\",
-            f'  --header "Authorization: Bearer {TOOL_TOKEN_PLACEHOLDER}" \\',
-            "  --header 'Content-Type: application/json' \\",
-            f"  --data-raw '{compact_body}'",
-        )
+    curl_lines = [f"curl --request POST '{url}' \\"]
+    curl_lines.extend(
+        f"  --header {json.dumps(f'{name}: {value}')} \\" for name, value in headers.items()
     )
+    curl_lines.append(f"  --data-raw '{compact_body}'")
+    curl = "\n".join(curl_lines)
     return SamvaadToolDefinition(
         name=name,
         description=description,

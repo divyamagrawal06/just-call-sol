@@ -473,7 +473,7 @@ def _install_routes(app: FastAPI) -> None:
     @app.post(
         "/v1/sarvam/tools/context",
         response_model=EscalationContextResponse,
-        dependencies=[Depends(_require_tool_token), Depends(_rate_limit_public)],
+        dependencies=[Depends(_require_public_tool_token), Depends(_rate_limit_public)],
     )
     async def context_tool(
         payload: EscalationContextRequest,
@@ -484,7 +484,7 @@ def _install_routes(app: FastAPI) -> None:
     @app.post(
         "/v1/sarvam/tools/record-instruction",
         response_model=RecordInstructionResponse,
-        dependencies=[Depends(_require_tool_token), Depends(_rate_limit_public)],
+        dependencies=[Depends(_require_public_tool_token), Depends(_rate_limit_public)],
     )
     async def instruction_tool(
         payload: RecordInstructionRequest,
@@ -495,7 +495,7 @@ def _install_routes(app: FastAPI) -> None:
     @app.post(
         "/v1/sarvam/tools/prepare-action",
         response_model=PrepareActionResponse,
-        dependencies=[Depends(_require_tool_token), Depends(_rate_limit_public)],
+        dependencies=[Depends(_require_public_tool_token), Depends(_rate_limit_public)],
     )
     async def prepare_action_tool(
         payload: PrepareActionRequest,
@@ -506,7 +506,7 @@ def _install_routes(app: FastAPI) -> None:
     @app.post(
         "/v1/sarvam/tools/confirm-action",
         response_model=ConfirmActionResponse,
-        dependencies=[Depends(_require_tool_token), Depends(_rate_limit_public)],
+        dependencies=[Depends(_require_public_tool_token), Depends(_rate_limit_public)],
     )
     async def confirm_action_tool(
         payload: ConfirmActionRequest,
@@ -517,7 +517,7 @@ def _install_routes(app: FastAPI) -> None:
     @app.post(
         "/v1/sarvam/tools/execute-action",
         response_model=ExecuteActionResponse,
-        dependencies=[Depends(_require_tool_token), Depends(_rate_limit_public)],
+        dependencies=[Depends(_require_public_tool_token), Depends(_rate_limit_public)],
     )
     async def execute_action_tool(
         payload: ExecuteActionRequest,
@@ -528,7 +528,7 @@ def _install_routes(app: FastAPI) -> None:
     @app.post(
         "/v1/sarvam/tools/begin-inbound",
         response_model=BeginInboundSessionResponse,
-        dependencies=[Depends(_require_tool_token), Depends(_rate_limit_public)],
+        dependencies=[Depends(_require_public_tool_token), Depends(_rate_limit_public)],
     )
     async def begin_inbound_tool(
         payload: BeginInboundSessionRequest,
@@ -538,7 +538,7 @@ def _install_routes(app: FastAPI) -> None:
 
     @app.post(
         "/v1/sarvam/tools/threads/list",
-        dependencies=[Depends(_require_tool_token), Depends(_rate_limit_public)],
+        dependencies=[Depends(_require_public_tool_token), Depends(_rate_limit_public)],
     )
     async def list_threads_tool(
         payload: ThreadListRequest,
@@ -548,7 +548,7 @@ def _install_routes(app: FastAPI) -> None:
 
     @app.post(
         "/v1/sarvam/tools/threads/inspect",
-        dependencies=[Depends(_require_tool_token), Depends(_rate_limit_public)],
+        dependencies=[Depends(_require_public_tool_token), Depends(_rate_limit_public)],
     )
     async def inspect_thread_tool(
         payload: ThreadInspectRequest,
@@ -560,7 +560,7 @@ def _install_routes(app: FastAPI) -> None:
         "/v1/sarvam/tools/repository-context",
         response_model=RepositoryContextResponse,
         dependencies=[
-            Depends(_require_tool_token),
+            Depends(_require_public_tool_token),
             Depends(_rate_limit_repository_context),
         ],
     )
@@ -594,11 +594,14 @@ async def _require_local_token(
     _verify_bearer(authorization, expected, unavailable_status=503)
 
 
-async def _require_tool_token(
+async def _require_public_tool_token(
     request: Request,
     authorization: str | None = Header(default=None),
 ) -> None:
-    expected = _settings(request).hotline_tool_token.get_secret_value()
+    settings = _settings(request)
+    if not settings.hotline_public_tools_require_token:
+        return
+    expected = settings.hotline_tool_token.get_secret_value()
     _verify_bearer(authorization, expected, unavailable_status=503)
 
 
