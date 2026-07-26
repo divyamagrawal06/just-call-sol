@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-hotline"
+version = "0.1.0"
+description = "A bidirectional voice control plane for Codex and Claude agents."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = { text = "MIT" }
+authors = [{ name = "Agent Hotline contributors" }]
+keywords = ["codex", "claude", "mcp", "voice-agent", "sarvam", "samvaad"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dependencies = [
+  "aiosqlite>=0.20,<1",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "mcp>=1.12,<2",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "rich>=13.9,<15",
+  "typer>=0.15,<1",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+  "respx>=0.22,<1",
+  "ruff>=0.8,<1",
+]
+
+[project.scripts]
+agent-hotline = "agent_hotline.cli:app"
+agent-hotline-claude-hook = "agent_hotline.claude_hooks:main"
+agent-hotline-mcp = "agent_hotline.mcp_server:main"
+agent-hotline-sarvam = "agent_hotline.sarvam_setup:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_hotline"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "C4", "SIM", "RUF"]
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

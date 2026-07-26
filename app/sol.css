@@ -1,0 +1,757 @@
+/* JUST CALL SOL — a hostage situation for coding agents.
+   Effects lifted directly from the arlan.me vault (MIT → free to copy):
+   ransom-note cutouts, the typer, CRT ASCII treatment, emboss, chromatic glow. */
+
+/* ── tokens ─────────────────────────────────────────────────────────── */
+
+:root {
+  --paper: #f1ede2;          /* the desk */
+  --paper-hi: #f8f5ec;       /* a fresher sheet */
+  --manila: #e9dfc4;         /* the action ticket */
+  --ink: #191611;            /* typewriter ribbon */
+  --ink-soft: #4a453b;
+  --ink-faint: #8d8677;
+  --red: #c22f2c;            /* URGENT stamp */
+  --tape: rgba(233, 222, 187, 0.75);
+  --accent: #12a150;         /* typer green, stolen as-is */
+  --phosphor: #49f47e;       /* the monitor */
+  --phosphor-dim: #1d6b3c;
+  --crt-bg: #060a07;
+  --warm: #ff8a00;           /* chroma glow warm */
+  --cool: #35f0ff;           /* chroma glow cool (the vault's --neon) */
+  --ease-out: cubic-bezier(.215, .61, .355, 1);
+  --ease-amo: cubic-bezier(.175, .885, .32, 1.1);
+  --type: "Courier Prime", "Courier New", ui-monospace, monospace;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body { overflow-x: clip; }
+
+body {
+  background:
+    radial-gradient(120% 90% at 50% 0%, rgba(255, 255, 255, 0.5), transparent 60%),
+    var(--paper);
+  color: var(--ink);
+  font-family: var(--type);
+  font-size: 16px;
+  line-height: 1.65;
+}
+
+/* paper grain over everything (cheap, one fixed layer) */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 40;
+  opacity: .5;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3CfeColorMatrix values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.05 0'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+::selection { background: var(--red); color: var(--paper-hi); }
+
+a { color: inherit; }
+
+:focus-visible { outline: 2px solid var(--red); outline-offset: 3px; }
+
+.col {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+.measure { max-width: 640px; }
+
+/* ── the typer (CSS lifted verbatim from arlan.me/vault/typer) ──────── */
+
+[data-typer] {
+  --typer-fg: var(--ink);
+  --typer-bg: var(--paper);
+  --typer-accent: var(--accent);
+  --typer-accent-ink: var(--paper-hi);
+  --typer-radius: 5px;
+}
+
+[data-typer][data-typer-type="initial"] { opacity: 0; }
+
+[data-typer] .word { white-space: pre; }
+
+[data-typer] .word .char {
+  box-sizing: content-box;
+  display: inline-block;
+  color: var(--typer-fg);
+  background: transparent;
+  transition: none;
+}
+
+[data-typer] .word .char.charInit { color: transparent; }
+
+[data-typer] .word .char.charFill {
+  color: var(--typer-bg);
+  background: var(--typer-fg);
+  border-radius: var(--typer-radius);
+}
+[data-typer] .word .char.charFill:has(+ .charFill) {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+[data-typer] .word .char.charFill + .charFill { border-radius: 0; }
+[data-typer] .word .char.charFill + .charFill:last-child,
+[data-typer] .word .char.charFill + .charFill:has(+ :not(.charFill)) {
+  border-radius: 0 var(--typer-radius) var(--typer-radius) 0;
+}
+
+[data-typer] .word .char.charInverse {
+  color: var(--typer-bg);
+  background: var(--typer-fg);
+}
+
+[data-typer] .word .char.charAccent {
+  color: var(--typer-accent);
+  background: transparent;
+}
+
+[data-typer] .word .char.charAccentInverse {
+  color: var(--typer-accent-ink);
+  background: var(--typer-accent);
+  border-radius: var(--typer-radius);
+}
+[data-typer] .word .char.charAccentInverse:has(+ .charAccentInverse) {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+[data-typer] .word .char.charAccentInverse + .charAccentInverse { border-radius: 0; }
+[data-typer] .word .char.charAccentInverse + .charAccentInverse:last-child,
+[data-typer] .word .char.charAccentInverse + .charAccentInverse:has(+ :not(.charAccentInverse)) {
+  border-radius: 0 var(--typer-radius) var(--typer-radius) 0;
+}
+
+[data-typer] .word .char.charAccentFill {
+  color: var(--typer-accent);
+  background: var(--typer-accent);
+}
+
+[data-typer] .word .char.charBorder {
+  position: relative;
+  color: var(--typer-fg);
+}
+[data-typer] .word .char.charBorder::after {
+  content: "";
+  display: inline-block;
+  position: absolute;
+  inset: 0;
+  border: 1px solid var(--typer-accent);
+  border-radius: var(--typer-radius);
+}
+[data-typer] .word .char.charBorder:has(+ .charBorder)::after {
+  border-right: 1px solid transparent;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+[data-typer] .word .char.charBorder + .charBorder::after {
+  border-left: 1px solid transparent;
+  border-right: 1px solid transparent;
+  border-radius: 0;
+}
+[data-typer] .word .char.charBorder + .charBorder:last-child::after,
+[data-typer] .word .char.charBorder + .charBorder:has(+ :not(.charBorder))::after {
+  border-left: 1px solid transparent;
+  border-right: 1px solid var(--typer-accent);
+  border-radius: 0 var(--typer-radius) var(--typer-radius) 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-typer][data-typer-type="initial"] { opacity: 1; }
+  [data-typer] .word .char.charInit { color: var(--typer-fg); }
+}
+
+/* ── section scaffolding ────────────────────────────────────────────── */
+
+.sec { padding: 88px 0 0; }
+
+.sec-tag {
+  font-size: 12px;
+  letter-spacing: .22em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin-bottom: 6px;
+}
+
+h2.typed {
+  font-size: clamp(21px, 3.4vw, 27px);
+  font-weight: 700;
+  line-height: 1.35;
+  margin-bottom: 18px;
+}
+
+.sec p { color: var(--ink-soft); }
+.sec .measure p + p { margin-top: 14px; }
+.sec strong { color: var(--ink); }
+
+/* ── hero: the ransom note ──────────────────────────────────────────── */
+
+.hero { padding: 72px 0 0; }
+
+.note {
+  position: relative;
+  background:
+    linear-gradient(178deg, rgba(255,255,255,.65), rgba(255,255,255,0) 40%),
+    var(--paper-hi);
+  border: 1px solid rgba(25, 22, 17, 0.12);
+  box-shadow:
+    0 1px 2px rgba(25, 22, 17, 0.08),
+    0 12px 40px -12px rgba(25, 22, 17, 0.28);
+  padding: clamp(40px, 7vw, 84px) clamp(20px, 5vw, 64px) clamp(36px, 5vw, 56px);
+  transform: rotate(-0.5deg);
+}
+
+/* masking tape on the corners */
+.note::before, .note::after,
+.tape-b::before, .tape-b::after {
+  content: "";
+  position: absolute;
+  width: 108px;
+  height: 30px;
+  background: var(--tape);
+  box-shadow: 0 1px 3px rgba(25, 22, 17, 0.18);
+  opacity: .9;
+}
+.note::before { top: -13px; left: 6%; transform: rotate(-5deg); }
+.note::after  { top: -11px; right: 7%; transform: rotate(4deg); }
+.tape-b::before { bottom: -12px; left: 12%; transform: rotate(3deg); }
+.tape-b::after  { bottom: -14px; right: 10%; transform: rotate(-6deg); }
+
+.ransom {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: center;
+  row-gap: clamp(6px, 2vw, 18px);
+  column-gap: clamp(18px, 4vw, 44px);
+}
+
+.ransom .rword {
+  display: inline-flex;
+  align-items: baseline;
+}
+
+.ransom img {
+  display: block;
+  height: var(--rh, 96px);
+  width: auto;
+  filter: drop-shadow(0 2px 2px rgba(25, 22, 17, 0.28));
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+/* the URGENT stamp, half off the note */
+.stamp-urgent {
+  position: absolute;
+  top: -26px;
+  right: clamp(8px, 6vw, 72px);
+  transform: rotate(12deg);
+  border: 3px solid var(--red);
+  border-radius: 6px;
+  color: var(--red);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: .32em;
+  padding: 6px 14px 6px 18px;
+  opacity: .82;
+  mix-blend-mode: multiply;
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='r'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.7' numOctaves='3'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0.9 0.28'/%3E%3C/filter%3E%3Crect width='120' height='120' fill='%23fff' filter='url(%23r)'/%3E%3C/svg%3E");
+}
+
+.hero-sub {
+  margin-top: 34px;
+  text-align: center;
+}
+
+.hero-sub .typed-line {
+  font-size: clamp(16px, 2.4vw, 20px);
+  font-weight: 700;
+}
+
+.hero-sub .small {
+  margin-top: 10px;
+  color: var(--ink-soft);
+  font-size: 14.5px;
+}
+
+.reroll {
+  margin-top: 18px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--type);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  color: var(--ink);
+  background: var(--paper-hi);
+  border: 1.5px solid var(--ink);
+  border-radius: 999px;
+  padding: 8px 18px;
+  cursor: pointer;
+  box-shadow: 2.5px 2.5px 0 var(--ink);
+  transition: transform .15s var(--ease-amo), box-shadow .15s var(--ease-amo);
+}
+.reroll:hover { transform: translate(-1px, -1px); box-shadow: 4px 4px 0 var(--ink); }
+.reroll:active { transform: translate(1.5px, 1.5px); box-shadow: 1px 1px 0 var(--ink); }
+
+/* ── the letter ─────────────────────────────────────────────────────── */
+
+.letter {
+  position: relative;
+  background: var(--paper-hi);
+  border: 1px solid rgba(25, 22, 17, 0.12);
+  box-shadow: 0 8px 28px -14px rgba(25, 22, 17, 0.3);
+  padding: 34px 34px 30px;
+  max-width: 560px;
+  transform: rotate(0.4deg);
+  font-size: 15.5px;
+  line-height: 1.8;
+}
+
+.letter::before {
+  content: "";
+  position: absolute;
+  top: -12px;
+  left: 40px;
+  width: 96px;
+  height: 26px;
+  background: var(--tape);
+  transform: rotate(-3deg);
+  box-shadow: 0 1px 3px rgba(25, 22, 17, 0.18);
+}
+
+.letter .shout { font-weight: 700; letter-spacing: .04em; }
+.letter .sig { margin-top: 14px; color: var(--ink-faint); }
+
+.aside-note { margin-top: 26px; }
+
+/* ── the monitor (CRT ASCII treatment) ──────────────────────────────── */
+
+.monitor-wrap { margin-top: 26px; }
+
+.bezel {
+  background: linear-gradient(180deg, #2b2925, #171512);
+  border-radius: 18px;
+  padding: 18px 18px 12px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 24px 60px -20px rgba(25, 22, 17, 0.55);
+}
+
+.crt {
+  position: relative;
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--crt-bg);
+  aspect-ratio: 16 / 8.4;
+  /* the screen bulges: vault's "curvature" as an inset glow + rounded glass */
+  box-shadow:
+    inset 0 0 60px rgba(0, 0, 0, 0.75),
+    inset 0 0 6px rgba(73, 244, 126, 0.18);
+}
+
+.crt canvas { display: block; width: 100%; height: 100%; }
+
+/* scanlines + vignette + slow flicker, per the vault's old-TV recipe */
+.crt::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0) 0px,
+    rgba(0, 0, 0, 0) 2px,
+    rgba(0, 0, 0, 0.22) 3px
+  );
+  mix-blend-mode: multiply;
+}
+.crt::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(115% 100% at 50% 45%, transparent 55%, rgba(0, 0, 0, 0.5) 100%);
+  animation: crt-flicker 4.2s steps(2, jump-none) infinite;
+}
+
+@keyframes crt-flicker {
+  0%, 92% { opacity: 1; }
+  94% { opacity: .93; }
+  96% { opacity: 1; }
+  98% { opacity: .96; }
+}
+
+.bezel-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 4px 0;
+  color: #8d8677;
+  font-size: 11.5px;
+  letter-spacing: .22em;
+}
+
+.bezel-row .led {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--phosphor);
+  box-shadow: 0 0 8px var(--phosphor);
+  margin-right: 8px;
+  vertical-align: 1px;
+}
+
+.tape-steps { margin-top: 30px; counter-reset: step; list-style: none; }
+
+.tape-steps li {
+  counter-increment: step;
+  position: relative;
+  padding-left: 54px;
+  max-width: 640px;
+}
+.tape-steps li + li { margin-top: 16px; }
+
+.tape-steps li::before {
+  content: counter(step, decimal-leading-zero);
+  position: absolute;
+  left: 0;
+  top: 2px;
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--paper-hi);
+  background: var(--ink);
+  padding: 2px 7px;
+  transform: rotate(-2deg);
+}
+
+.tape-steps b { color: var(--ink); }
+
+/* ── sol's rules + the ticket ───────────────────────────────────────── */
+
+.rules-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: 44px;
+  align-items: start;
+}
+
+.rule-strips { list-style: none; }
+
+.rule-strips li {
+  background: var(--paper-hi);
+  border: 1px solid rgba(25, 22, 17, 0.12);
+  box-shadow: 0 2px 10px -4px rgba(25, 22, 17, 0.25);
+  padding: 12px 18px;
+  font-size: 15px;
+  max-width: 520px;
+}
+.rule-strips li:nth-child(odd) { transform: rotate(-0.6deg); }
+.rule-strips li:nth-child(even) { transform: rotate(0.5deg) translateX(10px); }
+.rule-strips li + li { margin-top: 12px; }
+.rule-strips b { letter-spacing: .02em; }
+
+/* the manila action ticket */
+.ticket {
+  position: relative;
+  background:
+    linear-gradient(170deg, rgba(255,255,255,.4), rgba(255,255,255,0) 45%),
+    var(--manila);
+  border: 1px solid rgba(25, 22, 17, 0.18);
+  box-shadow: 0 14px 34px -16px rgba(25, 22, 17, 0.45);
+  padding: 22px 22px 70px;
+  transform: rotate(1.2deg);
+  font-size: 13px;
+}
+
+.ticket::before {
+  content: "";
+  position: absolute;
+  top: -12px;
+  right: 34px;
+  width: 90px;
+  height: 26px;
+  background: var(--tape);
+  transform: rotate(4deg);
+  box-shadow: 0 1px 3px rgba(25, 22, 17, 0.18);
+}
+
+.ticket-head {
+  font-weight: 700;
+  letter-spacing: .18em;
+  font-size: 12px;
+  border-bottom: 1.5px dashed rgba(25, 22, 17, 0.35);
+  padding-bottom: 8px;
+  margin-bottom: 12px;
+}
+
+.ticket dl { display: grid; gap: 7px; }
+.ticket dl div { display: grid; grid-template-columns: 92px 1fr; gap: 10px; }
+.ticket dt { color: rgba(25, 22, 17, 0.5); letter-spacing: .06em; }
+.ticket dd { font-weight: 700; overflow-wrap: anywhere; }
+.ticket dd small { font-weight: 400; color: rgba(25, 22, 17, 0.55); }
+
+/* embossed seal — the vault's emboss recipe in pure CSS: engraved text via
+   opposing light/shadow, on a raised ring */
+.seal {
+  position: absolute;
+  bottom: -26px;
+  right: 18px;
+  width: 118px;
+  height: 118px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  text-align: center;
+  transform: rotate(-11deg);
+  background: var(--manila);
+  box-shadow:
+    inset 1.5px 2px 2px rgba(255, 255, 255, 0.75),
+    inset -1.5px -2px 3px rgba(66, 52, 24, 0.4),
+    0 6px 14px -6px rgba(25, 22, 17, 0.4);
+}
+.seal::before {
+  content: "";
+  position: absolute;
+  inset: 9px;
+  border-radius: 50%;
+  box-shadow:
+    inset -1px -1.5px 1.5px rgba(255, 255, 255, 0.7),
+    inset 1px 1.5px 2px rgba(66, 52, 24, 0.45);
+}
+.seal span {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .18em;
+  line-height: 1.5;
+  color: rgba(83, 66, 32, 0.9);
+  text-shadow:
+    0.8px 1px 0.8px rgba(255, 255, 255, 0.8),
+    -0.8px -1px 1px rgba(66, 52, 24, 0.55);
+}
+
+.stamp-void {
+  position: absolute;
+  bottom: 34px;
+  left: 16px;
+  transform: rotate(-7deg);
+  border: 2.5px solid var(--red);
+  color: var(--red);
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: .22em;
+  padding: 4px 10px;
+  opacity: .7;
+  mix-blend-mode: multiply;
+}
+
+/* ── the kit: label-maker tapes ─────────────────────────────────────── */
+
+.kit { list-style: none; max-width: 680px; }
+
+.kit li {
+  display: grid;
+  grid-template-columns: 250px 1fr;
+  gap: 18px;
+  align-items: start;
+}
+.kit li + li { margin-top: 18px; }
+
+.kit .lab {
+  justify-self: start;
+  background: var(--ink);
+  color: var(--paper-hi);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  padding: 4px 10px;
+  box-shadow: 2px 2px 0 rgba(25, 22, 17, 0.25);
+  overflow-wrap: anywhere;
+}
+.kit li:nth-child(odd) .lab { transform: rotate(-1.6deg); }
+.kit li:nth-child(even) .lab { transform: rotate(1.2deg); }
+
+.kit p { font-size: 14.5px; }
+
+.kit-voice {
+  margin-top: 26px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 8px;
+  max-width: 680px;
+}
+
+.kit-voice span {
+  background: var(--paper-hi);
+  border: 1px solid rgba(25, 22, 17, 0.25);
+  font-size: 12px;
+  font-weight: 700;
+  padding: 3px 9px;
+  box-shadow: 1.5px 1.5px 0 rgba(25, 22, 17, 0.2);
+}
+.kit-voice span:nth-child(3n) { transform: rotate(1.4deg); }
+.kit-voice span:nth-child(3n+1) { transform: rotate(-1.2deg); }
+
+/* ── the drill: receipts ────────────────────────────────────────────── */
+
+.drill { list-style: none; counter-reset: drill; max-width: 680px; }
+
+.drill > li { counter-increment: drill; }
+.drill > li + li { margin-top: 34px; }
+
+.drill-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.drill-head::before {
+  content: counter(drill) ".";
+  font-weight: 700;
+  font-size: 19px;
+  color: var(--red);
+}
+
+.drill-head h3 { font-size: 17px; font-weight: 700; }
+
+.drill > li > p { font-size: 14.5px; max-width: 620px; }
+
+.receipt {
+  position: relative;
+  margin-top: 12px;
+  background: var(--paper-hi);
+  border: 1px solid rgba(25, 22, 17, 0.14);
+  box-shadow: 0 6px 18px -10px rgba(25, 22, 17, 0.35);
+  transform: rotate(-0.3deg);
+}
+.drill > li:nth-child(even) .receipt { transform: rotate(0.35deg); }
+
+/* perforated top edge */
+.receipt::before {
+  content: "";
+  position: absolute;
+  top: -5px;
+  left: 0;
+  right: 0;
+  height: 5px;
+  background-image: radial-gradient(circle at 5px 0, transparent 4px, var(--paper-hi) 4.5px);
+  background-size: 12px 5px;
+}
+
+.receipt pre {
+  padding: 16px 18px;
+  overflow-x: auto;
+  font-family: var(--type);
+  font-size: 13.5px;
+  line-height: 1.75;
+  color: var(--ink);
+}
+
+.receipt pre code::before { content: "$ "; color: var(--ink-faint); }
+.receipt pre code { display: block; }
+
+.copy-btn {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  font-family: var(--type);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  color: var(--ink);
+  background: var(--tape);
+  border: 0;
+  padding: 5px 12px;
+  cursor: pointer;
+  transform: rotate(2deg);
+  box-shadow: 0 1px 3px rgba(25, 22, 17, 0.2);
+  transition: transform .15s var(--ease-amo);
+}
+.copy-btn:hover { transform: rotate(0deg) scale(1.06); }
+.copy-btn .copy-done { display: none; color: var(--accent); }
+.copy-btn.copied .copy-label { display: none; }
+.copy-btn.copied .copy-done { display: inline; }
+
+/* ── footer: chromatic glow ─────────────────────────────────────────── */
+
+.tail {
+  margin-top: 110px;
+  background: #12100c;
+  color: #b7ad99;
+  padding: 84px 0 60px;
+}
+
+.glow-line { text-align: center; }
+
+/* the vault's chroma glow, CSS edition: real bloom from stacked blurred copies,
+   then a warm and a cool copy pulled apart toward the cursor */
+.glow {
+  position: relative;
+  display: inline-block;
+  font-size: clamp(34px, 7vw, 64px);
+  font-weight: 700;
+  letter-spacing: .06em;
+  color: #f6efdf;
+  text-shadow:
+    0 0 14px rgba(246, 239, 223, 0.55),
+    0 0 44px rgba(246, 239, 223, 0.3),
+    0 0 90px rgba(246, 239, 223, 0.2);
+}
+.glow::before, .glow::after {
+  content: attr(data-text);
+  position: absolute;
+  inset: 0;
+  mix-blend-mode: screen;
+  pointer-events: none;
+  filter: blur(1.5px);
+}
+.glow::before {
+  color: var(--warm);
+  opacity: .75;
+  transform: translate(calc(var(--lean-x, 0) * -9px), calc(var(--lean-y, 0) * -4px));
+}
+.glow::after {
+  color: var(--cool);
+  opacity: .75;
+  transform: translate(calc(var(--lean-x, 0) * 9px), calc(var(--lean-y, 0) * 4px));
+}
+
+.tail-note {
+  margin-top: 44px;
+  text-align: center;
+  font-size: 13px;
+  line-height: 2;
+  color: #7d7565;
+}
+.tail-note a { color: #b7ad99; text-underline-offset: 3px; }
+.tail-note a:hover { color: #f6efdf; }
+
+/* ── responsive ─────────────────────────────────────────────────────── */
+
+@media (max-width: 860px) {
+  .rules-grid { grid-template-columns: 1fr; }
+  .ticket { max-width: 400px; margin-top: 26px; margin-bottom: 34px; }
+}
+
+@media (max-width: 620px) {
+  .sec { padding-top: 64px; }
+  .kit li { grid-template-columns: 1fr; gap: 6px; }
+  .rule-strips li:nth-child(even) { transform: rotate(0.5deg); }
+  .note { transform: rotate(0deg); }
+  .stamp-urgent { top: -20px; right: 8px; font-size: 12px; }
+}
+
+/* ── reduced motion ─────────────────────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  .crt::after { animation: none; }
+  .reroll, .copy-btn { transition: none; }
+}

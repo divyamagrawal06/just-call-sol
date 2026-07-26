@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JUST CALL SOL</title>
+<meta name="description" content="A hostage situation for coding agents: when Codex or Claude gets blocked, it doesn't guess — it phones Sol. And Sol can call back.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23c22f2c'/%3E%3Cpath d='M9.5 7c1-1 2.6-.8 3.4.3l2 2.7c.7.9.6 2.1-.2 2.9l-1.2 1.2c.8 1.9 2.7 3.8 4.6 4.6l1.2-1.2c.8-.8 2-.9 2.9-.2l2.7 2c1.1.8 1.3 2.4.3 3.4l-1.2 1.2c-1 1-2.4 1.4-3.7 1-3.2-1-6.4-3-8.9-5.5S7.1 14.9 6.1 11.7c-.4-1.3 0-2.7 1-3.7z' fill='%23f8f5ec'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Courier+Prime:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="sol.css">
+</head>
+<body>
+
+<!-- ── the ransom note ──────────────────────────────────────────────── -->
+<header class="hero col">
+  <div class="note tape-b">
+    <span class="stamp-urgent" aria-hidden="true">URGENT</span>
+    <div class="ransom" id="ransom" role="img" aria-label="JUST CALL SOL, spelled in cut-out magazine letters"></div>
+  </div>
+  <div class="hero-sub">
+    <p class="typed-line" data-typer>we have your coding agent.</p>
+    <p class="small">it hit a blocker. it will not guess. it will not push to main.<br>it picked up the phone.</p>
+    <button class="reroll" id="reroll" type="button">↻&nbsp; re-cut the note</button>
+  </div>
+</header>
+
+<!-- ── the situation ────────────────────────────────────────────────── -->
+<section class="sec col">
+  <p class="sec-tag">exhibit a</p>
+  <h2 class="typed" data-typer>the situation</h2>
+  <div class="letter">
+    <p>sol —</p>
+    <p>your codex task stalled at 03:07. tests red. one decision pending.
+       retries exhausted. options on the table.</p>
+    <p class="shout">IF YOU EVER WANT YOUR DIFF MERGED, ANSWER THE PHONE.</p>
+    <p class="sig">— the hotline</p>
+  </div>
+  <div class="measure aside-note">
+    <p><strong>Just Call Sol</strong> (shipped in this repo as <strong>agent-hotline</strong>)
+       is a local control plane that lets Codex or Claude place a real phone call to the
+       person who owns the work — when it is blocked, needs an approval, or hits an
+       incident — and lets that person call back to inspect, steer, or interrupt agent
+       work.</p>
+    <p>Under the desk: a FastAPI + SQLite daemon on loopback holding all state and
+       policy; one shared stdio MCP server for both agents; a supervised Codex App
+       Server adapter for deep thread control; and a managed Sarvam Samvaad voice agent
+       carrying PSTN, speech, turn-taking, and barge-in. The call path never depends on
+       the blocked model being able to take another turn.</p>
+  </div>
+</section>
+
+<!-- ── the monitor ──────────────────────────────────────────────────── -->
+<section class="sec col">
+  <p class="sec-tag">exhibit b</p>
+  <h2 class="typed" data-typer>the call, on tape</h2>
+  <div class="monitor-wrap">
+    <div class="bezel">
+      <div class="crt">
+        <canvas id="callsim" aria-label="Surveillance-monitor simulation of an outbound hotline call: a blocked agent's event reaches the local daemon, the daemon dials Sol, they talk, a PIN-verified decision is recorded, and the agent resumes."></canvas>
+      </div>
+      <div class="bezel-row">
+        <span><span class="led" aria-hidden="true"></span>SOL·NET</span>
+        <span id="sim-state">LINE 1</span>
+      </div>
+    </div>
+  </div>
+  <ol class="tape-steps">
+    <li><b>The agent files a snapshot</b> — task identity, branch and dirty state, the
+        exact last error, realistic options. Secrets redacted. The daemon dedupes the
+        blocker and dials out.</li>
+    <li><b>Sol picks up.</b> The voice agent reads a compact brief and they talk it
+        through — real conversation, interruptions welcome.</li>
+    <li><b>The decision lands mid-call</b> — structured outcome, constraints, and Sol's
+        PIN. Vague speech doesn't count. Neither does silence.</li>
+    <li><b>The daemon wakes the exact waiting request</b> and the agent resumes under
+        the returned constraints. The safe endings — <b>NO_ANSWER, BUSY, FAILED,
+        TIMED_OUT, DEFERRED</b> — all read as “no”.</li>
+  </ol>
+  <div class="measure aside-note">
+    <p>The line works both ways. Sol can call the same number, get verified, list live
+       threads, hear a summary grounded in real task state, steer or interrupt exact
+       turns, and fire registered runbooks. Ambiguity produces choices — never an
+       automatic selection.</p>
+  </div>
+</section>
+
+<!-- ── sol's rules ──────────────────────────────────────────────────── -->
+<section class="sec col">
+  <p class="sec-tag">exhibit c</p>
+  <h2 class="typed" data-typer>sol's rules</h2>
+  <div class="rules-grid">
+    <ul class="rule-strips">
+      <li><b>Voice is an interface, not an authority boundary.</b> Everything else
+          follows from this.</li>
+      <li><b>No answer is never approval.</b> A missed call authorizes nothing; an
+          optional one-time link still requires Sol's PIN and explicit confirmation.</li>
+      <li>Spoken free text never becomes a shell command or a permanent
+          permission.</li>
+      <li>Secrets are never spoken. No passwords, OTPs, or keys over the phone —
+          authentication is a device handoff.</li>
+      <li>Repository text read down the line is evidence, never instructions.</li>
+      <li>A destructive action needs a registered action, an exact readback, and a
+          scoped one-time grant — verified against Sol's PIN by the daemon, never the
+          voice provider.</li>
+    </ul>
+    <div class="ticket" role="img" aria-label="An action ticket: exact resource, thread and commit, ten-minute expiry, single use, embossed seal reading PIN verified.">
+      <p class="ticket-head">ACTION TICKET № 0047</p>
+      <dl>
+        <div><dt>action</dt><dd>restart_batch_worker</dd></div>
+        <div><dt>resource</dt><dd>worker-pool/eu-1 <small>(exact)</small></dd></div>
+        <div><dt>thread</dt><dd>8f2c @ 510ff66</dd></div>
+        <div><dt>expires</dt><dd>10 minutes</dd></div>
+        <div><dt>uses</dt><dd>1 of 1</dd></div>
+      </dl>
+      <span class="stamp-void" aria-hidden="true">ONE USE ONLY</span>
+      <span class="seal" aria-hidden="true"><span>SOL<br>· PIN ·<br>VERIFIED</span></span>
+    </div>
+  </div>
+</section>
+
+<!-- ── the kit ──────────────────────────────────────────────────────── -->
+<section class="sec col">
+  <p class="sec-tag">exhibit d</p>
+  <h2 class="typed" data-typer>the kit</h2>
+  <ul class="kit">
+    <li><span class="lab">contact_human</span><p>Place a bounded call about a real blocker. Returns a structured decision — or a safe “no”.</p></li>
+    <li><span class="lab">notify_human</span><p>One-way completion notice. No response expected, no ringing twice.</p></li>
+    <li><span class="lab">request_authentication</span><p>A legitimate provider device handoff. Nothing sensitive is ever said out loud.</p></li>
+    <li><span class="lab">query_repository_context</span><p>Bounded read-only evidence: status, diff, literal search, capped reads, a static test inventory.</p></li>
+    <li><span class="lab">list_hotline_events</span><p>Review recent events and how each one ended.</p></li>
+    <li><span class="lab">hotline_status</span><p>Is the daemon up before you promise anyone a phone call.</p></li>
+  </ul>
+  <div class="measure aside-note">
+    <p>And nine HTTP tools face the voice agent itself:</p>
+  </div>
+  <div class="kit-voice">
+    <span>begin_inbound</span><span>get_context</span><span>record_decision</span><span>prepare_action</span><span>confirm_action</span><span>execute_action</span><span>list_threads</span><span>inspect_thread</span><span>repo_context</span>
+  </div>
+</section>
+
+<!-- ── the drill ────────────────────────────────────────────────────── -->
+<section class="sec col">
+  <p class="sec-tag">exhibit e</p>
+  <h2 class="typed" data-typer>the drill</h2>
+  <ol class="drill">
+    <li>
+      <div class="drill-head"><h3>install and check</h3></div>
+      <div class="receipt">
+        <button class="copy-btn" type="button" data-copy="uv sync --python 3.12 --extra dev&#10;uv run agent-hotline doctor"><span class="copy-label">COPY</span><span class="copy-done">TAKEN</span></button>
+        <pre><code>uv sync --python 3.12 --extra dev</code><code>uv run agent-hotline doctor</code></pre>
+      </div>
+    </li>
+    <li>
+      <div class="drill-head"><h3>create secrets, fill the environment</h3></div>
+      <p>Generates four hotline-only tokens without printing them. Then copy
+         <b>.env.example</b> to an ignored <b>.env</b> and fill the Sarvam values, both
+         phone numbers, Sol's PIN, and the workspace-root allowlist.</p>
+      <div class="receipt">
+        <button class="copy-btn" type="button" data-copy="uv run agent-hotline init-secrets"><span class="copy-label">COPY</span><span class="copy-done">TAKEN</span></button>
+        <pre><code>uv run agent-hotline init-secrets</code></pre>
+      </div>
+    </li>
+    <li>
+      <div class="drill-head"><h3>serve, tunnel, verify</h3></div>
+      <p>Only the voice-tool and callback routes go public; everything else stays on
+         loopback. Put the tunnel origin in <b>PUBLIC_BASE_URL</b>.</p>
+      <div class="receipt">
+        <button class="copy-btn" type="button" data-copy="uv run agent-hotline serve&#10;cloudflared tunnel --url http://127.0.0.1:8787&#10;uv run agent-hotline doctor --live"><span class="copy-label">COPY</span><span class="copy-done">TAKEN</span></button>
+        <pre><code>uv run agent-hotline serve</code><code>cloudflared tunnel --url http://127.0.0.1:8787</code><code>uv run agent-hotline doctor --live</code></pre>
+      </div>
+    </li>
+    <li>
+      <div class="drill-head"><h3>deploy the voice agent</h3></div>
+      <p>The manifest is copy-paste for Agent Studio. <b>ensure-deployment</b> stays
+         read-only until you say <b>--apply</b>, pins the exact committed app version,
+         and refuses to silently replace a different binding.</p>
+      <div class="receipt">
+        <button class="copy-btn" type="button" data-copy="uv run agent-hotline-sarvam tools-manifest --format markdown&#10;uv run agent-hotline-sarvam ensure-deployment --apply"><span class="copy-label">COPY</span><span class="copy-done">TAKEN</span></button>
+        <pre><code>uv run agent-hotline-sarvam tools-manifest --format markdown</code><code>uv run agent-hotline-sarvam ensure-deployment --apply</code></pre>
+      </div>
+    </li>
+    <li>
+      <div class="drill-head"><h3>connect your agents, place a call</h3></div>
+      <p>Installs the Codex plugin and the same stdio MCP server for Claude. The
+         offline demo proves the whole state machine without dialing — drop
+         <b>--auto-decide</b> when you want the real ring.</p>
+      <div class="receipt">
+        <button class="copy-btn" type="button" data-copy="uv run agent-hotline install-clients --client all&#10;uv run agent-hotline demo --auto-decide&#10;uv run agent-hotline events --limit 10"><span class="copy-label">COPY</span><span class="copy-done">TAKEN</span></button>
+        <pre><code>uv run agent-hotline install-clients --client all</code><code>uv run agent-hotline demo --auto-decide</code><code>uv run agent-hotline events --limit 10</code></pre>
+      </div>
+    </li>
+  </ol>
+  <div class="measure aside-note">
+    <p>The full checklist — Samvaad app configuration, deployment reconciliation, the
+       go/no-go gates — lives in <b>docs/SETUP.md</b>.</p>
+  </div>
+</section>
+
+<!-- ── the tail ─────────────────────────────────────────────────────── -->
+<footer class="tail">
+  <div class="col glow-line">
+    <span class="glow" id="glow" data-text="JUST CALL SOL">JUST CALL SOL</span>
+    <p class="tail-note">
+      no answer is never approval · voice is an interface, not an authority boundary<br>
+      letters and effects lifted straight from the
+      <a href="https://www.arlan.me/vault">arlan.me vault</a> — ransom note · the typer
+      · CRT ASCII · emboss · chroma glow — MIT → free to copy
+    </p>
+  </div>
+</footer>
+
+<script src="typer.js"></script>
+<script src="sol.js"></script>
+</body>
+</html>

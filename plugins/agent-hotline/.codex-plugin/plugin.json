@@ -1,0 +1,35 @@
+{
+  "name": "agent-hotline",
+  "version": "0.1.0",
+  "description": "Call a human owner for agent blockers and control Codex work by voice.",
+  "author": {
+    "name": "Agent Hotline contributors"
+  },
+  "license": "MIT",
+  "keywords": [
+    "voice",
+    "mcp",
+    "approvals",
+    "incidents",
+    "remote-control"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agent Hotline",
+    "shortDescription": "Call your owner when agent work is blocked.",
+    "longDescription": "A bidirectional Sarvam voice control plane for grounded human decisions, incidents, authentication handoffs, and Codex thread control.",
+    "developerName": "Agent Hotline",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Call me to resolve this blocker.",
+      "Show recent Hotline events.",
+      "Request a safe authentication handoff."
+    ],
+    "brandColor": "#EF5B3F"
+  },
+  "mcpServers": "./.mcp.json"
+}

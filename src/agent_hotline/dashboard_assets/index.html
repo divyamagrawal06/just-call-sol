@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="hotline-api-base" content="__DASHBOARD_PREFIX__/api">
+    <title>Agent Hotline · Operations</title>
+    <link rel="stylesheet" href="__DASHBOARD_PREFIX__/assets/dashboard.css">
+    <script src="__DASHBOARD_PREFIX__/assets/dashboard.js" defer></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="masthead">
+        <div>
+          <p class="eyebrow">Local operations console</p>
+          <h1>Agent Hotline</h1>
+          <p class="lede">Live escalations and their decision timelines.</p>
+        </div>
+        <div class="health" aria-live="polite">
+          <span class="health-dot" id="health-dot"></span>
+          <span id="health-label">Connecting</span>
+        </div>
+      </header>
+
+      <section class="notice" aria-label="Safety notice">
+        <span>Read only</span>
+        <p>This view never exposes phone numbers, credentials, raw evidence, or action controls.</p>
+      </section>
+
+      <section aria-labelledby="state-heading">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Current workload</p>
+            <h2 id="state-heading">State overview</h2>
+          </div>
+          <time id="last-updated">Waiting for data</time>
+        </div>
+        <div class="state-grid" id="state-grid" aria-live="polite"></div>
+      </section>
+
+      <section aria-labelledby="events-heading">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Most recent first</p>
+            <h2 id="events-heading">Escalation feed</h2>
+          </div>
+          <span class="event-total" id="event-total">0 events</span>
+        </div>
+        <div class="events" id="events" aria-live="polite">
+          <p class="empty-state">Loading the local event store…</p>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

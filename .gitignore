@@ -1,0 +1,36 @@
+# Local credentials and runtime state
+.env
+.env.*
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+.hotline/
+artifacts/private/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+dist/
+build/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Tunnel and logs
+*.log
+cloudflared.log
+
+# Local Codex workflow helpers
+.codex-stage-editor.ps1

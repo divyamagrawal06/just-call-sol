@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <title>Agent Hotline · Secure fallback</title>
+  <link rel="stylesheet" href="/fallback/assets/fallback.css">
+  <script src="/fallback/assets/fallback.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div class="status-dot" aria-hidden="true"></div>
+      <div>
+        <p class="eyebrow">Agent Hotline</p>
+        <h1>Secure missed-call response</h1>
+      </div>
+    </header>
+
+    <section class="card" id="verify-panel">
+      <p class="lede">
+        This one-time link can record a response for the task that called you. Verify
+        with your owner PIN before any task context is shown.
+      </p>
+      <form id="verify-form">
+        <label for="owner-pin">Owner PIN</label>
+        <input
+          id="owner-pin"
+          name="owner-pin"
+          type="password"
+          inputmode="numeric"
+          autocomplete="one-time-code"
+          minlength="6"
+          maxlength="12"
+          pattern="[0-9]{6,12}"
+          required
+        >
+        <button type="submit">Review request</button>
+      </form>
+    </section>
+
+    <section class="card hidden" id="decision-panel" aria-live="polite">
+      <div class="severity" id="severity"></div>
+      <h2 id="summary"></h2>
+      <p class="question" id="question"></p>
+      <div class="context-block hidden" id="pending-wrap">
+        <span>Pending action</span>
+        <p id="pending-action"></p>
+      </div>
+      <div class="context-block hidden" id="constraints-wrap">
+        <span>Existing constraints</span>
+        <ul id="constraints"></ul>
+      </div>
+      <p class="expires" id="expires"></p>
+
+      <form id="decision-form">
+        <label for="outcome">Response</label>
+        <select id="outcome" name="outcome" required>
+          <option value="instruct">Give an instruction</option>
+          <option value="approve">Approve the pending request</option>
+          <option value="deny">Deny the pending request</option>
+          <option value="defer">Defer and remain paused</option>
+          <option value="auth_completed">Authentication completed</option>
+        </select>
+
+        <label for="instruction">Instruction or constraints</label>
+        <textarea
+          id="instruction"
+          name="instruction"
+          rows="4"
+          maxlength="3000"
+          placeholder="Be explicit about what the agent may do next."
+        ></textarea>
+
+        <label class="confirmation">
+          <input id="confirmed" type="checkbox" required>
+          <span>
+            I confirm this response applies only to the request shown above. It does not
+            authorize a registered operational action.
+          </span>
+        </label>
+        <button type="submit">Send response once</button>
+      </form>
+    </section>
+
+    <section class="card result hidden" id="result-panel" aria-live="polite">
+      <h2 id="result-title"></h2>
+      <p id="result-message"></p>
+    </section>
+
+    <p class="safety-note">
+      No answer is never approval. Agent Hotline never asks for passwords, OTPs, recovery
+      codes, private keys, or cloud credentials.
+    </p>
+  </main>
+</body>
+</html>

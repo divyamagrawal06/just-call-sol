@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "agent_hotline": {
+      "command": "agent-hotline-mcp",
+      "args": []
+    }
+  }
+}
