@@ -138,6 +138,20 @@ async def test_public_demo_registration_tool_needs_no_auth(api: APIHarness) -> N
     assert "does not match" in payload["reason"]
 
 
+@pytest.mark.asyncio
+async def test_public_demo_registration_tool_accepts_sheet_name(api: APIHarness) -> None:
+    response = await api.client.post(
+        "/v1/demo/sarvam/check-registration",
+        json={"query": "SEP 26003", "sheet_name": "sheet_name.csv"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["registered"] is True
+    assert payload["approval_status"] == "REJECTED"
+    assert payload["sheet_name"] == "sarvam_epoch_registration_tracker.csv"
+
+
 @pytest_asyncio.fixture
 async def auto_execute_api(tmp_path: Path) -> AsyncIterator[APIHarness]:
     settings = Settings(

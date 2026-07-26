@@ -1,16 +1,18 @@
 {
   "name": "check_event_registration",
-  "description": "Check whether a Sarvam Epoch participant may enter. Always call this when given a participant name, registration ID, email, or phone. Return the verdict and recorded reason without guessing.",
+  "description": "Check whether a participant is registered in the requested CSV, then return their separate approval status, reason, and gate note. Always call this for questions like 'is participant X registered, check sheet_name.csv'.",
   "method": "POST",
   "url": "https://began-running-exists-limits.trycloudflare.com/v1/demo/sarvam/check-registration",
   "headers": {
     "Content-Type": "application/json"
   },
   "request_body": {
-    "query": "{{participant_lookup}}"
+    "query": "{{participant_lookup}}",
+    "sheet_name": "{{sheet_name}}"
   },
   "input_binding": {
-    "participant_lookup": "Let the agent decide from the caller's participant name, registration ID, email, or phone"
+    "participant_lookup": "Let the agent decide from the caller's participant name, registration ID, email, or phone",
+    "sheet_name": "Let the agent decide from the spoken CSV filename; default to sarvam_epoch_registration_tracker.csv"
   },
   "run_phase": "during_conversation",
   "authentication": "none"

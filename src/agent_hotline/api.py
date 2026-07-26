@@ -485,7 +485,7 @@ def _install_routes(app: FastAPI) -> None:
     ) -> dict[str, Any]:
         """Demo-only public tool: deliberately has no auth or session requirement."""
 
-        return check_registration(payload.query)
+        return check_registration(payload.query, payload.sheet_name)
 
     @app.post(
         "/v1/sarvam/tools/context",

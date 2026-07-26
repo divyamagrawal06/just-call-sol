@@ -19,7 +19,7 @@ from .contracts import (
     RepositoryContextQuery,
     RepositoryContextResponse,
 )
-from .event_tracker import check_registration, search_registrations
+from .event_tracker import DEFAULT_SHEET_NAME, check_registration, search_registrations
 
 SERVER_INSTRUCTIONS = (
     "For a disputed Sarvam Epoch gate admission, call check_event_registration with the "
@@ -56,8 +56,11 @@ mcp = FastMCP(
     ),
     structured_output=True,
 )
-def check_event_registration(query: str) -> dict[str, object]:
-    return check_registration(query)
+def check_event_registration(
+    query: str,
+    sheet_name: str = DEFAULT_SHEET_NAME,
+) -> dict[str, object]:
+    return check_registration(query, sheet_name)
 
 
 @mcp.tool(

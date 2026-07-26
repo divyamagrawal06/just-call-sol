@@ -10,36 +10,54 @@ from typing import Any
 DEFAULT_RELATIVE_PATH = Path(
     "outputs/sarvam_epoch_event_tracker/sarvam_epoch_registration_tracker.csv"
 )
+DEFAULT_SHEET_NAME = DEFAULT_RELATIVE_PATH.name
+DEMO_SHEET_ALIASES = {"sheet_name.csv": DEFAULT_SHEET_NAME}
 
 
-def _candidate_paths() -> list[Path]:
+def _safe_sheet_name(sheet_name: str | None) -> str:
+    requested = (sheet_name or DEFAULT_SHEET_NAME).strip().strip("\"'")
+    requested = DEMO_SHEET_ALIASES.get(requested.casefold(), requested)
+    candidate = Path(requested)
+    if candidate.name != requested or candidate.suffix.casefold() != ".csv" or len(requested) > 200:
+        raise ValueError("Only a CSV filename from the demo tracker directory is allowed.")
+    return requested
+
+
+def _candidate_paths(sheet_name: str | None = None) -> list[Path]:
+    requested = _safe_sheet_name(sheet_name)
     configured = os.getenv("SARVAM_EPOCH_CSV")
-    candidates = [Path(configured).expanduser()] if configured else []
+    candidates = []
+    if configured and Path(configured).name.casefold() == requested.casefold():
+        candidates.append(Path(configured).expanduser())
     candidates.extend(
         [
-            Path.cwd() / DEFAULT_RELATIVE_PATH,
-            Path(__file__).resolve().parents[2] / DEFAULT_RELATIVE_PATH,
+            Path.cwd() / DEFAULT_RELATIVE_PATH.parent / requested,
+            Path(__file__).resolve().parents[2] / DEFAULT_RELATIVE_PATH.parent / requested,
         ]
     )
     return candidates
 
 
-def registration_csv_path() -> Path:
-    for candidate in _candidate_paths():
+def registration_csv_path(sheet_name: str | None = None) -> Path:
+    for candidate in _candidate_paths(sheet_name):
         resolved = candidate.resolve()
         if resolved.is_file():
             return resolved
-    searched = ", ".join(str(path) for path in _candidate_paths())
+    searched = ", ".join(str(path) for path in _candidate_paths(sheet_name))
     raise FileNotFoundError(f"Sarvam Epoch registration CSV not found. Searched: {searched}")
 
 
-def load_registrations() -> list[dict[str, str]]:
-    with registration_csv_path().open(encoding="utf-8-sig", newline="") as handle:
+def load_registrations(sheet_name: str | None = None) -> list[dict[str, str]]:
+    with registration_csv_path(sheet_name).open(encoding="utf-8-sig", newline="") as handle:
         return list(csv.DictReader(handle))
 
 
 def _normalized(value: str) -> str:
     return " ".join(value.casefold().strip().split())
+
+
+def _compact_identifier(value: str) -> str:
+    return "".join(character for character in value.casefold() if character.isalnum())
 
 
 def _public_record(row: dict[str, str]) -> dict[str, str]:
@@ -55,23 +73,48 @@ def _public_record(row: dict[str, str]) -> dict[str, str]:
     }
 
 
-def check_registration(query: str) -> dict[str, Any]:
-    """Find one participant and return an admission verdict with evidence."""
+def check_registration(query: str, sheet_name: str | None = None) -> dict[str, Any]:
+    """Find one participant in one allowlisted CSV and return registration evidence."""
 
     needle = _normalized(query)
+    requested_sheet = (sheet_name or DEFAULT_SHEET_NAME).strip()
+    try:
+        resolved_sheet = registration_csv_path(sheet_name)
+    except (FileNotFoundError, ValueError):
+        return {
+            "sheet_found": False,
+            "sheet_name": requested_sheet,
+            "found": False,
+            "registered": False,
+            "verdict": "HOLD",
+            "approved": None,
+            "reason": f"The requested CSV {requested_sheet!r} is not available.",
+            "matches": [],
+        }
+
+    base_response = {
+        "sheet_found": True,
+        "sheet_name": resolved_sheet.name,
+    }
     if not needle:
         return {
+            **base_response,
             "found": False,
+            "registered": False,
             "verdict": "HOLD",
             "approved": None,
             "reason": "A participant name, registration ID, email, or phone is required.",
             "matches": [],
         }
 
-    rows = load_registrations()
-    exact_fields = ("Registration ID", "Email", "Phone")
+    rows = load_registrations(resolved_sheet.name)
+    compact_needle = _compact_identifier(query)
     exact = [
-        row for row in rows if any(_normalized(row[field]) == needle for field in exact_fields)
+        row
+        for row in rows
+        if _normalized(row["Email"]) == needle
+        or _compact_identifier(row["Registration ID"]) == compact_needle
+        or _compact_identifier(row["Phone"]) == compact_needle
     ]
     name_exact = [row for row in rows if _normalized(row["Full Name"]) == needle]
     matches = exact or name_exact
@@ -81,23 +124,27 @@ def check_registration(query: str) -> dict[str, Any]:
             row
             for row in rows
             if needle in _normalized(row["Full Name"])
-            or needle in _normalized(row["Registration ID"])
             or needle in _normalized(row["Email"])
-            or needle in _normalized(row["Phone"])
+            or compact_needle in _compact_identifier(row["Registration ID"])
+            or compact_needle in _compact_identifier(row["Phone"])
         ]
 
     if not matches:
         return {
+            **base_response,
             "found": False,
-            "verdict": "NO",
-            "approved": False,
+            "registered": False,
+            "verdict": "HOLD",
+            "approved": None,
             "reason": "No matching Sarvam Epoch registration was found.",
             "matches": [],
         }
 
     if len(matches) > 1:
         return {
+            **base_response,
             "found": True,
+            "registered": None,
             "verdict": "HOLD",
             "approved": None,
             "reason": (
@@ -120,10 +167,14 @@ def check_registration(query: str) -> dict[str, Any]:
         approved = False
 
     return {
+        **base_response,
         "found": True,
+        "registered": True,
         "verdict": verdict,
         "approved": approved,
+        "approval_status": status,
         "reason": row["Approval Reason"],
+        "gate_note": row["Gate / Coordinator Note"],
         "participant": _public_record(row),
     }
 

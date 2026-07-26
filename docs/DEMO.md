@@ -28,6 +28,16 @@ Give only the verdict, recorded reason, and gate instruction.
 Expected verdict: `NO`. For an ambiguity demonstration, query `Rohan Mehta`; the tool
 returns `HOLD` and asks for a registration ID because two records share that name.
 
+For the live phone demo, ask:
+
+```text
+Can you check if participant SEP 26003 is registered, check sheet_name.csv?
+```
+
+`sheet_name.csv` is a demo alias for the bundled tracker. The answer must distinguish the
+facts: the participant is registered, but their approval status is rejected because the
+submitted ID name does not match. The agent then states the recorded gate instruction.
+
 ## Fixed scenario
 
 A deterministic Codex task has completed a rate-limiter change. Its tests pass, but the
