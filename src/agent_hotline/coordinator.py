@@ -138,6 +138,7 @@ _THREAD_STATUS_QUERY_ALIASES: dict[str, frozenset[str]] = {
     "running": frozenset({"active"}),
     "in progress": frozenset({"active"}),
 }
+_VOICE_THREAD_STATUS_QUERY_LIMIT = 10
 _VOICE_THREAD_QUERY_SCAN_LIMIT = 100
 
 
@@ -707,12 +708,16 @@ class HotlineCoordinator:
             )
         if self.controller is None:
             raise RuntimeError("Codex thread control is unavailable")
+        query = request.query.strip().casefold() if request.query else None
+        status_aliases = _THREAD_STATUS_QUERY_ALIASES.get(query) if query is not None else None
         candidates = await self.controller.list_candidates(
-            limit=(_VOICE_THREAD_QUERY_SCAN_LIMIT if request.query else request.limit)
+            limit=(
+                _VOICE_THREAD_STATUS_QUERY_LIMIT
+                if status_aliases is not None
+                else (_VOICE_THREAD_QUERY_SCAN_LIMIT if query else request.limit)
+            )
         )
-        if request.query:
-            query = request.query.strip().casefold()
-            status_aliases = _THREAD_STATUS_QUERY_ALIASES.get(query)
+        if query:
             if status_aliases is not None:
                 candidates = tuple(
                     item for item in candidates if item.status.casefold() in status_aliases

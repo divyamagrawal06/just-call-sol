@@ -1002,7 +1002,7 @@ async def test_thread_reads_accept_only_a_provider_correlated_live_outbound_call
     assert stale_inspection.status_code == 403
 
 
-async def test_thread_list_filters_cached_candidates_per_request_and_maps_running_status(
+async def test_thread_list_uses_warm_cache_for_exact_running_status_queries(
     api: APIHarness,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1051,7 +1051,7 @@ async def test_thread_list_filters_cached_candidates_per_request_and_maps_runnin
     )
     running = await api.client.post(
         "/v1/sarvam/tools/threads/list",
-        json={"event_id": event_id, "query": "running", "limit": 10},
+        json={"event_id": event_id, "query": "running", "limit": 25},
         headers=_tool_headers(),
     )
     in_progress = await api.client.post(
@@ -1065,12 +1065,14 @@ async def test_thread_list_filters_cached_candidates_per_request_and_maps_runnin
         headers=_tool_headers(),
     )
 
-    expected_active = ["thread-running", "thread-active-beyond-cache"]
-    assert [item["thread_id"] for item in active.json()["threads"]] == expected_active
-    assert [item["thread_id"] for item in running.json()["threads"]] == expected_active
-    assert [item["thread_id"] for item in in_progress.json()["threads"]] == expected_active
+    assert [item["thread_id"] for item in active.json()["threads"]] == [
+        "thread-running",
+        "thread-active-beyond-cache",
+    ]
+    assert [item["thread_id"] for item in running.json()["threads"]] == ["thread-running"]
+    assert [item["thread_id"] for item in in_progress.json()["threads"]] == ["thread-running"]
     assert absent.json()["threads"] == []
-    assert api.controller.list_limits[-4:] == [100, 100, 100, 100]
+    assert api.controller.list_limits[-4:] == [100, 10, 10, 100]
     duration_messages = [
         record.getMessage()
         for record in caplog.records
