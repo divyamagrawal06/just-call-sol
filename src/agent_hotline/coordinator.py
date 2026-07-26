@@ -51,6 +51,7 @@ from .fallback_delivery import (
 from .models import (
     ActionKind,
     ActionScope,
+    ActionState,
     AgentType,
     ConfirmationMethod,
     ContactChannel,
@@ -96,6 +97,7 @@ from .security import (
 )
 from .settings import Settings
 from .storage import (
+    ActionAlreadyConsumedError,
     ActiveSessionError,
     DecisionAlreadyExistsError,
     FallbackLinkError,
@@ -189,6 +191,7 @@ class HotlineCoordinator:
             max_ttl_seconds=settings.hotline_fallback_ttl_seconds,
         )
         self._waiters: dict[str, asyncio.Event] = {}
+        self._demo_action_locks: dict[str, asyncio.Lock] = {}
 
     async def contact_human(self, request: ContactHumanRequest) -> ContactHumanResult:
         event = self._event_from_request(request)
@@ -508,7 +511,10 @@ class HotlineCoordinator:
             requires_confirmation=True,
             expires_at=expires_at,
         )
-        prepared = await self.store.prepare_action(prepared)
+        prepared = await self.store.prepare_action(
+            prepared,
+            dedupe_consumed=self.settings.hotline_demo_auto_execute_actions,
+        )
         nonce = self._signer.issue_nonce(
             subject=prepared.action_id,
             action_hash=prepared.action_hash,
@@ -518,6 +524,12 @@ class HotlineCoordinator:
             ),
             claims={"event_id": event.event_id},
         )
+        if self.settings.hotline_demo_auto_execute_actions:
+            return await self._demo_auto_execute_prepared_action(
+                prepared,
+                nonce=nonce,
+                impact=impact,
+            )
         return PrepareActionResponse(
             action_id=prepared.action_id,
             action_hash=prepared.action_hash,
@@ -525,6 +537,244 @@ class HotlineCoordinator:
             risk=_contract_risk(prepared.risk.value),
             exact_readback=f"{impact} To confirm, say exactly: {phrase}",
             expires_at=prepared.expires_at,
+        )
+
+    async def _demo_auto_execute_prepared_action(
+        self,
+        prepared: PreparedAction,
+        *,
+        nonce: str,
+        impact: str,
+    ) -> PrepareActionResponse:
+        lock = self._demo_action_locks.setdefault(prepared.action_id, asyncio.Lock())
+        async with lock:
+            action = await self.store.get_action(prepared.action_id)
+            if action is None:
+                raise NotFoundError(f"action {prepared.action_id!r} does not exist")
+
+            receipt = await self.store.get_action_execution(action.action_id)
+            if receipt is not None and (receipt.kind is TimelineKind.ACTION_EXECUTION_SUCCEEDED):
+                grant = await self.store.get_grant_for_action(action.action_id)
+                return self._demo_execution_receipt_response(
+                    action,
+                    receipt,
+                    nonce=nonce,
+                    impact=impact,
+                    grant_id=grant.grant_id if grant is not None else None,
+                    already_executed=True,
+                )
+
+            if action.state is ActionState.CONSUMED:
+                return await self._demo_consumed_action_response(
+                    action,
+                    receipt=receipt,
+                    nonce=nonce,
+                    impact=impact,
+                )
+
+            if receipt is not None and (receipt.kind is TimelineKind.ACTION_EXECUTION_FAILED):
+                retryable = receipt.details.get("retryable") is True
+                if not retryable or action.state is not ActionState.CONFIRMED:
+                    grant = await self.store.get_grant_for_action(action.action_id)
+                    return self._demo_execution_receipt_response(
+                        action,
+                        receipt,
+                        nonce=nonce,
+                        impact=impact,
+                        grant_id=grant.grant_id if grant is not None else None,
+                        already_executed=False,
+                    )
+
+            if action.state is ActionState.PREPARED:
+                try:
+                    grant = await self.store.confirm_action(
+                        action.action_id,
+                        owner_ref="owner_demo_auto_execute",
+                        confirmation_method=ConfirmationMethod.TRUSTED_LOCAL,
+                        confirmation_hash=action.confirmation_phrase_hash,
+                    )
+                except ActionAlreadyConsumedError:
+                    current = await self.store.get_action(action.action_id)
+                    if current is None:
+                        raise NotFoundError(f"action {action.action_id!r} does not exist") from None
+                    return await self._demo_consumed_action_response(
+                        current,
+                        receipt=await self.store.get_action_execution(action.action_id),
+                        nonce=nonce,
+                        impact=impact,
+                    )
+            elif action.state is ActionState.CONFIRMED:
+                grant = await self.store.get_grant_for_action(action.action_id)
+                if grant is None:
+                    raise RuntimeError("confirmed demo action has no durable grant")
+            else:
+                message = (
+                    f"This demo action is {action.state.value} and cannot be executed. "
+                    "No action was run."
+                )
+                return PrepareActionResponse(
+                    action_id=action.action_id,
+                    action_hash=action.action_hash,
+                    confirmation_nonce=nonce,
+                    risk=_contract_risk(action.risk.value),
+                    exact_readback=f"{impact} {message}",
+                    expires_at=action.expires_at,
+                    message_to_user=message,
+                    result={"status": action.state.value, "retryable": False},
+                )
+
+            try:
+                execution = await self.execute_action(
+                    ExecuteActionRequest(
+                        event_id=action.event_id,
+                        action_id=action.action_id,
+                        grant_id=grant.grant_id,
+                    )
+                )
+            except ActionAlreadyConsumedError:
+                current = await self.store.get_action(action.action_id)
+                if current is None:
+                    raise NotFoundError(f"action {action.action_id!r} does not exist") from None
+                return await self._demo_consumed_action_response(
+                    current,
+                    receipt=await self.store.get_action_execution(action.action_id),
+                    nonce=nonce,
+                    impact=impact,
+                )
+            except Exception as exc:
+                current = await self.store.get_action(action.action_id)
+                if current is None:
+                    raise NotFoundError(f"action {action.action_id!r} does not exist") from exc
+                retryable = current.state is ActionState.CONFIRMED
+                if retryable:
+                    message = (
+                        "Demo action execution failed before its one-time grant was "
+                        "consumed. The same prepared action can be retried safely."
+                    )
+                else:
+                    message = (
+                        "Demo action execution failed after its one-time grant was "
+                        "claimed. It will not be retried automatically, preventing a "
+                        "duplicate action."
+                    )
+                result: dict[str, Any] = {
+                    "status": "failed",
+                    "retryable": retryable,
+                    "error_type": type(exc).__name__,
+                }
+                logger.warning(
+                    "demo_auto_execution_failed action_id=%s retryable=%s error_type=%s",
+                    current.action_id,
+                    retryable,
+                    type(exc).__name__,
+                )
+                receipt = await self.store.record_action_execution(
+                    current.action_id,
+                    succeeded=False,
+                    message_to_user=message,
+                    result=result,
+                    retryable=retryable,
+                )
+                return self._demo_execution_receipt_response(
+                    current,
+                    receipt,
+                    nonce=nonce,
+                    impact=impact,
+                    grant_id=grant.grant_id,
+                    already_executed=False,
+                )
+
+            receipt = await self.store.record_action_execution(
+                action.action_id,
+                succeeded=True,
+                message_to_user=execution.message_to_user,
+                operation_id=execution.operation_id,
+                result=execution.result,
+            )
+            return self._demo_execution_receipt_response(
+                action,
+                receipt,
+                nonce=nonce,
+                impact=impact,
+                grant_id=execution.grant_id,
+                already_executed=False,
+            )
+
+    async def _demo_consumed_action_response(
+        self,
+        prepared: PreparedAction,
+        *,
+        receipt: TimelineEntry | None,
+        nonce: str,
+        impact: str,
+    ) -> PrepareActionResponse:
+        grant = await self.store.get_grant_for_action(prepared.action_id)
+        grant_id = grant.grant_id if grant is not None else None
+        if receipt is not None:
+            return self._demo_execution_receipt_response(
+                prepared,
+                receipt,
+                nonce=nonce,
+                impact=impact,
+                grant_id=grant_id,
+                already_executed=(receipt.kind is TimelineKind.ACTION_EXECUTION_SUCCEEDED),
+            )
+
+        message = (
+            "This exact action's one-time grant was already claimed, but no durable "
+            "completion receipt is available. It was not retried, preventing a "
+            "duplicate action."
+        )
+        return PrepareActionResponse(
+            action_id=prepared.action_id,
+            action_hash=prepared.action_hash,
+            confirmation_nonce=nonce,
+            risk=_contract_risk(prepared.risk.value),
+            exact_readback=f"{impact} {message}",
+            expires_at=prepared.expires_at,
+            executed=False,
+            already_executed=False,
+            grant_id=grant_id,
+            message_to_user=message,
+            result={"status": "outcome_unknown", "retryable": False},
+        )
+
+    @staticmethod
+    def _demo_execution_receipt_response(
+        prepared: PreparedAction,
+        receipt: TimelineEntry,
+        *,
+        nonce: str,
+        impact: str,
+        grant_id: str | None,
+        already_executed: bool,
+    ) -> PrepareActionResponse:
+        succeeded = receipt.kind is TimelineKind.ACTION_EXECUTION_SUCCEEDED
+        stored_message = receipt.details.get("message_to_user")
+        message = (
+            stored_message
+            if isinstance(stored_message, str)
+            else (
+                "The demo action completed." if succeeded else "The demo action did not complete."
+            )
+        )
+        stored_operation_id = receipt.details.get("operation_id")
+        operation_id = stored_operation_id if isinstance(stored_operation_id, str) else None
+        stored_result = receipt.details.get("result")
+        result = dict(stored_result) if isinstance(stored_result, dict) else {}
+        return PrepareActionResponse(
+            action_id=prepared.action_id,
+            action_hash=prepared.action_hash,
+            confirmation_nonce=nonce,
+            risk=_contract_risk(prepared.risk.value),
+            exact_readback=f"{impact} {message}",
+            expires_at=prepared.expires_at,
+            executed=succeeded,
+            already_executed=succeeded and already_executed,
+            grant_id=grant_id,
+            operation_id=operation_id,
+            message_to_user=message,
+            result=result,
         )
 
     async def confirm_action(self, request: ConfirmActionRequest) -> ConfirmActionResponse:

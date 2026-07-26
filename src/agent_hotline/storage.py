@@ -1902,8 +1902,13 @@ class SQLiteStore:
             )
         )
 
-    async def prepare_action(self, action: PreparedAction) -> PreparedAction:
-        """Atomically register an expiring action and dedupe its canonical hash."""
+    async def prepare_action(
+        self,
+        action: PreparedAction,
+        *,
+        dedupe_consumed: bool = False,
+    ) -> PreparedAction:
+        """Atomically register an action and optionally dedupe a demo execution."""
 
         if action.state is not ActionState.PREPARED:
             raise ValueError("new actions must start in the prepared state")
@@ -1924,6 +1929,32 @@ class SQLiteStore:
                         raise CorrelationError(
                             "prepared action session does not belong to its event"
                         )
+                if dedupe_consumed:
+                    cursor = await self.connection.execute(
+                        """
+                        SELECT payload_json
+                        FROM prepared_actions
+                        WHERE event_id = ?
+                          AND session_id IS ?
+                          AND action_hash = ?
+                          AND state IN (?, ?, ?)
+                        ORDER BY CASE WHEN state = ? THEN 0 ELSE 1 END, updated_at DESC
+                        LIMIT 1
+                        """,
+                        (
+                            action.event_id,
+                            action.session_id,
+                            action.action_hash,
+                            ActionState.PREPARED.value,
+                            ActionState.CONFIRMED.value,
+                            ActionState.CONSUMED.value,
+                            ActionState.CONSUMED.value,
+                        ),
+                    )
+                    row = await cursor.fetchone()
+                    if row is not None:
+                        await self._commit()
+                        return _load(PreparedAction, row["payload_json"])
                 try:
                     await self.connection.execute(
                         """
@@ -1993,6 +2024,73 @@ class SQLiteStore:
     async def get_action(self, action_id: str) -> PreparedAction | None:
         async with self._write_lock:
             return await self._fetch_action_locked(action_id)
+
+    async def get_action_execution(self, action_id: str) -> TimelineEntry | None:
+        """Return the latest durable demo execution outcome for one action."""
+
+        async with self._write_lock:
+            cursor = await self.connection.execute(
+                """
+                SELECT payload_json
+                FROM timeline
+                WHERE action_id = ? AND kind IN (?, ?)
+                ORDER BY occurred_at DESC, timeline_id DESC
+                LIMIT 1
+                """,
+                (
+                    action_id,
+                    TimelineKind.ACTION_EXECUTION_SUCCEEDED.value,
+                    TimelineKind.ACTION_EXECUTION_FAILED.value,
+                ),
+            )
+            row = await cursor.fetchone()
+        return None if row is None else _load(TimelineEntry, row["payload_json"])
+
+    async def record_action_execution(
+        self,
+        action_id: str,
+        *,
+        succeeded: bool,
+        message_to_user: str,
+        operation_id: str | None = None,
+        result: dict[str, Any] | None = None,
+        retryable: bool = False,
+    ) -> TimelineEntry:
+        """Persist a redacted auto-execution receipt for idempotent retries."""
+
+        timestamp = utc_now()
+        async with self._write_lock:
+            await self._begin()
+            try:
+                action = await self._fetch_action_locked(action_id)
+                if action is None:
+                    raise NotFoundError(f"action {action_id!r} does not exist")
+                details: dict[str, Any] = {
+                    "status": "succeeded" if succeeded else "failed",
+                    "message_to_user": message_to_user,
+                    "result": result or {},
+                    "retryable": retryable,
+                }
+                if operation_id is not None:
+                    details["operation_id"] = operation_id
+                receipt = TimelineEntry(
+                    event_id=action.event_id,
+                    session_id=action.session_id,
+                    action_id=action.action_id,
+                    kind=(
+                        TimelineKind.ACTION_EXECUTION_SUCCEEDED
+                        if succeeded
+                        else TimelineKind.ACTION_EXECUTION_FAILED
+                    ),
+                    details=details,
+                    occurred_at=timestamp,
+                )
+                await self._insert_timeline_locked(receipt)
+            except BaseException:
+                await self._rollback()
+                raise
+            await self._commit()
+        return receipt
 
     async def _replace_action_locked(
         self,
@@ -2173,6 +2271,17 @@ class SQLiteStore:
     async def get_grant(self, grant_id: str) -> ActionGrant | None:
         async with self._write_lock:
             return await self._fetch_grant_locked(grant_id)
+
+    async def get_grant_for_action(self, action_id: str) -> ActionGrant | None:
+        """Return the one durable grant bound to a prepared action."""
+
+        async with self._write_lock:
+            cursor = await self.connection.execute(
+                "SELECT payload_json FROM action_grants WHERE action_id = ?",
+                (action_id,),
+            )
+            row = await cursor.fetchone()
+        return None if row is None else _load(ActionGrant, row["payload_json"])
 
     async def consume_action(
         self,

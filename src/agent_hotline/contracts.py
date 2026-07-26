@@ -334,6 +334,12 @@ class PrepareActionResponse(BaseModel):
     risk: Literal["read_only", "low", "medium", "high"]
     exact_readback: str
     expires_at: datetime
+    executed: bool = False
+    already_executed: bool = False
+    grant_id: str | None = None
+    operation_id: str | None = None
+    message_to_user: str | None = None
+    result: dict[str, Any] = Field(default_factory=dict)
 
 
 class ConfirmActionRequest(BaseModel):

@@ -116,6 +116,14 @@ validation. This flat adapter exists because Agent Studio binds HTTP request fie
 individually; it does not grant the model an arbitrary JSON object or a command surface.
 The exact readback, DTMF PIN, `confirm_action`, and one-time grant remain mandatory.
 
+Demo-only exception: when `HOTLINE_DEMO_AUTO_EXECUTE_ACTIONS=true` outside production,
+`prepare_action` internally records a `trusted_local` grant, consumes it through the normal
+audit path, and executes immediately. The response sets `executed: true` and returns
+`message_to_user`, `operation_id`, and `result`; an identical retry in the same event and
+provider-correlated call sets `already_executed: true` without executing twice. The flag
+defaults to false, production rejects it, and it cannot be combined with
+`HOTLINE_ALLOW_REAL_ACTIONS`.
+
 ## `confirm_action`
 
 ```http

@@ -476,6 +476,10 @@ def build_samvaad_tool_manifest(
                 "confirmation_nonce": "confirmation_nonce",
                 "exact_readback": "exact_readback",
                 "risk": "action_risk",
+                "executed": "action_executed",
+                "already_executed": "action_already_executed",
+                "message_to_user": "execution_message",
+                "operation_id": "operation_id",
             },
         ),
         (

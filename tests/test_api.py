@@ -13,7 +13,7 @@ import pytest_asyncio
 
 import agent_hotline.api as api_module
 from agent_hotline.api import create_app
-from agent_hotline.codex_protocol import ThreadCandidate
+from agent_hotline.codex_protocol import ThreadCandidate, ThreadControlResult
 from agent_hotline.models import (
     ContactDirection,
     ContactSession,
@@ -35,6 +35,7 @@ class FakeThreadController:
     def __init__(self) -> None:
         self.extra_candidates: tuple[ThreadCandidate, ...] = ()
         self.list_limits: list[int] = []
+        self.spawn_calls: list[tuple[str, str]] = []
 
     async def list_candidates(
         self,
@@ -68,6 +69,15 @@ class FakeThreadController:
             }
         }
 
+    async def spawn_root(self, *, task: str, cwd: str) -> ThreadControlResult:
+        self.spawn_calls.append((task, cwd))
+        return ThreadControlResult(
+            action="spawned",
+            thread_id="thread-demo-spawned",
+            turn_id="turn-demo-spawned",
+            response={},
+        )
+
 
 @dataclass(slots=True)
 class APIHarness:
@@ -91,6 +101,44 @@ async def api(tmp_path: Path) -> AsyncIterator[APIHarness]:
         owner_phone_number="+919876543210",
         owner_confirmation_pin=OWNER_PIN,
         hotline_allowlisted_callers="+12025550147",
+        codex_app_server_enabled=False,
+    )
+    provider = FakeCallProvider()
+    controller = FakeThreadController()
+    app = create_app(
+        settings=settings,
+        provider=provider,
+        controller=controller,  # type: ignore[arg-type]
+    )
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            yield APIHarness(
+                client=client,
+                provider=provider,
+                store=app.state.store,
+                controller=controller,
+            )
+
+
+
+@pytest_asyncio.fixture
+async def auto_execute_api(tmp_path: Path) -> AsyncIterator[APIHarness]:
+    settings = Settings(
+        _env_file=None,
+        hotline_env="development",
+        hotline_database_path=tmp_path / "auto-execute.sqlite3",
+        hotline_transport="fake",
+        hotline_local_token=LOCAL_TOKEN,
+        hotline_tool_token=TOOL_TOKEN,
+        hotline_public_tools_require_token=True,
+        hotline_callback_token=CALLBACK_TOKEN,
+        owner_phone_number="+919876543210",
+        owner_confirmation_pin=OWNER_PIN,
+        hotline_demo_auto_execute_actions=True,
         codex_app_server_enabled=False,
     )
     provider = FakeCallProvider()
@@ -387,6 +435,32 @@ def test_production_rejects_headerless_sarvam_tool_configuration() -> None:
             _env_file=None,
             hotline_env="production",
             hotline_public_tools_require_token=False,
+        )
+
+
+def test_production_rejects_demo_action_auto_execution() -> None:
+    with pytest.raises(
+        ValueError,
+        match="HOTLINE_DEMO_AUTO_EXECUTE_ACTIONS cannot be enabled in production",
+    ):
+        Settings(
+            _env_file=None,
+            hotline_env="production",
+            hotline_public_tools_require_token=True,
+            hotline_demo_auto_execute_actions=True,
+        )
+
+
+def test_demo_action_auto_execution_rejects_real_runbooks() -> None:
+    with pytest.raises(
+        ValueError,
+        match="HOTLINE_DEMO_AUTO_EXECUTE_ACTIONS cannot be combined",
+    ):
+        Settings(
+            _env_file=None,
+            hotline_env="development",
+            hotline_demo_auto_execute_actions=True,
+            hotline_allow_real_actions=True,
         )
 
 
@@ -700,6 +774,9 @@ async def test_no_answer_webhook_wakes_waiter_without_creating_approval(
     )
     assert prepared.status_code == 200
     prepared_payload = prepared.json()
+    assert prepared_payload["executed"] is False
+    assert prepared_payload["already_executed"] is False
+    assert prepared_payload["grant_id"] is None
     exact_phrase = prepared_payload["exact_readback"].rsplit("say exactly: ", 1)[1]
 
     webhook = await api.client.post(
@@ -882,6 +959,53 @@ async def test_prepare_confirm_execute_runbook_is_exact_and_one_time(
     assert executed.json()["result"]["status"] == "mock_succeeded"
     assert executed.json()["result"]["verified"] is True
     assert replay.status_code == 409
+
+
+async def test_demo_prepare_auto_executes_spawn_once_and_dedupes_retry(
+    auto_execute_api: APIHarness,
+) -> None:
+    created = await auto_execute_api.client.post(
+        "/v1/escalations/contact",
+        json=_contact_payload(wait_for_decision=False),
+        headers=_local_headers(),
+    )
+    event_id = created.json()["event_id"]
+    request = {
+        "event_id": event_id,
+        "action_type": "thread.spawn_root",
+        "action_task": "Investigate the database incident.",
+        "action_cwd": ".",
+    }
+
+    first = await auto_execute_api.client.post(
+        "/v1/sarvam/tools/prepare-action",
+        json=request,
+        headers=_tool_headers(),
+    )
+    retry = await auto_execute_api.client.post(
+        "/v1/sarvam/tools/prepare-action",
+        json=request,
+        headers=_tool_headers(),
+    )
+
+    assert first.status_code == 200
+    assert first.json()["executed"] is True
+    assert first.json()["already_executed"] is False
+    assert first.json()["result"] == {
+        "action": "spawned",
+        "thread_id": "thread-demo-spawned",
+        "turn_id": "turn-demo-spawned",
+    }
+    assert retry.status_code == 200
+    assert retry.json()["executed"] is True
+    assert retry.json()["already_executed"] is True
+    assert retry.json()["action_id"] == first.json()["action_id"]
+    assert retry.json()["action_hash"] == first.json()["action_hash"]
+    assert auto_execute_api.controller.spawn_calls == [("Investigate the database incident.", ".")]
+    timeline = await auto_execute_api.store.list_timeline(event_id=event_id, limit=100)
+    assert [entry.kind.value for entry in timeline].count("action_prepared") == 1
+    assert [entry.kind.value for entry in timeline].count("action_confirmed") == 1
+    assert [entry.kind.value for entry in timeline].count("action_consumed") == 1
 
 
 async def test_inbound_control_discloses_nothing_to_unallowlisted_callers(
