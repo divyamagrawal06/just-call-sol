@@ -67,6 +67,7 @@ from .watchdog import AgentFailureWatchdog
 
 logger = logging.getLogger(__name__)
 _MAX_BODY_BYTES = 64 * 1024
+_CODEX_THREAD_PREWARM_TIMEOUT_SECONDS = 60.0
 _FALLBACK_ASSET_DIRECTORY = Path(__file__).with_name("fallback_assets")
 _FALLBACK_SECURITY_HEADERS = {
     "Cache-Control": "no-store, max-age=0",
@@ -192,6 +193,9 @@ async def _runtime_lifespan(app: FastAPI) -> AsyncIterator[None]:
             monitor_task = asyncio.create_task(
                 _monitor_codex(codex, coordinator, escalation_tasks),
                 name="agent-hotline-codex-watchdog",
+            )
+            await controller.prewarm_voice_candidates(
+                timeout_seconds=_CODEX_THREAD_PREWARM_TIMEOUT_SECONDS
             )
 
     app.state.settings = settings

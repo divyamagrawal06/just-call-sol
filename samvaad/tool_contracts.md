@@ -129,7 +129,7 @@ POST <PUBLIC_BASE_URL>/v1/sarvam/tools/threads/list
 
 {
   "event_id": "<provider-correlated live inbound or outbound event id>",
-  "query": "<optional task reference>",
+  "query": "<optional name, preview, workspace, or status; running means active>",
   "limit": 10
 }
 ```

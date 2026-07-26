@@ -30,6 +30,7 @@ from typing import Any, Protocol, cast
 from .codex_protocol import (
     AmbiguousThreadError,
     CodexAppServerConnectionError,
+    CodexAppServerError,
     CodexAppServerNotRunning,
     CodexAppServerProtocolError,
     CodexAppServerStatus,
@@ -49,12 +50,16 @@ from .codex_protocol import (
     UnsupportedCodexMethod,
     ensure_json_mapping,
 )
+from .security import sanitize_untrusted_text
 
 logger = logging.getLogger(__name__)
 
 _MAX_JSONL_BYTES = 8 * 1024 * 1024
 _MAX_INSTRUCTION_CHARS = 100_000
 _SUBSCRIPTION_STOP = object()
+_VOICE_CANDIDATE_CACHE_LIMIT = 10
+_DEFAULT_VOICE_CANDIDATE_CACHE_TTL_SECONDS = 15.0
+_DEFAULT_VOICE_LIST_TIMEOUT_SECONDS = 25.0
 
 # This is intentionally narrower than the full app-server protocol.  Do not add
 # command/exec, process/spawn, thread/shellCommand, fs/*, or dynamic tool calls.
@@ -942,6 +947,7 @@ class CodexAppServerClient:
         source_kinds: Sequence[str] | None = None,
         parent_thread_id: str | None = None,
         ancestor_thread_id: str | None = None,
+        request_timeout: float | None = None,
     ) -> dict[str, JSONValue]:
         if limit is not None and not 1 <= limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
@@ -968,7 +974,11 @@ class CodexAppServerClient:
             params["sourceKinds"] = list(source_kinds)
         _set_if_not_none(params, "parentThreadId", parent_thread_id)
         _set_if_not_none(params, "ancestorThreadId", ancestor_thread_id)
-        result = await self.request("thread/list", params)
+        result = await self.request(
+            "thread/list",
+            params,
+            request_timeout=request_timeout,
+        )
         return ensure_json_mapping(result, context="thread/list")
 
     async def thread_read(
@@ -1119,26 +1129,162 @@ class SafeThreadController:
         *,
         workspace_roots: Sequence[str | os.PathLike[str]],
         max_instruction_chars: int = 12_000,
+        voice_candidate_cache_ttl_seconds: float = (_DEFAULT_VOICE_CANDIDATE_CACHE_TTL_SECONDS),
+        voice_list_timeout_seconds: float = _DEFAULT_VOICE_LIST_TIMEOUT_SECONDS,
     ) -> None:
         if not workspace_roots:
             raise ValueError("at least one workspace root is required")
         if max_instruction_chars <= 0:
             raise ValueError("max_instruction_chars must be positive")
+        if voice_candidate_cache_ttl_seconds <= 0 or voice_list_timeout_seconds <= 0:
+            raise ValueError("voice candidate cache timing must be positive")
         self.client = client
         self.workspace_roots = tuple(
             Path(root).expanduser().resolve(strict=False) for root in workspace_roots
         )
         self.max_instruction_chars = max_instruction_chars
+        self.voice_candidate_cache_ttl_seconds = voice_candidate_cache_ttl_seconds
+        self.voice_list_timeout_seconds = voice_list_timeout_seconds
+        self._voice_candidate_cache: tuple[ThreadCandidate, ...] = ()
+        self._voice_candidate_cache_expires_at = 0.0
+        self._voice_candidate_cache_epoch = 0
+        self._voice_candidate_cache_lock = asyncio.Lock()
+        self._voice_candidate_refresh_task: (
+            asyncio.Task[tuple[ThreadCandidate, ...] | None] | None
+        ) = None
 
     async def list_candidates(
         self, *, limit: int = 100, archived: bool = False
     ) -> tuple[ThreadCandidate, ...]:
-        response = await self.client.thread_list(
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        if not archived and limit <= _VOICE_CANDIDATE_CACHE_LIMIT:
+            candidates = await self._voice_candidates()
+            return candidates[:limit]
+        return await self._list_candidates_uncached(
             limit=limit,
             archived=archived,
-            sort_key="updated_at",
-            sort_direction="desc",
+            request_timeout=self.voice_list_timeout_seconds,
         )
+
+    async def prewarm_voice_candidates(
+        self,
+        *,
+        timeout_seconds: float = _DEFAULT_VOICE_LIST_TIMEOUT_SECONDS,
+    ) -> bool:
+        """Fill the bounded voice cache without making startup depend on Codex."""
+
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        started = time.monotonic()
+        try:
+            async with asyncio.timeout(timeout_seconds + 0.1):
+                await self._voice_candidates(
+                    force_refresh=True,
+                    request_timeout=timeout_seconds,
+                )
+        except Exception:
+            logger.warning(
+                "codex_thread_list_prewarm_failed duration_ms=%.1f",
+                (time.monotonic() - started) * 1000,
+            )
+            return False
+        logger.info(
+            "codex_thread_list_prewarm_completed duration_ms=%.1f",
+            (time.monotonic() - started) * 1000,
+        )
+        return True
+
+    def invalidate_voice_candidate_cache(self) -> None:
+        """Invalidate cached discovery after a successful thread mutation."""
+
+        self._voice_candidate_cache_epoch += 1
+        self._voice_candidate_cache = ()
+        self._voice_candidate_cache_expires_at = 0.0
+
+    async def _voice_candidates(
+        self,
+        *,
+        force_refresh: bool = False,
+        request_timeout: float | None = None,
+    ) -> tuple[ThreadCandidate, ...]:
+        for _attempt in range(2):
+            now = time.monotonic()
+            if not force_refresh and now < self._voice_candidate_cache_expires_at:
+                return self._voice_candidate_cache
+            async with self._voice_candidate_cache_lock:
+                now = time.monotonic()
+                if not force_refresh and now < self._voice_candidate_cache_expires_at:
+                    return self._voice_candidate_cache
+                refresh = self._voice_candidate_refresh_task
+                if refresh is None:
+                    refresh = asyncio.create_task(
+                        self._refresh_voice_candidates(
+                            cache_epoch=self._voice_candidate_cache_epoch,
+                            request_timeout=(
+                                self.voice_list_timeout_seconds
+                                if request_timeout is None
+                                else request_timeout
+                            ),
+                        ),
+                        name="agent-hotline-voice-thread-candidates",
+                    )
+                    refresh.add_done_callback(_consume_task_exception)
+                    self._voice_candidate_refresh_task = refresh
+            candidates = await asyncio.shield(refresh)
+            if candidates is not None:
+                return candidates
+            force_refresh = True
+        raise CodexAppServerError("voice thread candidates changed during refresh")
+
+    async def _refresh_voice_candidates(
+        self,
+        *,
+        cache_epoch: int,
+        request_timeout: float,
+    ) -> tuple[ThreadCandidate, ...] | None:
+        current_task = asyncio.current_task()
+        try:
+            candidates = await self._list_candidates_uncached(
+                limit=_VOICE_CANDIDATE_CACHE_LIMIT,
+                archived=False,
+                request_timeout=request_timeout,
+            )
+            cached = tuple(_sanitize_voice_candidate(candidate) for candidate in candidates)
+            async with self._voice_candidate_cache_lock:
+                if cache_epoch != self._voice_candidate_cache_epoch:
+                    return None
+                self._voice_candidate_cache = cached
+                self._voice_candidate_cache_expires_at = (
+                    time.monotonic() + self.voice_candidate_cache_ttl_seconds
+                )
+                return cached
+        finally:
+            async with self._voice_candidate_cache_lock:
+                if self._voice_candidate_refresh_task is current_task:
+                    self._voice_candidate_refresh_task = None
+
+    async def _list_candidates_uncached(
+        self,
+        *,
+        limit: int,
+        archived: bool,
+        request_timeout: float | None,
+    ) -> tuple[ThreadCandidate, ...]:
+        started = time.monotonic()
+        try:
+            response = await self.client.thread_list(
+                limit=limit,
+                archived=archived,
+                sort_key="updated_at",
+                sort_direction="desc",
+                request_timeout=request_timeout,
+            )
+        finally:
+            logger.info(
+                "codex_thread_list duration_ms=%.1f",
+                (time.monotonic() - started) * 1000,
+            )
         raw_threads = response.get("data", [])
         if not isinstance(raw_threads, list):
             raise CodexAppServerProtocolError("thread/list data is not an array")
@@ -1225,6 +1371,7 @@ class SafeThreadController:
             approval_policy=approval_policy,
             permissions=permissions,
         )
+        self.invalidate_voice_candidate_cache()
         thread = started.get("thread")
         if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
             raise CodexAppServerProtocolError("thread/start omitted thread.id")
@@ -1256,6 +1403,7 @@ class SafeThreadController:
         active_turn_ids = _active_turn_ids(thread)
         if status == "notLoaded":
             response = await self.client.thread_resume(candidate.thread_id)
+            self.invalidate_voice_candidate_cache()
             self._assert_response_workspace(response)
             thread = response.get("thread")
             if not isinstance(thread, dict):
@@ -1270,6 +1418,7 @@ class SafeThreadController:
                 active_turn_ids[0],
                 text,
             )
+            self.invalidate_voice_candidate_cache()
             return ThreadControlResult(
                 action="steered",
                 thread_id=candidate.thread_id,
@@ -1281,6 +1430,7 @@ class SafeThreadController:
                 f"thread {candidate.thread_id} cannot accept an instruction in {status!r}"
             )
         result = await self.client.turn_start(candidate.thread_id, text)
+        self.invalidate_voice_candidate_cache()
         return ThreadControlResult(
             action="started",
             thread_id=candidate.thread_id,
@@ -1311,6 +1461,7 @@ class SafeThreadController:
             raise ThreadStateError("thread exposes multiple in-progress turns")
 
         result = await self.client.turn_interrupt(candidate.thread_id, selected_turn)
+        self.invalidate_voice_candidate_cache()
         return ThreadControlResult(
             action="interrupted",
             thread_id=candidate.thread_id,
@@ -1330,6 +1481,7 @@ class SafeThreadController:
         if candidate.thread_id != confirmed_thread_id:
             raise ThreadStateError("archive confirmation does not match resolved thread")
         result = await self.client.thread_archive(candidate.thread_id)
+        self.invalidate_voice_candidate_cache()
         return ThreadControlResult(
             action="archived",
             thread_id=candidate.thread_id,
@@ -1385,6 +1537,13 @@ def _set_if_not_none(target: dict[str, JSONValue], key: str, value: JSONValue) -
         target[key] = value
 
 
+def _consume_task_exception(task: asyncio.Task[Any]) -> None:
+    """Mark detached refresh failures observed without changing waiter behavior."""
+
+    if not task.cancelled():
+        task.exception()
+
+
 def _require_identifier(value: str, name: str) -> None:
     if not value or len(value) > 500:
         raise ValueError(f"{name} must be between 1 and 500 characters")
@@ -1419,6 +1578,23 @@ def _thread_status(thread: Mapping[str, Any]) -> str:
     if isinstance(status, str):  # Defensive compatibility with older versions.
         return status
     return "unknown"
+
+
+def _sanitize_voice_candidate(candidate: ThreadCandidate) -> ThreadCandidate:
+    """Cache only bounded display text while retaining exact opaque identifiers."""
+
+    return ThreadCandidate(
+        thread_id=candidate.thread_id,
+        name=(
+            sanitize_untrusted_text(candidate.name, max_chars=300)
+            if candidate.name is not None
+            else None
+        ),
+        preview=sanitize_untrusted_text(candidate.preview, max_chars=500),
+        cwd=candidate.cwd,
+        status=sanitize_untrusted_text(candidate.status, max_chars=100),
+        updated_at=candidate.updated_at,
+    )
 
 
 def _active_turn_ids(thread: Mapping[str, Any]) -> list[str]:

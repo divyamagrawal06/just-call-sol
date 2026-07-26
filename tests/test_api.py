@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,7 @@ import httpx
 import pytest
 import pytest_asyncio
 
+import agent_hotline.api as api_module
 from agent_hotline.api import create_app
 from agent_hotline.codex_protocol import ThreadCandidate
 from agent_hotline.models import (
@@ -30,6 +32,10 @@ OWNER_PIN = "246810"
 
 
 class FakeThreadController:
+    def __init__(self) -> None:
+        self.extra_candidates: tuple[ThreadCandidate, ...] = ()
+        self.list_limits: list[int] = []
+
     async def list_candidates(
         self,
         *,
@@ -37,6 +43,7 @@ class FakeThreadController:
         archived: bool = False,
     ) -> tuple[ThreadCandidate, ...]:
         del archived
+        self.list_limits.append(limit)
         return (
             ThreadCandidate(
                 thread_id="thread-running",
@@ -46,6 +53,7 @@ class FakeThreadController:
                 status="active",
                 updated_at=1,
             ),
+            *self.extra_candidates,
         )[:limit]
 
     async def inspect_thread(self, reference: str) -> dict[str, Any]:
@@ -78,6 +86,7 @@ async def api(tmp_path: Path) -> AsyncIterator[APIHarness]:
         hotline_transport="fake",
         hotline_local_token=LOCAL_TOKEN,
         hotline_tool_token=TOOL_TOKEN,
+        hotline_public_tools_require_token=True,
         hotline_callback_token=CALLBACK_TOKEN,
         owner_phone_number="+919876543210",
         owner_confirmation_pin=OWNER_PIN,
@@ -137,6 +146,69 @@ async def _wait_for_provider_call(provider: FakeCallProvider) -> tuple[str, obje
             return provider.calls[-1]
         await asyncio.sleep(0.01)
     pytest.fail("fake call provider was not invoked")
+
+
+async def test_runtime_startup_prewarms_unfiltered_top_ten_with_sixty_second_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, float | None]] = []
+
+    class StubCodexClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def register_server_request_handler(self, _method: str, _handler: object) -> None:
+            pass
+
+        async def start(self) -> dict[str, object]:
+            calls.append(("start", None))
+            return {}
+
+        async def close(self) -> None:
+            calls.append(("close", None))
+
+    class StubThreadController:
+        def __init__(
+            self,
+            _client: StubCodexClient,
+            *,
+            workspace_roots: list[Path],
+        ) -> None:
+            assert workspace_roots == [tmp_path.resolve()]
+
+        async def prewarm_voice_candidates(self, *, timeout_seconds: float) -> bool:
+            calls.append(("prewarm-started", timeout_seconds))
+            await asyncio.sleep(0)
+            calls.append(("prewarm", timeout_seconds))
+            return True
+
+    async def idle_monitor(*_args: object) -> None:
+        calls.append(("monitor", None))
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(api_module, "CodexAppServerClient", StubCodexClient)
+    monkeypatch.setattr(api_module, "SafeThreadController", StubThreadController)
+    monkeypatch.setattr(api_module, "_monitor_codex", idle_monitor)
+    settings = Settings(
+        _env_file=None,
+        hotline_env="test",
+        hotline_database_path=tmp_path / "runtime-prewarm.sqlite3",
+        hotline_transport="fake",
+        codex_app_server_enabled=True,
+        codex_app_server_cwd=tmp_path,
+    )
+    app = create_app(settings=settings)
+
+    async with app.router.lifespan_context(app):
+        assert calls == [
+            ("start", None),
+            ("prewarm-started", 60.0),
+            ("monitor", None),
+            ("prewarm", 60.0),
+        ]
+
+    assert calls[-1] == ("close", None)
 
 
 async def test_api_authentication_boundaries_are_separate_and_fail_closed(
@@ -928,6 +1000,87 @@ async def test_thread_reads_accept_only_a_provider_correlated_live_outbound_call
     assert completed.status_code == 200
     assert stale.status_code == 403
     assert stale_inspection.status_code == 403
+
+
+async def test_thread_list_filters_cached_candidates_per_request_and_maps_running_status(
+    api: APIHarness,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    created = await api.client.post(
+        "/v1/escalations/contact",
+        json=_contact_payload(wait_for_decision=False),
+        headers=_local_headers(),
+    )
+    event_id = created.json()["event_id"]
+    decoys = tuple(
+        ThreadCandidate(
+            thread_id=f"thread-decoy-{index}",
+            name=f"Decoy {index}",
+            preview="An unrelated historical task.",
+            cwd="C:/workspace/just-call-sol",
+            status="idle",
+            updated_at=0,
+        )
+        for index in range(10)
+    )
+    api.controller.extra_candidates = (
+        ThreadCandidate(
+            thread_id="thread-idle-history",
+            name="Historical task",
+            preview="A running total is documented here.",
+            cwd="C:/workspace/just-call-sol",
+            status="idle",
+            updated_at=0,
+        ),
+        *decoys,
+        ThreadCandidate(
+            thread_id="thread-active-beyond-cache",
+            name="Late active task",
+            preview="This match is beyond the cached top ten.",
+            cwd="C:/workspace/just-call-sol",
+            status="active",
+            updated_at=0,
+        ),
+    )
+    caplog.set_level(logging.INFO, logger="agent_hotline.coordinator")
+
+    active = await api.client.post(
+        "/v1/sarvam/tools/threads/list",
+        json={"event_id": event_id, "query": "active", "limit": 10},
+        headers=_tool_headers(),
+    )
+    running = await api.client.post(
+        "/v1/sarvam/tools/threads/list",
+        json={"event_id": event_id, "query": "running", "limit": 10},
+        headers=_tool_headers(),
+    )
+    in_progress = await api.client.post(
+        "/v1/sarvam/tools/threads/list",
+        json={"event_id": event_id, "query": "in progress", "limit": 10},
+        headers=_tool_headers(),
+    )
+    absent = await api.client.post(
+        "/v1/sarvam/tools/threads/list",
+        json={"event_id": event_id, "query": "definitely-absent", "limit": 10},
+        headers=_tool_headers(),
+    )
+
+    expected_active = ["thread-running", "thread-active-beyond-cache"]
+    assert [item["thread_id"] for item in active.json()["threads"]] == expected_active
+    assert [item["thread_id"] for item in running.json()["threads"]] == expected_active
+    assert [item["thread_id"] for item in in_progress.json()["threads"]] == expected_active
+    assert absent.json()["threads"] == []
+    assert api.controller.list_limits[-4:] == [100, 100, 100, 100]
+    duration_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "agent_hotline.coordinator"
+        and record.getMessage().startswith("voice_list_threads_live_session_guard")
+    ]
+    assert len(duration_messages) == 4
+    assert all("duration_ms=" in message for message in duration_messages)
+    assert all(event_id not in message for message in duration_messages)
+    assert all("running" not in message for message in duration_messages)
 
 
 async def test_thread_reads_reject_an_uncorrelated_outbound_session(api: APIHarness) -> None:

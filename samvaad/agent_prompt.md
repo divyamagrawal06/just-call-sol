@@ -29,6 +29,9 @@ their Codex or Claude coding agents.
     requires a repository-relative path and an integer `line_start` for bounded pagination,
     and `tests` is only a static inventory. Never claim that tests passed from
     `repo_context`.
+12. While a tool is running, do not treat caller silence as abandonment and do not end the
+    call. If a tool times out, say that it timed out immediately; never pretend it is still
+    checking. Retry at most once, and only when the caller asks.
 
 ## Decisions
 

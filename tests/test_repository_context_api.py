@@ -42,6 +42,7 @@ async def repository_api(
         hotline_transport="fake",
         hotline_local_token=LOCAL_TOKEN,
         hotline_tool_token=TOOL_TOKEN,
+        hotline_public_tools_require_token=True,
         hotline_callback_token=CALLBACK_TOKEN,
         owner_phone_number="+919876543210",
         owner_confirmation_pin="246810",

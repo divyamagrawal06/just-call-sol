@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 from collections.abc import Mapping
 from datetime import timedelta
 from pathlib import Path
@@ -133,6 +134,11 @@ _THREAD_ACTIONS: dict[str, tuple[ActionKind, RiskLevel]] = {
     "thread.spawn_root": (ActionKind.SPAWN_ROOT_THREAD, RiskLevel.MEDIUM),
     "thread.archive": (ActionKind.DEPLOYMENT, RiskLevel.HIGH),
 }
+_THREAD_STATUS_QUERY_ALIASES: dict[str, frozenset[str]] = {
+    "running": frozenset({"active"}),
+    "in progress": frozenset({"active"}),
+}
+_VOICE_THREAD_QUERY_SCAN_LIMIT = 100
 
 
 class HotlineCoordinator:
@@ -691,32 +697,69 @@ class HotlineCoordinator:
         )
 
     async def list_threads(self, request: ThreadListRequest) -> dict[str, JsonValue]:
-        await self._require_live_voice_read_session(request.event_id)
+        guard_started = time.monotonic()
+        try:
+            await self._require_live_voice_read_session(request.event_id)
+        finally:
+            logger.info(
+                "voice_list_threads_live_session_guard duration_ms=%.1f",
+                (time.monotonic() - guard_started) * 1000,
+            )
         if self.controller is None:
             raise RuntimeError("Codex thread control is unavailable")
-        candidates = await self.controller.list_candidates(limit=request.limit)
+        candidates = await self.controller.list_candidates(
+            limit=(_VOICE_THREAD_QUERY_SCAN_LIMIT if request.query else request.limit)
+        )
         if request.query:
-            needle = request.query.casefold()
-            candidates = tuple(
-                item
-                for item in candidates
-                if needle
-                in " ".join(
-                    (item.thread_id, item.name or "", item.preview, Path(item.cwd).name)
-                ).casefold()
-            )
+            query = request.query.strip().casefold()
+            status_aliases = _THREAD_STATUS_QUERY_ALIASES.get(query)
+            if status_aliases is not None:
+                candidates = tuple(
+                    item for item in candidates if item.status.casefold() in status_aliases
+                )
+            else:
+                candidates = tuple(
+                    item
+                    for item in candidates
+                    if query
+                    in " ".join(
+                        (
+                            item.thread_id,
+                            item.name or "",
+                            item.preview,
+                            Path(item.cwd).name,
+                            item.status,
+                        )
+                    ).casefold()
+                )
         return {
             "threads": [
                 {
                     "thread_id": item.thread_id,
-                    "name": item.name,
+                    "name": (
+                        sanitize_untrusted_text(
+                            item.name,
+                            max_chars=300,
+                            known_secrets=self._known_secrets(),
+                        )
+                        if item.name is not None
+                        else None
+                    ),
                     "preview": sanitize_untrusted_text(
                         item.preview,
                         max_chars=500,
                         known_secrets=self._known_secrets(),
                     ),
-                    "workspace": Path(item.cwd).name,
-                    "status": item.status,
+                    "workspace": sanitize_untrusted_text(
+                        Path(item.cwd).name,
+                        max_chars=300,
+                        known_secrets=self._known_secrets(),
+                    ),
+                    "status": sanitize_untrusted_text(
+                        item.status,
+                        max_chars=100,
+                        known_secrets=self._known_secrets(),
+                    ),
                     "updated_at": item.updated_at,
                 }
                 for item in candidates[: request.limit]
