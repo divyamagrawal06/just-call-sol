@@ -683,7 +683,7 @@ class HotlineCoordinator:
         )
 
     async def list_threads(self, request: ThreadListRequest) -> dict[str, JsonValue]:
-        await self._require_allowlisted_inbound(request.event_id)
+        await self._require_live_voice_read_session(request.event_id)
         if self.controller is None:
             raise RuntimeError("Codex thread control is unavailable")
         candidates = await self.controller.list_candidates(limit=request.limit)
@@ -716,7 +716,7 @@ class HotlineCoordinator:
         }
 
     async def inspect_thread(self, request: ThreadInspectRequest) -> dict[str, JsonValue]:
-        await self._require_allowlisted_inbound(request.event_id)
+        await self._require_live_voice_read_session(request.event_id)
         if self.controller is None:
             raise RuntimeError("Codex thread control is unavailable")
         response = await self.controller.inspect_thread(request.reference)
@@ -1432,6 +1432,30 @@ class HotlineCoordinator:
             session.direction is ContactDirection.INBOUND_CONTROL for session in sessions
         ):
             raise PermissionError("allowlisted inbound control session required")
+        return event
+
+    async def _require_live_voice_read_session(self, event_id: str) -> EscalationEvent:
+        """Authorize read-only task discovery only while its voice session is live."""
+
+        event = await self.store.require_event(event_id)
+        inbound = (
+            event.evidence.get("caller_allowlisted") is True
+            and event.evidence.get("direction") == "inbound"
+        )
+        if inbound:
+            await self._require_allowlisted_inbound(event.event_id)
+            await self._require_live_session(
+                event,
+                expected_direction=ContactDirection.INBOUND_CONTROL,
+                require_provider_correlation=True,
+                allowed_states={SessionState.CONNECTED, SessionState.DISCUSSING},
+            )
+        else:
+            await self._require_live_session(
+                event,
+                expected_direction=ContactDirection.OUTBOUND_ESCALATION,
+                require_provider_correlation=True,
+            )
         return event
 
     def _owner_pin_verified(self, submitted: Any) -> bool:

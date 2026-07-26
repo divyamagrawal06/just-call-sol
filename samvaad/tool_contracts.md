@@ -128,11 +128,15 @@ call may wake a waiting agent with the action outcome, but it must keep
 POST <PUBLIC_BASE_URL>/v1/sarvam/tools/threads/list
 
 {
-  "event_id": "<allowlisted inbound event id>",
+  "event_id": "<provider-correlated live inbound or outbound event id>",
   "query": "<optional task reference>",
   "limit": 10
 }
 ```
+
+Inbound events must come from a successful `begin_inbound`; outbound events must carry the
+provider attempt linked when the daemon dialed. The session must still be live. This
+read-only result does not verify identity or authorize a decision or mutation.
 
 ## `inspect_thread`
 
@@ -140,10 +144,12 @@ POST <PUBLIC_BASE_URL>/v1/sarvam/tools/threads/list
 POST <PUBLIC_BASE_URL>/v1/sarvam/tools/threads/inspect
 
 {
-  "event_id": "<allowlisted inbound event id>",
+  "event_id": "<provider-correlated live inbound or outbound event id>",
   "reference": "<unambiguous task reference>"
 }
 ```
+
+The same live-session rules as `list_threads` apply.
 
 ## `repo_context`
 

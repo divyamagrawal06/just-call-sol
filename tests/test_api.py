@@ -4,12 +4,14 @@ import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 import pytest_asyncio
 
 from agent_hotline.api import create_app
+from agent_hotline.codex_protocol import ThreadCandidate
 from agent_hotline.models import (
     ContactDirection,
     ContactSession,
@@ -27,11 +29,44 @@ CALLBACK_TOKEN = "callback-test-token-123456"
 OWNER_PIN = "246810"
 
 
+class FakeThreadController:
+    async def list_candidates(
+        self,
+        *,
+        limit: int = 100,
+        archived: bool = False,
+    ) -> tuple[ThreadCandidate, ...]:
+        del archived
+        return (
+            ThreadCandidate(
+                thread_id="thread-running",
+                name="Active task",
+                preview="Continue the active repository task.",
+                cwd="C:/workspace/just-call-sol",
+                status="active",
+                updated_at=1,
+            ),
+        )[:limit]
+
+    async def inspect_thread(self, reference: str) -> dict[str, Any]:
+        return {
+            "thread": {
+                "id": reference,
+                "name": "Active task",
+                "preview": "Continue the active repository task.",
+                "cwd": "C:/workspace/just-call-sol",
+                "status": "active",
+                "turns": [],
+            }
+        }
+
+
 @dataclass(slots=True)
 class APIHarness:
     client: httpx.AsyncClient
     provider: FakeCallProvider
     store: SQLiteStore
+    controller: FakeThreadController
 
 
 @pytest_asyncio.fixture
@@ -50,7 +85,12 @@ async def api(tmp_path: Path) -> AsyncIterator[APIHarness]:
         codex_app_server_enabled=False,
     )
     provider = FakeCallProvider()
-    app = create_app(settings=settings, provider=provider)
+    controller = FakeThreadController()
+    app = create_app(
+        settings=settings,
+        provider=provider,
+        controller=controller,  # type: ignore[arg-type]
+    )
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
         async with httpx.AsyncClient(
@@ -61,6 +101,7 @@ async def api(tmp_path: Path) -> AsyncIterator[APIHarness]:
                 client=client,
                 provider=provider,
                 store=app.state.store,
+                controller=controller,
             )
 
 
@@ -699,8 +740,100 @@ async def test_inbound_control_discloses_nothing_to_unallowlisted_callers(
     assert replay.json()["accepted"] is True
     assert replay.json()["identity_verified"] is False
     assert replay.json()["event_id"] == accepted.json()["event_id"]
+    listed = await api.client.post(
+        "/v1/sarvam/tools/threads/list",
+        json={"event_id": accepted.json()["event_id"], "limit": 10},
+        headers=_tool_headers(),
+    )
+    inspected = await api.client.post(
+        "/v1/sarvam/tools/threads/inspect",
+        json={"event_id": accepted.json()["event_id"], "reference": "thread-running"},
+        headers=_tool_headers(),
+    )
+    assert listed.status_code == 200
+    assert inspected.status_code == 200
     events = await api.store.list_events(limit=10)
     assert [event.event_id for event in events] == [accepted.json()["event_id"]]
+
+
+async def test_thread_reads_accept_only_a_provider_correlated_live_outbound_call(
+    api: APIHarness,
+) -> None:
+    created = await api.client.post(
+        "/v1/escalations/contact",
+        json=_contact_payload(wait_for_decision=False),
+        headers=_local_headers(),
+    )
+    assert created.status_code == 200
+    event_id = created.json()["event_id"]
+
+    listed = await api.client.post(
+        "/v1/sarvam/tools/threads/list",
+        json={"event_id": event_id, "limit": 10},
+        headers=_tool_headers(),
+    )
+    inspected = await api.client.post(
+        "/v1/sarvam/tools/threads/inspect",
+        json={"event_id": event_id, "reference": "thread-running"},
+        headers=_tool_headers(),
+    )
+
+    assert listed.status_code == 200
+    assert [item["thread_id"] for item in listed.json()["threads"]] == ["thread-running"]
+    assert inspected.status_code == 200
+    assert inspected.json()["thread_id"] == "thread-running"
+
+    completed = await api.client.post(
+        f"/v1/sarvam/webhooks/instant-outbound/{CALLBACK_TOKEN}",
+        json={
+            "attempt_id": f"fake-attempt-{event_id}",
+            "status": "connected",
+            "duration": 5.0,
+            "channel_info": {"direction": "outbound"},
+        },
+    )
+    stale = await api.client.post(
+        "/v1/sarvam/tools/threads/list",
+        json={"event_id": event_id, "limit": 10},
+        headers=_tool_headers(),
+    )
+    stale_inspection = await api.client.post(
+        "/v1/sarvam/tools/threads/inspect",
+        json={"event_id": event_id, "reference": "thread-running"},
+        headers=_tool_headers(),
+    )
+
+    assert completed.status_code == 200
+    assert stale.status_code == 403
+    assert stale_inspection.status_code == 403
+
+
+async def test_thread_reads_reject_an_uncorrelated_outbound_session(api: APIHarness) -> None:
+    event = EscalationEvent(kind="status", summary="Uncorrelated outbound call.")
+    await api.store.create_event(event)
+    await api.store.transition_event(event.event_id, EventState.QUEUED)
+    await api.store.transition_event(event.event_id, EventState.DIALING)
+    await api.store.create_session(
+        ContactSession(
+            event_id=event.event_id,
+            direction=ContactDirection.OUTBOUND_ESCALATION,
+            state=SessionState.DIALING,
+        )
+    )
+
+    rejected = await api.client.post(
+        "/v1/sarvam/tools/threads/list",
+        json={"event_id": event.event_id, "limit": 10},
+        headers=_tool_headers(),
+    )
+    rejected_inspection = await api.client.post(
+        "/v1/sarvam/tools/threads/inspect",
+        json={"event_id": event.event_id, "reference": "thread-running"},
+        headers=_tool_headers(),
+    )
+
+    assert rejected.status_code == 403
+    assert rejected_inspection.status_code == 403
 
 
 async def test_missing_owner_pin_configuration_denies_grants_and_approvals(

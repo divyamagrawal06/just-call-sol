@@ -84,6 +84,11 @@ thing.”
 
 Then retrieve live context using `event_id`.
 
+If the owner asks which Codex tasks are running or asks to inspect one during this outbound
+call, use `list_threads`, then `inspect_thread` as needed. These read-only tools require the
+provider-correlated call to remain live; their results do not authorize a decision or
+mutation.
+
 ## Inbound control
 
 For an inbound call, call `begin_inbound` with the provider caller number and required

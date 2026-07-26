@@ -156,7 +156,10 @@ POST ${PUBLIC_BASE_URL}/v1/sarvam/tools/threads/list
 POST ${PUBLIC_BASE_URL}/v1/sarvam/tools/threads/inspect
 ```
 
-These provide bounded inbound task discovery and inspection after `begin_inbound`.
+These provide bounded task discovery and inspection during a provider-correlated live voice
+session. Inbound calls must first pass `begin_inbound` and remain correlated by
+`interaction_id`; outbound calls use the `attempt_id` linked when the daemon dialed. These
+read-only results do not verify identity or authorize a decision or mutation.
 
 ### `repo_context`
 
