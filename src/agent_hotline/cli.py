@@ -22,7 +22,7 @@ from rich.table import Table
 from . import __version__
 from .client import HotlineClient, HotlineClientError
 from .contracts import ContactHumanRequest, ContextPacket
-from .settings import get_settings, reset_settings_cache
+from .settings import Settings, get_settings, reset_settings_cache, runtime_env_path
 
 app = typer.Typer(
     name="agent-hotline",
@@ -33,12 +33,35 @@ console = Console()
 
 _TOOL_DISTRIBUTION = "agent-hotline"
 _MCP_EXECUTABLE = "agent-hotline-mcp"
+_MANAGED_SECRET_NAMES = (
+    "HOTLINE_LOCAL_TOKEN",
+    "HOTLINE_SIP_CORRELATION_SECRET",
+    "HOTLINE_ACTION_SIGNING_SECRET",
+    "HOTLINE_FALLBACK_SIGNING_SECRET",
+    "HOTLINE_FALLBACK_WEBHOOK_TOKEN",
+)
+_TERMINAL_RESULT_STATUSES = frozenset(
+    {
+        "resolved",
+        "deferred",
+        "no_answer",
+        "busy",
+        "failed",
+        "timed_out",
+    }
+)
 
 
 @dataclass(frozen=True)
 class _CodexRegistrationPlan:
     add_marketplace: bool
     add_plugin: bool
+
+
+@dataclass(frozen=True)
+class _ClaudeRegistrationPlan:
+    remove_existing: bool
+    add_server: bool
 
 
 @app.command("serve")
@@ -52,7 +75,6 @@ def serve(
     import uvicorn
 
     settings = get_settings()
-    settings.ensure_runtime_directory()
     uvicorn.run(
         "agent_hotline.api:create_app",
         factory=True,
@@ -60,8 +82,9 @@ def serve(
         port=port or settings.hotline_port,
         reload=reload,
         log_level=settings.hotline_log_level.lower(),
-        # The webhook authentication secret is part of its callback path because
-        # Sarvam does not publish a signature header. Never emit request URLs.
+        # Public provider routes are authenticated with signature headers. Access
+        # logging remains disabled so correlation metadata is not copied into
+        # terminal history.
         access_log=False,
     )
 
@@ -70,7 +93,7 @@ def serve(
 def doctor(
     live: Annotated[
         bool,
-        typer.Option(help="Also query the local daemon and Sarvam deployment API."),
+        typer.Option(help="Also query the local daemon and selected provider APIs."),
     ] = False,
 ) -> None:
     """Check configuration without printing any credential values."""
@@ -89,7 +112,7 @@ def doctor(
         raise typer.Exit(code=asyncio.run(_doctor_live(settings)))
 
 
-async def _doctor_live(settings: object) -> int:
+async def _doctor_live(settings: Settings) -> int:
     exit_code = 0
     try:
         async with HotlineClient() as client:
@@ -100,24 +123,49 @@ async def _doctor_live(settings: object) -> int:
         console.print(f"[yellow]Local daemon:[/yellow] {exc}")
         exit_code = 1
 
-    from .sarvam import SarvamAPIError, SarvamClient
+    typed_settings = settings
+    if typed_settings.hotline_transport == "openai_realtime":
+        from .openai_realtime import (
+            OpenAIRealtimeAPIError,
+            OpenAIRealtimeClient,
+        )
+        from .twilio import TwilioAPIError, TwilioClient
 
-    typed_settings = get_settings()
-    if typed_settings.sarvam_api_key.get_secret_value():
-        try:
-            async with SarvamClient(typed_settings) as client:
-                deployments = await client.list_deployments(limit=10)
-            console.print(
-                f"[green]Sarvam API:[/green] reachable; {deployments.total} deployment(s)"
-            )
-        except SarvamAPIError as exc:
-            console.print(
-                f"[yellow]Sarvam API:[/yellow] {exc} (status={exc.status_code or 'network'})"
-            )
+        if typed_settings.openai_api_key.get_secret_value():
+            try:
+                async with OpenAIRealtimeClient(typed_settings) as client:
+                    await client.probe()
+                console.print("[green]OpenAI Realtime API:[/green] reachable")
+            except (OpenAIRealtimeAPIError, ValueError) as exc:
+                status_code = getattr(exc, "status_code", None)
+                console.print(
+                    "[yellow]OpenAI Realtime API:[/yellow] "
+                    f"{exc} (status={status_code or 'network'})"
+                )
+                exit_code = 1
+        else:
+            console.print("[yellow]OpenAI Realtime API:[/yellow] key not configured")
             exit_code = 1
-    else:
-        console.print("[yellow]Sarvam API:[/yellow] key not configured")
-        exit_code = 1
+
+        if typed_settings.twilio_configured:
+            try:
+                async with TwilioClient(typed_settings) as client:
+                    await client.probe()
+                console.print("[green]Twilio API:[/green] reachable")
+            except (TwilioAPIError, ValueError) as exc:
+                status_code = getattr(exc, "status_code", None)
+                console.print(
+                    f"[yellow]Twilio API:[/yellow] {exc} (status={status_code or 'network'})"
+                )
+                exit_code = 1
+        else:
+            console.print("[yellow]Twilio API:[/yellow] configuration incomplete")
+            exit_code = 1
+        return exit_code
+
+    console.print(
+        f"[yellow]Provider API:[/yellow] no live probe for {typed_settings.hotline_transport!r}"
+    )
     return exit_code
 
 
@@ -130,15 +178,19 @@ def init_secrets(
 ) -> None:
     """Generate local service tokens without displaying them."""
 
-    names = (
-        "HOTLINE_TOOL_TOKEN",
-        "HOTLINE_LOCAL_TOKEN",
-        "HOTLINE_CALLBACK_TOKEN",
-        "HOTLINE_FALLBACK_WEBHOOK_TOKEN",
-    )
+    runtime_file = runtime_env_path()
+    existing_runtime_text = ""
+    runtime_values: dict[str, str] = {}
+    if platform.system() != "Windows" and runtime_file.exists():
+        existing_runtime_text = runtime_file.read_text(encoding="utf-8")
+        runtime_values = _read_managed_runtime_values(existing_runtime_text)
+
     generated: dict[str, str] = {}
-    for name in names:
-        existing = os.environ.get(name) or _read_windows_user_env(name)
+    for name in _MANAGED_SECRET_NAMES:
+        if platform.system() == "Windows":
+            existing = os.environ.get(name) or _read_windows_user_env(name)
+        else:
+            existing = runtime_values.get(name) or os.environ.get(name)
         generated[name] = secrets.token_urlsafe(32) if force or not existing else existing
 
     if platform.system() == "Windows":
@@ -155,18 +207,90 @@ def init_secrets(
             os.environ[name] = value
         destination = "Windows user environment"
     else:
-        runtime_file = Path(".hotline/runtime.env")
         runtime_file.parent.mkdir(parents=True, exist_ok=True)
-        runtime_file.write_text(
-            "".join(f"{name}={value}\n" for name, value in generated.items()),
-            encoding="utf-8",
+        _atomic_write_private_text(
+            runtime_file,
+            _merge_managed_runtime_values(existing_runtime_text, generated),
         )
-        runtime_file.chmod(0o600)
         destination = str(runtime_file)
 
     reset_settings_cache()
-    console.print(f"[green]Stored four Hotline service tokens in {destination}.[/green]")
+    console.print(f"[green]Stored five Hotline service tokens in {destination}.[/green]")
     console.print("No token values were printed.")
+
+
+def _read_managed_runtime_values(content: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    managed = set(_MANAGED_SECRET_NAMES)
+    for line in content.splitlines():
+        assignment = _parse_runtime_assignment(line)
+        if assignment is None:
+            continue
+        name, value = assignment
+        if name in managed and value:
+            values[name] = value
+    return values
+
+
+def _merge_managed_runtime_values(
+    content: str,
+    values: dict[str, str],
+) -> str:
+    """Replace only Hotline-managed keys while preserving every unrelated line."""
+
+    output: list[str] = []
+    written: set[str] = set()
+    for line in content.splitlines():
+        assignment = _parse_runtime_assignment(line)
+        name = assignment[0] if assignment is not None else None
+        if name in values:
+            if name not in written:
+                output.append(f"{name}={values[name]}")
+                written.add(name)
+            continue
+        output.append(line)
+    for name in _MANAGED_SECRET_NAMES:
+        if name not in written:
+            output.append(f"{name}={values[name]}")
+    return "\n".join(output) + "\n"
+
+
+def _parse_runtime_assignment(line: str) -> tuple[str, str] | None:
+    candidate = line.strip()
+    if not candidate or candidate.startswith("#"):
+        return None
+    if candidate.startswith("export "):
+        candidate = candidate[7:].lstrip()
+    name, separator, raw_value = candidate.partition("=")
+    name = name.strip()
+    if not separator or not name.replace("_", "").isalnum() or not name[0].isalpha():
+        return None
+    value = raw_value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        value = value[1:-1]
+    return name, value
+
+
+def _atomic_write_private_text(path: Path, content: str) -> None:
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            descriptor = None
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        path.chmod(0o600)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
 
 
 @app.command("call")
@@ -201,17 +325,76 @@ def call(
         summary=summary,
         question=question,
         context=ContextPacket(task_summary=summary),
-        wait_for_decision=not no_wait,
-        timeout_seconds=timeout if not no_wait else 1,
+        wait_for_decision=True,
+        timeout_seconds=timeout,
     )
-    result = asyncio.run(_contact(request))
+    result = asyncio.run(_contact(request, start_only=no_wait))
     console.print_json(data=result)
 
 
-async def _contact(request: ContactHumanRequest) -> dict[str, object]:
+async def _contact(
+    request: ContactHumanRequest,
+    *,
+    start_only: bool = False,
+) -> dict[str, object]:
     async with HotlineClient() as client:
-        result = await client.contact_human(request)
+        result = (
+            await client.start_contact_human(request)
+            if start_only
+            else await client.contact_human(request)
+        )
     return result.model_dump(mode="json", exclude_none=True)
+
+
+@app.command("result")
+def result(
+    event_id: Annotated[str, typer.Argument(help="Durable evt_... identifier.")],
+    watch: Annotated[
+        bool,
+        typer.Option(help="Poll until a terminal result or the local watch timeout."),
+    ] = False,
+    timeout: Annotated[
+        int,
+        typer.Option(min=1, max=7200, help="Maximum local watch time in seconds."),
+    ] = 600,
+    interval: Annotated[
+        float,
+        typer.Option(min=0.2, max=30.0, help="Polling interval while watching."),
+    ] = 1.0,
+) -> None:
+    """Read or watch one durable escalation result."""
+
+    payload, terminal = asyncio.run(
+        _event_result(
+            event_id,
+            watch=watch,
+            timeout_seconds=timeout,
+            interval_seconds=interval,
+        )
+    )
+    console.print_json(data=payload)
+    if watch and not terminal:
+        raise typer.Exit(code=2)
+
+
+async def _event_result(
+    event_id: str,
+    *,
+    watch: bool,
+    timeout_seconds: float,
+    interval_seconds: float,
+) -> tuple[dict[str, object], bool]:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    async with HotlineClient() as client:
+        while True:
+            result = await client.get_result(event_id)
+            terminal = result.status in _TERMINAL_RESULT_STATUSES
+            if terminal or not watch:
+                return result.model_dump(mode="json", exclude_none=True), terminal
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return result.model_dump(mode="json", exclude_none=True), False
+            await asyncio.sleep(min(interval_seconds, remaining))
 
 
 @app.command("events")
@@ -245,41 +428,58 @@ def install_clients(
         typer.Option(help="Client configuration to install."),
     ] = "all",
     marketplace_root: Annotated[
-        Path,
-        typer.Option(help="Repository root containing .agents/plugins/marketplace.json."),
-    ] = Path.cwd(),
+        Path | None,
+        typer.Option(
+            help=(
+                "Marketplace root override. By default, use the source checkout when "
+                "available or the plugin bundled in the installed wheel."
+            )
+        ),
+    ] = None,
 ) -> None:
-    """Install the editable CLI and register Codex/Claude MCP integrations."""
+    """Install or locate the CLI and register Codex/Claude integrations."""
 
-    project_root = marketplace_root.resolve()
-    if not (project_root / "pyproject.toml").is_file():
-        raise typer.BadParameter(
-            f"{project_root} is not an Agent Hotline repository (pyproject.toml is missing)"
-        )
+    resolved_marketplace_root = _resolve_marketplace_root(marketplace_root)
+    editable_root = (
+        resolved_marketplace_root
+        if (resolved_marketplace_root / "pyproject.toml").is_file()
+        else None
+    )
 
     marketplace_name: str | None = None
     if client in {"codex", "all"}:
-        marketplace_name = _read_marketplace_name(project_root)
+        marketplace_name = _read_marketplace_name(resolved_marketplace_root)
 
-    install_tool = _uv_tool_install_needed(project_root)
+    install_tool = _uv_tool_install_needed(editable_root)
     codex_plan: _CodexRegistrationPlan | None = None
     if client in {"codex", "all"}:
         assert marketplace_name is not None
-        codex_plan = _plan_codex_registration(project_root, marketplace_name)
-    install_claude = _claude_registration_needed() if client in {"claude", "all"} else False
+        codex_plan = _plan_codex_registration(resolved_marketplace_root, marketplace_name)
+    claude_plan = (
+        _plan_claude_registration()
+        if client in {"claude", "all"}
+        else _ClaudeRegistrationPlan(remove_existing=False, add_server=False)
+    )
 
     if install_tool:
-        _checked_run(["uv", "tool", "install", "--editable", str(project_root)])
+        assert editable_root is not None
+        _checked_run(["uv", "tool", "install", "--editable", str(editable_root)])
     else:
-        console.print(
-            "[green]Agent Hotline uv tool is already installed from this repository.[/green]"
-        )
+        console.print("[green]Agent Hotline command suite is already installed.[/green]")
 
     if client in {"codex", "all"}:
         assert marketplace_name is not None
         assert codex_plan is not None
         if codex_plan.add_marketplace:
-            _checked_run(["codex", "plugin", "marketplace", "add", str(project_root)])
+            _checked_run(
+                [
+                    "codex",
+                    "plugin",
+                    "marketplace",
+                    "add",
+                    str(resolved_marketplace_root),
+                ]
+            )
         if codex_plan.add_plugin:
             _checked_run(["codex", "plugin", "add", f"agent-hotline@{marketplace_name}"])
         if codex_plan.add_marketplace or codex_plan.add_plugin:
@@ -288,7 +488,18 @@ def install_clients(
             console.print("[green]Codex plugin is already registered.[/green]")
 
     if client in {"claude", "all"}:
-        if install_claude:
+        if claude_plan.remove_existing:
+            _checked_run(
+                [
+                    "claude",
+                    "mcp",
+                    "remove",
+                    "--scope",
+                    "user",
+                    "agent-hotline",
+                ]
+            )
+        if claude_plan.add_server:
             _checked_run(
                 [
                     "claude",
@@ -297,6 +508,8 @@ def install_clients(
                     "--scope",
                     "user",
                     "agent-hotline",
+                    "--env",
+                    "HOTLINE_MCP_CLIENT=claude",
                     "--",
                     _MCP_EXECUTABLE,
                 ]
@@ -323,44 +536,68 @@ def demo(
 
 def _checked_run(command: list[str]) -> None:
     resolved_command = _resolve_subprocess_command(command)
-    result = subprocess.run(resolved_command, check=False, shell=False)
+    try:
+        result = subprocess.run(resolved_command, check=False, shell=False)
+    except OSError as exc:
+        raise typer.BadParameter(f"Required executable is unavailable: {command[0]}") from exc
     if result.returncode != 0:
         raise typer.Exit(result.returncode)
 
 
 def _captured_run(command: list[str]) -> subprocess.CompletedProcess[str]:
     resolved_command = _resolve_subprocess_command(command)
-    return subprocess.run(
-        resolved_command,
-        check=False,
-        shell=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    try:
+        return subprocess.run(
+            resolved_command,
+            check=False,
+            shell=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError as exc:
+        raise typer.BadParameter(f"Required executable is unavailable: {command[0]}") from exc
 
 
-def _uv_tool_install_needed(project_root: Path) -> bool:
-    """Return whether the editable uv tool is absent.
+def _uv_tool_install_needed(project_root: Path | None) -> bool:
+    """Return whether an editable checkout still needs a persistent uv tool.
 
     Replacing a uv tool environment from a process running inside that same
     environment is unsafe on Windows. Exact editable installs are therefore a
     no-op, while a different or unreadable existing install is an explicit
-    conflict rather than an implicit ``--force`` replacement.
+    conflict rather than an implicit ``--force`` replacement. A release-wheel
+    invocation has no editable project root and must already expose the bundled
+    ``agent-hotline-mcp`` companion command.
     """
 
     current_receipt = Path(sys.prefix) / "uv-receipt.toml"
     if current_receipt.is_file():
         current_tool, current_source = _agent_hotline_receipt(current_receipt)
         if current_tool:
-            if current_source is not None and _same_path(current_source, project_root):
+            if (
+                project_root is not None
+                and current_source is not None
+                and _same_path(current_source, project_root)
+            ):
+                return False
+            if project_root is None and _is_persistent_uv_tool_environment():
                 return False
             raise typer.BadParameter(
                 "install-clients is running from an Agent Hotline uv tool installed "
-                "from a different repository. Refusing to replace its active environment; "
-                "after this command exits, install the intended repository explicitly."
+                "from a different source or a temporary tool environment. Refusing to "
+                "replace its active environment; after this command exits, install the "
+                "intended release or repository explicitly with uv tool install."
             )
+
+    if project_root is None:
+        if shutil.which(_MCP_EXECUTABLE):
+            return False
+        raise typer.BadParameter(
+            "The bundled plugin is available, but agent-hotline-mcp is not on PATH. "
+            "Install the release persistently with `uv tool install agent-hotline`, "
+            "then run install-clients again."
+        )
 
     result = _captured_run(["uv", "tool", "dir"])
     if result.returncode != 0:
@@ -384,6 +621,14 @@ def _uv_tool_install_needed(project_root: Path) -> bool:
         "Agent Hotline is already installed as a uv tool from another source. "
         "Refusing to replace it automatically; remove or reinstall that tool explicitly."
     )
+
+
+def _is_persistent_uv_tool_environment() -> bool:
+    result = _captured_run(["uv", "tool", "dir"])
+    if result.returncode != 0 or not result.stdout.strip():
+        return False
+    expected_environment = Path(result.stdout.strip()) / _TOOL_DISTRIBUTION
+    return _same_path(sys.prefix, expected_environment)
 
 
 def _agent_hotline_receipt(receipt_path: Path) -> tuple[bool, Path | None]:
@@ -412,6 +657,7 @@ def _plan_codex_registration(
     project_root: Path,
     marketplace_name: str,
 ) -> _CodexRegistrationPlan:
+    expected_plugin_version = _read_plugin_version(project_root)
     marketplaces = _command_json(
         ["codex", "plugin", "marketplace", "list", "--json"],
         "Codex marketplaces",
@@ -446,6 +692,27 @@ def _plan_codex_registration(
     for row in plugin_rows:
         if not isinstance(row, dict):
             continue
+        row_plugin_id = row.get("pluginId")
+        row_name = row.get("name")
+        row_marketplace = row.get("marketplaceName")
+        is_hotline = row_name == "agent-hotline" or (
+            isinstance(row_plugin_id, str) and row_plugin_id.startswith("agent-hotline@")
+        )
+        is_other_marketplace = is_hotline and (
+            row_plugin_id != plugin_id
+            and not (row_name == "agent-hotline" and row_marketplace == marketplace_name)
+        )
+        if is_other_marketplace:
+            installed_id = (
+                row_plugin_id
+                if isinstance(row_plugin_id, str)
+                else f"agent-hotline@{row_marketplace or 'unknown'}"
+            )
+            raise typer.BadParameter(
+                f"Codex already has {installed_id!r} installed. Agent Hotline does "
+                "not remove plugin registrations automatically; remove the old entry "
+                f"with `codex plugin remove {installed_id}` and rerun install-clients."
+            )
         matches = row.get("pluginId") == plugin_id or (
             row.get("name") == "agent-hotline" and row.get("marketplaceName") == marketplace_name
         )
@@ -459,7 +726,7 @@ def _plan_codex_registration(
                 f"Codex plugin {plugin_id!r} is installed from a different source; "
                 "refusing to replace it automatically"
             )
-        add_plugin = False
+        add_plugin = row.get("version") != expected_plugin_version
         break
 
     return _CodexRegistrationPlan(
@@ -468,12 +735,12 @@ def _plan_codex_registration(
     )
 
 
-def _claude_registration_needed() -> bool:
+def _plan_claude_registration() -> _ClaudeRegistrationPlan:
     result = _captured_run(["claude", "mcp", "get", "agent-hotline"])
     combined = "\n".join(part for part in (result.stdout, result.stderr) if part)
     if result.returncode != 0:
         if "no mcp server named" in combined.casefold():
-            return True
+            return _ClaudeRegistrationPlan(remove_existing=False, add_server=True)
         raise typer.BadParameter("Could not inspect the existing Claude MCP registration")
 
     fields: dict[str, str] = {}
@@ -486,17 +753,36 @@ def _claude_registration_needed() -> bool:
     transport = fields.get("type", "").casefold()
     command = fields.get("command", "")
     args = fields.get("args", "")
-    if (
+    environment = fields.get("environment", "")
+    has_client_identity = environment.casefold() == "hotline_mcp_client=claude" or any(
+        line.strip().casefold()
+        in {
+            "hotline_mcp_client=claude",
+            "hotline_mcp_client: claude",
+        }
+        for line in result.stdout.splitlines()
+    )
+    base_registration_matches = (
         scope.startswith("user config")
         and transport == "stdio"
         and command == _MCP_EXECUTABLE
         and not args
-    ):
-        return False
+    )
+    if base_registration_matches and has_client_identity:
+        return _ClaudeRegistrationPlan(remove_existing=False, add_server=False)
+    if base_registration_matches and not environment:
+        return _ClaudeRegistrationPlan(remove_existing=True, add_server=True)
     raise typer.BadParameter(
         "Claude already has an MCP server named 'agent-hotline' with a different "
-        "scope or command; refusing to overwrite it automatically"
+        "scope, command, or HOTLINE_MCP_CLIENT identity; refusing to overwrite it "
+        "automatically"
     )
+
+
+def _claude_registration_needed() -> bool:
+    """Backward-compatible predicate used by external installer checks."""
+
+    return _plan_claude_registration().add_server
 
 
 def _command_json(command: list[str], description: str) -> dict[str, object]:
@@ -576,6 +862,78 @@ def _read_marketplace_name(repository_root: Path) -> str:
             f"Codex marketplace manifest has no valid name: {marketplace_path}"
         )
     return name.strip()
+
+
+def _read_plugin_version(marketplace_root: Path) -> str:
+    plugin_path = marketplace_root / "plugins" / "agent-hotline" / ".codex-plugin" / "plugin.json"
+    try:
+        payload = json.loads(plugin_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise typer.BadParameter(f"Codex plugin manifest is unreadable: {plugin_path}") from exc
+    version = payload.get("version") if isinstance(payload, dict) else None
+    if not isinstance(version, str) or not version.strip():
+        raise typer.BadParameter(f"Codex plugin manifest has no valid version: {plugin_path}")
+    return version.strip()
+
+
+def _resolve_marketplace_root(requested_root: Path | None) -> Path:
+    if requested_root is not None:
+        resolved = requested_root.resolve()
+        _validate_hotline_marketplace_root(resolved)
+        return resolved
+
+    source_root = Path(__file__).resolve().parents[2]
+    bundled_root = Path(__file__).resolve().parent / "_distribution"
+    candidates = [
+        source_root,
+        bundled_root,
+        Path.cwd().resolve(),
+    ]
+    seen: set[str] = set()
+    for candidate in candidates:
+        marker = os.path.normcase(os.path.normpath(str(candidate)))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        try:
+            _validate_hotline_marketplace_root(candidate)
+        except typer.BadParameter:
+            continue
+        return candidate
+
+    raise typer.BadParameter(
+        "Could not locate the Agent Hotline Codex plugin. Reinstall a complete "
+        "Agent Hotline wheel or pass --marketplace-root pointing at a source checkout."
+    )
+
+
+def _validate_hotline_marketplace_root(root: Path) -> None:
+    marketplace_path = root / ".agents" / "plugins" / "marketplace.json"
+    plugin_manifest_path = root / "plugins" / "agent-hotline" / ".codex-plugin" / "plugin.json"
+    try:
+        marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
+        plugin = json.loads(plugin_manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        missing = Path(exc.filename) if exc.filename else marketplace_path
+        raise typer.BadParameter(f"Codex plugin bundle is incomplete: {missing}") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise typer.BadParameter(f"Codex plugin bundle is unreadable under {root}") from exc
+
+    plugin_name = plugin.get("name") if isinstance(plugin, dict) else None
+    rows = marketplace.get("plugins") if isinstance(marketplace, dict) else None
+    matching_row = (
+        next(
+            (row for row in rows if isinstance(row, dict) and row.get("name") == "agent-hotline"),
+            None,
+        )
+        if isinstance(rows, list)
+        else None
+    )
+    expected_source = {"source": "local", "path": "./plugins/agent-hotline"}
+    if plugin_name != "agent-hotline" or not isinstance(matching_row, dict):
+        raise typer.BadParameter(f"{root} is not an Agent Hotline marketplace")
+    if matching_row.get("source") != expected_source:
+        raise typer.BadParameter("Agent Hotline marketplace source must be ./plugins/agent-hotline")
 
 
 def _read_windows_user_env(name: str) -> str | None:

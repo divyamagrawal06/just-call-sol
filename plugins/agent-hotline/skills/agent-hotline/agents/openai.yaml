@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Hotline"
+  short_description: "Resolve agent blockers through safe owner calls"
+  default_prompt: "Use $agent-hotline to call my owner about this blocker and return only a scoped, verified decision."

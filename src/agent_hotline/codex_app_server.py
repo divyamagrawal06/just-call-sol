@@ -14,10 +14,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import hmac
 import inspect
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -46,11 +49,12 @@ from .codex_protocol import (
     ThreadControlResult,
     ThreadNotFoundError,
     ThreadStateError,
+    ThreadWritePlan,
     UnsafeWorkspaceError,
     UnsupportedCodexMethod,
     ensure_json_mapping,
 )
-from .security import sanitize_untrusted_text
+from .security import canonical_json, sanitize_untrusted_text
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +62,10 @@ _MAX_JSONL_BYTES = 8 * 1024 * 1024
 _MAX_INSTRUCTION_CHARS = 100_000
 _SUBSCRIPTION_STOP = object()
 _VOICE_CANDIDATE_CACHE_LIMIT = 10
+_BOUNDED_THREAD_TURN_LIMIT = 10
 _DEFAULT_VOICE_CANDIDATE_CACHE_TTL_SECONDS = 15.0
 _DEFAULT_VOICE_LIST_TIMEOUT_SECONDS = 25.0
+_THREAD_ID_PATTERN = re.compile(r"^(?:thread-[A-Za-z0-9._:-]+|[0-9a-fA-F]{8}-[0-9a-fA-F-]{20,})$")
 
 # This is intentionally narrower than the full app-server protocol.  Do not add
 # command/exec, process/spawn, thread/shellCommand, fs/*, or dynamic tool calls.
@@ -70,6 +76,7 @@ SAFE_CLIENT_METHODS = frozenset(
         "thread/read",
         "thread/resume",
         "thread/start",
+        "thread/turns/list",
         "turn/interrupt",
         "turn/start",
         "turn/steer",
@@ -991,6 +998,34 @@ class CodexAppServerClient:
         )
         return ensure_json_mapping(result, context="thread/read")
 
+    async def thread_turns_list(
+        self,
+        thread_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int = _BOUNDED_THREAD_TURN_LIMIT,
+        sort_direction: str = "desc",
+        items_view: str = "notLoaded",
+    ) -> dict[str, JSONValue]:
+        """Read a bounded turn page without loading unbounded turn item history."""
+
+        _require_identifier(thread_id, "thread_id")
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        if sort_direction not in {"asc", "desc"}:
+            raise ValueError("sort_direction must be 'asc' or 'desc'")
+        if items_view not in {"notLoaded", "summary", "full"}:
+            raise ValueError("unsupported turn items view")
+        params: dict[str, JSONValue] = {
+            "threadId": thread_id,
+            "limit": limit,
+            "sortDirection": sort_direction,
+            "itemsView": items_view,
+        }
+        _set_if_not_none(params, "cursor", cursor)
+        result = await self.request("thread/turns/list", params)
+        return ensure_json_mapping(result, context="thread/turns/list")
+
     async def thread_start(
         self,
         *,
@@ -1270,12 +1305,14 @@ class SafeThreadController:
         limit: int,
         archived: bool,
         request_timeout: float | None,
+        search_term: str | None = None,
     ) -> tuple[ThreadCandidate, ...]:
         started = time.monotonic()
         try:
             response = await self.client.thread_list(
                 limit=limit,
                 archived=archived,
+                search_term=search_term,
                 sort_key="updated_at",
                 sort_direction="desc",
                 request_timeout=request_timeout,
@@ -1297,6 +1334,26 @@ class SafeThreadController:
                 candidates.append(candidate)
         return tuple(candidates)
 
+    async def search_candidates(
+        self,
+        query: str,
+        *,
+        limit: int = 25,
+    ) -> tuple[ThreadCandidate, ...]:
+        """Use Codex server-side search instead of scanning the entire task history."""
+
+        term = query.strip()
+        if not term:
+            return await self.list_candidates(limit=limit)
+        if not 1 <= limit <= 100:
+            raise ValueError("search limit must be between 1 and 100")
+        return await self._list_candidates_uncached(
+            limit=limit,
+            archived=False,
+            request_timeout=self.voice_list_timeout_seconds,
+            search_term=term,
+        )
+
     async def resolve_thread(self, reference: str) -> ThreadCandidate:
         """Resolve by ID/name/preview, raising on zero or multiple matches."""
 
@@ -1304,11 +1361,25 @@ class SafeThreadController:
         if not needle:
             raise ThreadNotFoundError("thread reference is empty")
         folded = needle.casefold()
-        candidates = await self.list_candidates()
+        candidates = await self._voice_candidates()
 
         exact_id = [candidate for candidate in candidates if candidate.thread_id == needle]
         if len(exact_id) == 1:
             return exact_id[0]
+        if _THREAD_ID_PATTERN.fullmatch(needle):
+            try:
+                response = await self.client.thread_read(needle, include_turns=False)
+            except CodexRequestError:
+                pass
+            else:
+                self._assert_response_workspace(response)
+                thread = response.get("thread")
+                if isinstance(thread, dict):
+                    candidate = self._candidate_from_thread(thread)
+                    if candidate is not None and candidate.thread_id == needle:
+                        return candidate
+
+        candidates = await self.search_candidates(needle, limit=25)
 
         exact_named = [
             candidate
@@ -1349,9 +1420,37 @@ class SafeThreadController:
 
     async def inspect_thread(self, reference: str) -> dict[str, JSONValue]:
         candidate = await self.resolve_thread(reference)
-        response = await self.client.thread_read(candidate.thread_id, include_turns=True)
-        self._assert_response_workspace(response)
-        return response
+        return await self._read_bounded_thread_state(candidate.thread_id)
+
+    def canonicalize_workspace(self, cwd: str | os.PathLike[str]) -> str:
+        """Return one exact allowlisted workspace path without changing state."""
+
+        return os.fspath(self._require_allowed_cwd(cwd))
+
+    async def resolve_interrupt_target(
+        self,
+        reference: str,
+        *,
+        turn_id: str | None = None,
+    ) -> tuple[ThreadCandidate, str]:
+        """Resolve and bind an interrupt to one exact thread and active turn."""
+
+        candidate = await self.resolve_thread(reference)
+        response = await self._read_bounded_thread_state(candidate.thread_id)
+        thread = response.get("thread")
+        if not isinstance(thread, dict):
+            raise CodexAppServerProtocolError("thread/read omitted thread")
+        active_turn_ids = _active_turn_ids(thread)
+        if turn_id is not None:
+            _require_identifier(turn_id, "turn_id")
+            if turn_id not in active_turn_ids:
+                raise ThreadStateError("confirmed turn is no longer the active turn")
+            return candidate, turn_id
+        if len(active_turn_ids) == 1:
+            return candidate, active_turn_ids[0]
+        if not active_turn_ids:
+            raise ThreadStateError("thread has no in-progress turn to interrupt")
+        raise ThreadStateError("thread exposes multiple in-progress turns")
 
     async def spawn_root(
         self,
@@ -1376,11 +1475,23 @@ class SafeThreadController:
         if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
             raise CodexAppServerProtocolError("thread/start omitted thread.id")
         thread_id = cast(str, thread["id"])
-        turn = await self.client.turn_start(
-            thread_id,
-            instruction,
-            effort=effort,
-        )
+        try:
+            turn = await self.client.turn_start(
+                thread_id,
+                instruction,
+                effort=effort,
+            )
+        except Exception as exc:
+            try:
+                await self.client.thread_archive(thread_id)
+            except Exception as archive_exc:
+                raise CodexAppServerError(
+                    "root task creation failed and the empty task could not be archived"
+                ) from archive_exc
+            self.invalidate_voice_candidate_cache()
+            raise ThreadStateError(
+                "root task creation failed; the empty task was archived"
+            ) from exc
         turn_id = _turn_id_from_response(turn)
         return ThreadControlResult(
             action="spawned",
@@ -1394,17 +1505,19 @@ class SafeThreadController:
 
         text = self._validate_instruction(instruction)
         candidate = await self.resolve_thread(reference)
-        response = await self.client.thread_read(candidate.thread_id, include_turns=True)
-        self._assert_response_workspace(response)
+        response = await self._read_bounded_thread_state(candidate.thread_id)
         thread = response.get("thread")
         if not isinstance(thread, dict):
             raise CodexAppServerProtocolError("thread/read omitted thread")
         status = _thread_status(thread)
         active_turn_ids = _active_turn_ids(thread)
         if status == "notLoaded":
-            response = await self.client.thread_resume(candidate.thread_id)
+            response = await self.client.thread_resume(
+                candidate.thread_id,
+                exclude_turns=True,
+            )
             self.invalidate_voice_candidate_cache()
-            self._assert_response_workspace(response)
+            response = await self._attach_bounded_turns(response)
             thread = response.get("thread")
             if not isinstance(thread, dict):
                 raise CodexAppServerProtocolError("thread/resume omitted thread")
@@ -1438,28 +1551,139 @@ class SafeThreadController:
             response=result,
         )
 
-    async def interrupt(self, reference: str, *, turn_id: str | None = None) -> ThreadControlResult:
-        """Interrupt one exact active turn; never guess among active turns."""
+    async def prepare_instruction(
+        self,
+        reference: str,
+        instruction: str,
+    ) -> ThreadWritePlan:
+        """Bind an instruction to one exact task operation and current server state."""
 
+        text = self._validate_instruction(instruction)
         candidate = await self.resolve_thread(reference)
-        response = await self.client.thread_read(candidate.thread_id, include_turns=True)
-        self._assert_response_workspace(response)
+        response = await self._read_bounded_thread_state(candidate.thread_id)
         thread = response.get("thread")
         if not isinstance(thread, dict):
             raise CodexAppServerProtocolError("thread/read omitted thread")
+        status = _thread_status(thread)
         active_turn_ids = _active_turn_ids(thread)
-        if turn_id is not None:
-            _require_identifier(turn_id, "turn_id")
-            if active_turn_ids and turn_id not in active_turn_ids:
-                raise ThreadStateError("confirmed turn is no longer the active turn")
-            selected_turn = turn_id
-        elif len(active_turn_ids) == 1:
-            selected_turn = active_turn_ids[0]
-        elif not active_turn_ids:
-            raise ThreadStateError("thread has no in-progress turn to interrupt")
+        if status == "active":
+            if len(active_turn_ids) != 1:
+                raise ThreadStateError("active thread does not expose exactly one in-progress turn")
+            operation = "steer"
+            turn_id: str | None = active_turn_ids[0]
+        elif status == "idle":
+            if active_turn_ids:
+                raise ThreadStateError("idle thread unexpectedly exposes an in-progress turn")
+            operation = "start"
+            turn_id = None
         else:
-            raise ThreadStateError("thread exposes multiple in-progress turns")
+            raise ThreadStateError(f"thread {candidate.thread_id} cannot be prepared in {status!r}")
+        cwd = cast(str, thread["cwd"])
+        return ThreadWritePlan(
+            thread_id=candidate.thread_id,
+            cwd=self.canonicalize_workspace(cwd),
+            operation=operation,
+            turn_id=turn_id,
+            state_fingerprint=_thread_state_fingerprint(thread),
+            instruction=text,
+        )
 
+    async def execute_instruction(self, plan: ThreadWritePlan) -> ThreadControlResult:
+        """Execute only the exact start/steer operation whose precondition was confirmed."""
+
+        _require_identifier(plan.thread_id, "thread_id")
+        text = self._validate_instruction(plan.instruction)
+        if plan.operation not in {"start", "steer"}:
+            raise ValueError("unsupported prepared instruction operation")
+        response = await self._read_bounded_thread_state(plan.thread_id)
+        thread = response.get("thread")
+        if not isinstance(thread, dict):
+            raise CodexAppServerProtocolError("thread/read omitted thread")
+        cwd = cast(str, thread["cwd"])
+        if self.canonicalize_workspace(cwd) != self.canonicalize_workspace(plan.cwd):
+            raise ThreadStateError("confirmed task moved to a different workspace")
+        current_fingerprint = _thread_state_fingerprint(thread)
+        if not hmac.compare_digest(current_fingerprint, plan.state_fingerprint):
+            raise ThreadStateError(
+                "Codex task state changed after confirmation; prepare the action again"
+            )
+
+        status = _thread_status(thread)
+        active_turn_ids = _active_turn_ids(thread)
+        if plan.operation == "steer":
+            if status != "active" or plan.turn_id is None or active_turn_ids != [plan.turn_id]:
+                raise ThreadStateError("confirmed active turn is no longer current")
+            result = await self.client.turn_steer(
+                plan.thread_id,
+                plan.turn_id,
+                text,
+            )
+            action = "steered"
+            result_turn_id = plan.turn_id
+        else:
+            if status != "idle" or active_turn_ids or plan.turn_id is not None:
+                raise ThreadStateError("confirmed idle task is no longer idle")
+            result = await self.client.turn_start(plan.thread_id, text)
+            action = "started"
+            result_turn_id = _turn_id_from_response(result)
+        self.invalidate_voice_candidate_cache()
+        return ThreadControlResult(
+            action=action,
+            thread_id=plan.thread_id,
+            turn_id=result_turn_id,
+            response=result,
+        )
+
+    async def _read_bounded_thread_state(
+        self,
+        thread_id: str,
+    ) -> dict[str, JSONValue]:
+        """Read metadata plus only the newest turn headers.
+
+        ``thread/read(includeTurns=true)`` serializes the entire persisted task
+        history into one JSONL response. Long-lived Codex tasks can exceed many
+        MiB, stall a voice call, and break the supervised transport. The
+        paginated turn endpoint gives us the exact state needed for inspection
+        and mutations without loading turn items.
+        """
+
+        response = await self.client.thread_read(thread_id, include_turns=False)
+        return await self._attach_bounded_turns(response)
+
+    async def _attach_bounded_turns(
+        self,
+        response: dict[str, JSONValue],
+    ) -> dict[str, JSONValue]:
+        self._assert_response_workspace(response)
+        raw_thread = response.get("thread")
+        if not isinstance(raw_thread, dict):
+            raise CodexAppServerProtocolError("thread response omitted thread")
+        thread_id = raw_thread.get("id")
+        if not isinstance(thread_id, str):
+            raise CodexAppServerProtocolError("thread response omitted thread.id")
+        turn_page = await self.client.thread_turns_list(
+            thread_id,
+            limit=_BOUNDED_THREAD_TURN_LIMIT,
+            sort_direction="desc",
+            items_view="notLoaded",
+        )
+        raw_turns = turn_page.get("data")
+        if not isinstance(raw_turns, list):
+            raise CodexAppServerProtocolError("thread/turns/list data is not an array")
+        bounded_turns = [turn for turn in reversed(raw_turns) if isinstance(turn, dict)]
+        copied_thread = dict(raw_thread)
+        copied_thread["turns"] = cast(JSONValue, bounded_turns)
+        copied_response = dict(response)
+        copied_response["thread"] = cast(JSONValue, copied_thread)
+        return copied_response
+
+    async def interrupt(self, reference: str, *, turn_id: str | None = None) -> ThreadControlResult:
+        """Interrupt one exact active turn; never guess among active turns."""
+
+        candidate, selected_turn = await self.resolve_interrupt_target(
+            reference,
+            turn_id=turn_id,
+        )
         result = await self.client.turn_interrupt(candidate.thread_id, selected_turn)
         self.invalidate_voice_candidate_cache()
         return ThreadControlResult(
@@ -1610,6 +1834,22 @@ def _active_turn_ids(thread: Mapping[str, Any]) -> list[str]:
         if status_type == "inProgress":
             active.append(cast(str, turn["id"]))
     return active
+
+
+def _thread_state_fingerprint(thread: Mapping[str, Any]) -> str:
+    thread_id = thread.get("id")
+    cwd = thread.get("cwd")
+    if not isinstance(thread_id, str) or not isinstance(cwd, str):
+        raise CodexAppServerProtocolError("thread state omitted identity or workspace")
+    updated_at = thread.get("updatedAt")
+    snapshot = {
+        "thread_id": thread_id,
+        "cwd": cwd,
+        "status": _thread_status(thread),
+        "active_turn_ids": _active_turn_ids(thread),
+        "updated_at": updated_at if isinstance(updated_at, int) else None,
+    }
+    return hashlib.sha256(canonical_json(snapshot).encode()).hexdigest()
 
 
 def _turn_id_from_response(response: Mapping[str, JSONValue]) -> str | None:

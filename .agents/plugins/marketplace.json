@@ -1,11 +1,12 @@
 {
-  "name": "personal",
+  "name": "agent-hotline-local",
   "interface": {
-    "displayName": "Personal"
+    "displayName": "Agent Hotline Local"
   },
   "plugins": [
     {
       "name": "agent-hotline",
+      "description": "Call an owner through OpenAI Realtime and return bounded, verified decisions to Codex or Claude.",
       "source": {
         "source": "local",
         "path": "./plugins/agent-hotline"

@@ -178,6 +178,18 @@ class ThreadControlResult:
     response: dict[str, JSONValue]
 
 
+@dataclass(frozen=True, slots=True)
+class ThreadWritePlan:
+    """Server-derived, immutable precondition for one exact Codex instruction write."""
+
+    thread_id: str
+    cwd: str
+    operation: str
+    turn_id: str | None
+    state_fingerprint: str
+    instruction: str
+
+
 def ensure_json_mapping(value: JSONValue, *, context: str) -> dict[str, JSONValue]:
     """Narrow an open protocol result to an object with a useful error."""
 

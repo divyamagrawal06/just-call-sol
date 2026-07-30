@@ -2,7 +2,10 @@
   "mcpServers": {
     "agent_hotline": {
       "command": "agent-hotline-mcp",
-      "args": []
+      "args": [],
+      "env": {
+        "HOTLINE_MCP_CLIENT": "codex"
+      }
     }
   }
 }

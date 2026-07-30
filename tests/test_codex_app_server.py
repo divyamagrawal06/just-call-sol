@@ -482,6 +482,7 @@ async def test_thread_and_turn_wrappers_use_0144_6_field_names() -> None:
         {
             "thread/list": lambda _message: {"data": []},
             "thread/read": lambda message: {"thread": {"id": message["params"]["threadId"]}},
+            "thread/turns/list": lambda _message: {"data": []},
             "thread/start": lambda _message: {"thread": {"id": "new-thread"}},
             "thread/resume": lambda message: {"thread": {"id": message["params"]["threadId"]}},
             "thread/archive": lambda _message: {},
@@ -504,6 +505,7 @@ async def test_thread_and_turn_wrappers_use_0144_6_field_names() -> None:
         sort_direction="desc",
     )
     await client.thread_read("thread-a")
+    await client.thread_turns_list("thread-a", limit=5)
     await client.thread_start(cwd="C:\\repo", model="fast-model")
     await client.thread_resume("thread-a", exclude_turns=True)
     await client.thread_archive("thread-a")
@@ -518,6 +520,12 @@ async def test_thread_and_turn_wrappers_use_0144_6_field_names() -> None:
     assert method_messages(server, "thread/read")[0]["params"] == {
         "threadId": "thread-a",
         "includeTurns": True,
+    }
+    assert method_messages(server, "thread/turns/list")[0]["params"] == {
+        "threadId": "thread-a",
+        "limit": 5,
+        "sortDirection": "desc",
+        "itemsView": "notLoaded",
     }
     assert method_messages(server, "thread/start")[0]["params"] == {
         "cwd": "C:\\repo",
@@ -907,6 +915,11 @@ async def test_safe_controller_disambiguates_and_steers_exact_active_turn(
             thread for thread in threads if thread["id"] == message["params"]["threadId"]
         )
     }
+    server.handlers["thread/turns/list"] = lambda message: {
+        "data": next(
+            thread["turns"] for thread in threads if thread["id"] == message["params"]["threadId"]
+        )
+    }
     server.handlers["turn/steer"] = lambda message: {"turnId": message["params"]["expectedTurnId"]}
     server.handlers["turn/interrupt"] = lambda _message: {}
     server.handlers["thread/archive"] = lambda _message: {}
@@ -938,6 +951,61 @@ async def test_safe_controller_disambiguates_and_steers_exact_active_turn(
         await controller.archive("training-run", confirmed_thread_id="thread-training-notes")
     archived = await controller.archive("training-run", confirmed_thread_id="thread-training")
     assert archived.action == "archived"
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_safe_controller_inspection_uses_bounded_turn_headers(
+    tmp_path: Path,
+) -> None:
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    turns = [
+        {
+            "id": f"turn-{index:02d}",
+            "status": {"type": "completed"},
+            "items": [],
+            "itemsView": "notLoaded",
+        }
+        for index in range(12)
+    ]
+    thread = {
+        "id": "thread-large-history",
+        "name": "large-history",
+        "preview": "A long-lived task.",
+        "cwd": str(allowed),
+        "status": {"type": "idle"},
+        "updatedAt": 20,
+        "turns": [],
+    }
+    server = FakeCodexServer()
+    server.handlers["thread/list"] = lambda _message: {"data": [thread]}
+    server.handlers["thread/read"] = lambda _message: {"thread": thread}
+    server.handlers["thread/turns/list"] = lambda message: {
+        "data": list(reversed(turns))[: message["params"]["limit"]],
+        "nextCursor": "older-turns",
+    }
+    client = CodexAppServerClient(
+        _process_factory=FakeProcessFactory(server),
+        codex_executable="codex.exe",
+    )
+    await client.start()
+    controller = SafeThreadController(client, workspace_roots=[allowed])
+
+    inspected = await controller.inspect_thread("large-history")
+
+    inspected_thread = inspected["thread"]
+    assert isinstance(inspected_thread, dict)
+    assert [turn["id"] for turn in inspected_thread["turns"]] == [
+        f"turn-{index:02d}" for index in range(2, 12)
+    ]
+    assert method_messages(server, "thread/read")[0]["params"]["includeTurns"] is False
+    assert method_messages(server, "thread/turns/list")[0]["params"] == {
+        "threadId": "thread-large-history",
+        "limit": 10,
+        "sortDirection": "desc",
+        "itemsView": "notLoaded",
+    }
     await client.close()
 
 
@@ -995,6 +1063,7 @@ async def test_safe_controller_resumes_unloaded_thread_before_new_turn(
     server = FakeCodexServer()
     server.handlers["thread/list"] = lambda _message: {"data": [stored]}
     server.handlers["thread/read"] = lambda _message: {"thread": stored}
+    server.handlers["thread/turns/list"] = lambda _message: {"data": []}
     server.handlers["thread/resume"] = lambda _message: {"thread": resumed}
     server.handlers["turn/start"] = lambda _message: {"turn": {"id": "next-turn"}}
     client = CodexAppServerClient(

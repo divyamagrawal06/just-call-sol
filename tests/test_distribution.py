@@ -14,6 +14,24 @@ from pathlib import Path
 
 import pytest
 
+_REMOVED_ARTIFACT_MARKERS = (
+    "sarvam",
+    "samvaad",
+    "event_tracker",
+    "hackathon",
+    "registration_tracker",
+    ".csv",
+)
+
+
+def _assert_no_removed_voice_or_demo_artifacts(names: set[str]) -> None:
+    offenders = sorted(
+        name
+        for name in names
+        if any(marker in name.lower() for marker in _REMOVED_ARTIFACT_MARKERS)
+    )
+    assert offenders == []
+
 
 def test_wheel_and_sdist_contain_runtime_and_integration_assets(tmp_path: Path) -> None:
     uv = shutil.which("uv")
@@ -36,12 +54,30 @@ def test_wheel_and_sdist_contain_runtime_and_integration_assets(tmp_path: Path) 
 
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
+        _assert_no_removed_voice_or_demo_artifacts(names)
         assert "agent_hotline/mcp_server.py" in names
         assert "agent_hotline/cli.py" in names
         assert "agent_hotline/py.typed" in names
         assert "agent_hotline/dashboard_assets/index.html" in names
         assert "agent_hotline/fallback_assets/index.html" in names
         assert "agent_hotline/fallback_assets/fallback.js" in names
+        assert "agent_hotline/_distribution/.agents/plugins/marketplace.json" in names
+        assert (
+            "agent_hotline/_distribution/plugins/agent-hotline/.codex-plugin/plugin.json" in names
+        )
+        assert "agent_hotline/_distribution/plugins/agent-hotline/.mcp.json" in names
+        assert (
+            "agent_hotline/_distribution/plugins/agent-hotline/"
+            "skills/agent-hotline/SKILL.md" in names
+        )
+        assert (
+            "agent_hotline/_distribution/plugins/agent-hotline/"
+            "skills/agent-hotline/references/policy.md" in names
+        )
+        assert (
+            "agent_hotline/_distribution/plugins/agent-hotline/"
+            "skills/agent-hotline/agents/openai.yaml" in names
+        )
 
         entry_points_name = next(
             name for name in names if name.endswith(".dist-info/entry_points.txt")
@@ -52,22 +88,34 @@ def test_wheel_and_sdist_contain_runtime_and_integration_assets(tmp_path: Path) 
         assert console_scripts["agent-hotline"] == "agent_hotline.cli:app"
         assert console_scripts["agent-hotline-claude-hook"] == "agent_hotline.claude_hooks:main"
         assert console_scripts["agent-hotline-mcp"] == "agent_hotline.mcp_server:main"
+        assert set(console_scripts) == {
+            "agent-hotline",
+            "agent-hotline-claude-hook",
+            "agent-hotline-mcp",
+        }
+
+        extracted = tmp_path / "extracted-wheel"
+        archive.extractall(extracted)
 
     import_check = subprocess.run(
         [
             sys.executable,
             "-c",
             (
-                "import agent_hotline; "
+                "import sys; import agent_hotline; "
                 "from agent_hotline.cli import app; "
+                "from agent_hotline.cli import _resolve_marketplace_root; "
                 "from agent_hotline.mcp_server import mcp; "
-                "assert '.whl' in agent_hotline.__file__; "
+                "root = _resolve_marketplace_root(None); "
+                "assert str(root).startswith(sys.argv[1]); "
+                "assert (root / 'plugins/agent-hotline/.mcp.json').is_file(); "
                 "assert app.info.name == 'agent-hotline'; "
                 "assert mcp.name == 'agent-hotline'"
             ),
+            str(extracted),
         ],
         cwd=tmp_path,
-        env={**os.environ, "PYTHONPATH": str(wheel)},
+        env={**os.environ, "PYTHONPATH": str(extracted)},
         check=False,
         capture_output=True,
         text=True,
@@ -77,10 +125,10 @@ def test_wheel_and_sdist_contain_runtime_and_integration_assets(tmp_path: Path) 
 
     with tarfile.open(sdist, "r:gz") as archive:
         relative_names = {"/".join(Path(name).parts[1:]) for name in archive.getnames()}
+        _assert_no_removed_voice_or_demo_artifacts(relative_names)
         assert "plugins/agent-hotline/.codex-plugin/plugin.json" in relative_names
         assert "plugins/agent-hotline/.mcp.json" in relative_names
         assert "integrations/claude/settings.example.json" in relative_names
-        assert "samvaad/agent_prompt.md" in relative_names
 
 
 def test_plugin_and_marketplace_manifests_are_consistent() -> None:
@@ -94,6 +142,7 @@ def test_plugin_and_marketplace_manifests_are_consistent() -> None:
     assert plugin["name"] == plugin_root.name == marketplace["plugins"][0]["name"]
     assert plugin["mcpServers"] == "./.mcp.json"
     assert plugin["skills"] == "./skills/"
+    assert marketplace["name"] == "agent-hotline-local"
     assert marketplace["plugins"][0]["source"] == {
         "source": "local",
         "path": "./plugins/agent-hotline",

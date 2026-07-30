@@ -1,13 +1,15 @@
 {
   "name": "agent-hotline",
-  "version": "0.1.0",
-  "description": "Call a human owner for agent blockers and control Codex work by voice.",
+  "version": "0.2.0",
+  "description": "Call an owner through OpenAI Realtime and return bounded, verified decisions to Codex or Claude.",
   "author": {
     "name": "Agent Hotline contributors"
   },
   "license": "MIT",
   "keywords": [
     "voice",
+    "openai-realtime",
+    "human-in-the-loop",
     "mcp",
     "approvals",
     "incidents",
@@ -16,8 +18,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Agent Hotline",
-    "shortDescription": "Call your owner when agent work is blocked.",
-    "longDescription": "A bidirectional Sarvam voice control plane for grounded human decisions, incidents, authentication handoffs, and Codex thread control.",
+    "shortDescription": "Resolve agent blockers through safe owner calls.",
+    "longDescription": "An OpenAI Realtime voice control plane for natural owner conversations about blockers, incidents, authentication handoffs, and tightly scoped Codex task actions.",
     "developerName": "Agent Hotline",
     "category": "Productivity",
     "capabilities": [
@@ -25,9 +27,9 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Call me to resolve this blocker.",
-      "Show recent Hotline events.",
-      "Request a safe authentication handoff."
+      "Call my owner to resolve this blocker.",
+      "Start a safe authentication handoff with my owner.",
+      "Review recent Hotline decisions and events."
     ],
     "brandColor": "#EF5B3F"
   },

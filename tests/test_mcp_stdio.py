@@ -15,6 +15,7 @@ from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from agent_hotline.api import create_app
+from agent_hotline.contracts import RecordInstructionRequest
 from agent_hotline.providers import FakeCallProvider
 from agent_hotline.settings import Settings
 
@@ -33,7 +34,8 @@ async def test_stdio_server_initializes_lists_tools_and_returns_structured_failu
             # Port 9 is intentionally unavailable. The contact tool must return a
             # safe structured failure rather than corrupting the MCP session.
             "HOTLINE_DAEMON_URL": "http://127.0.0.1:9",
-            "HOTLINE_LOCAL_TOKEN": "test-local-token",
+            "HOTLINE_LOCAL_TOKEN": "test-local-token-1234567890-abcdef",
+            "HOTLINE_MCP_CLIENT": "codex",
         },
     )
 
@@ -48,20 +50,35 @@ async def test_stdio_server_initializes_lists_tools_and_returns_structured_failu
             listed = await session.list_tools()
             by_name = {tool.name: tool for tool in listed.tools}
             assert set(by_name) == {
-                "check_event_registration",
                 "contact_human",
+                "get_hotline_result",
                 "hotline_status",
                 "list_hotline_events",
                 "notify_human",
                 "query_repository_context",
                 "request_authentication",
-                "search_event_registrations",
             }
             assert by_name["contact_human"].inputSchema["required"] == [
                 "kind",
                 "summary",
                 "question",
             ]
+            assert "source" not in by_name["contact_human"].inputSchema["properties"]
+            assert "source" not in by_name["notify_human"].inputSchema["properties"]
+            authentication_schema = by_name["request_authentication"].inputSchema
+            assert authentication_schema["required"] == ["service", "reason"]
+            assert {
+                "service",
+                "reason",
+                "device_code_hint",
+                "timeout_seconds",
+            } == set(authentication_schema["properties"])
+            assert {
+                "url",
+                "auth_url",
+                "authentication_url",
+                "login_url",
+            }.isdisjoint(authentication_schema["properties"])
             assert by_name["contact_human"].annotations is not None
             assert by_name["contact_human"].annotations.readOnlyHint is False
             assert by_name["hotline_status"].annotations is not None
@@ -69,18 +86,6 @@ async def test_stdio_server_initializes_lists_tools_and_returns_structured_failu
             assert by_name["query_repository_context"].annotations is not None
             assert by_name["query_repository_context"].annotations.readOnlyHint is True
             assert "operation" in by_name["query_repository_context"].inputSchema["required"]
-            assert by_name["check_event_registration"].annotations is not None
-            assert by_name["check_event_registration"].annotations.readOnlyHint is True
-
-            registration_result = await session.call_tool(
-                "check_event_registration",
-                {"query": "SEP-26003"},
-            )
-            assert registration_result.isError is False
-            assert registration_result.structuredContent is not None
-            assert registration_result.structuredContent["verdict"] == "NO"
-            assert registration_result.structuredContent["approved"] is False
-            assert "does not match" in registration_result.structuredContent["reason"]
 
             result = await session.call_tool(
                 "contact_human",
@@ -115,16 +120,17 @@ def test_plugin_mcp_manifest_uses_portable_command_only() -> None:
             "agent_hotline": {
                 "command": "agent-hotline-mcp",
                 "args": [],
+                "env": {"HOTLINE_MCP_CLIENT": "codex"},
             }
         }
     }
 
 
 @pytest.mark.asyncio
-async def test_stdio_mcp_queries_real_loopback_daemon_repository_route(
+async def test_stdio_mcp_queries_real_loopback_daemon_routes(
     tmp_path: Path,
 ) -> None:
-    """Prove the portable MCP path used by Codex/Claude reaches the daemon."""
+    """Prove Codex/Claude can query context and recover a call result via MCP."""
 
     repo = tmp_path / "mcp-repo"
     repo.mkdir()
@@ -138,15 +144,16 @@ async def test_stdio_mcp_queries_real_loopback_daemon_repository_route(
     )
     assert await git_init.wait() == 0
     (repo / "README.md").write_text("mcp-repo-needle\n", encoding="utf-8")
-    local_token = "mcp-repository-local-token-123"
+    local_token = "mcp-repository-local-token-1234567890"
     settings = Settings(
         _env_file=None,
         hotline_env="test",
         hotline_database_path=tmp_path / "hotline.sqlite3",
         hotline_transport="fake",
         hotline_local_token=local_token,
-        hotline_tool_token="mcp-repository-tool-token-123",
-        hotline_callback_token="mcp-repository-callback-token",
+        hotline_action_signing_secret="mcp-action-signing-token-1234567890",
+        owner_phone_number="+919876543210",
+        owner_confirmation_pin="246810",
         hotline_workspace_roots=str(repo),
         codex_app_server_enabled=False,
     )
@@ -179,6 +186,7 @@ async def test_stdio_mcp_queries_real_loopback_daemon_repository_route(
         env={
             "HOTLINE_DAEMON_URL": f"http://127.0.0.1:{port}",
             "HOTLINE_LOCAL_TOKEN": local_token,
+            "HOTLINE_MCP_CLIENT": "codex",
         },
     )
     try:
@@ -195,10 +203,57 @@ async def test_stdio_mcp_queries_real_loopback_daemon_repository_route(
                         "query": "mcp-repo-needle",
                     },
                 )
+                started = await session.call_tool(
+                    "contact_human",
+                    {
+                        "kind": "incident",
+                        "summary": "A recoverable MCP polling test.",
+                        "question": "Should this task remain paused?",
+                        "dedupe_key": "mcp-result-polling-test",
+                        "timeout_seconds": 60,
+                    },
+                )
+                assert started.isError is False
+                assert started.structuredContent is not None
+                assert started.structuredContent["status"] == "calling"
+                event_id = started.structuredContent["event_id"]
+
+                pending = await session.call_tool(
+                    "get_hotline_result",
+                    {"event_id": event_id},
+                )
+                assert pending.isError is False
+                assert pending.structuredContent is not None
+                assert pending.structuredContent["status"] == "calling"
+                assert pending.structuredContent["outcome"] == "none"
+                assert pending.structuredContent["identity_verified"] is False
+
+                recorded = await app.state.coordinator.record_instruction(
+                    RecordInstructionRequest(
+                        event_id=event_id,
+                        outcome="instruct",
+                        instruction="Keep the task paused while I inspect it.",
+                        confirmation_pin="246810",
+                    )
+                )
+                resolved = await session.call_tool(
+                    "get_hotline_result",
+                    {"event_id": event_id},
+                )
             assert result.isError is False
             assert result.structuredContent is not None
             assert result.structuredContent["operation"] == "search"
             assert result.structuredContent["items"][0]["path"] == "README.md"
+            assert resolved.isError is False
+            assert resolved.structuredContent is not None
+            assert resolved.structuredContent["status"] == "resolved"
+            assert resolved.structuredContent["outcome"] == "instruct"
+            assert resolved.structuredContent["identity_verified"] is True
+            assert resolved.structuredContent["decision_id"] == recorded.decision_id
+            assert (
+                resolved.structuredContent["instruction"]
+                == "Keep the task paused while I inspect it."
+            )
             stderr.seek(0)
             assert local_token not in stderr.read()
     finally:
