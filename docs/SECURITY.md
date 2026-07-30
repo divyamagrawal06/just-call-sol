@@ -1,243 +1,159 @@
 # Security model
 
-Agent Hotline lets speech influence coding work, so its security boundary is stricter than
-an ordinary voice bot. Voice is an interface, not an authority boundary.
+Agent Hotline assumes that audio, caller ID, model output, provider events, repository text,
+and agent-produced context can all be wrong or adversarial. The daemon is the authority
+boundary.
 
-## Non-negotiable invariants
+## Core invariants
 
-- Caller ID and voice recognition alone do not prove identity.
-- No answer, voicemail, silence, busy, disconnect, timeout, malformed tool output, or
-  provider failure is never approval.
-- Free-form speech never becomes a shell command.
-- Only registered, typed runbooks can perform operational actions.
-- High-risk actions require exact readback, a scoped expiring confirmation, and a second
-  factor.
-- A grant is valid for one exact action and normally one use.
-- Target or state drift invalidates the grant.
-- Authentication calls never request passwords, OTPs, MFA codes, private keys, recovery
-  codes, or session cookies.
-- Real actions remain disabled unless an operator explicitly enables the runtime gate.
+1. No answer, voicemail, silence, background speech, failure, or ambiguity is approval.
+2. A live provider session is necessary but not sufficient for authority.
+3. Every live-call decision is bound to one event and a fresh verification window.
+4. Every action grant is exact, expiring, and one-time.
+5. Free-form speech never becomes a shell command.
+6. Secrets and PIN digits are never exposed to the voice model.
 
-## Trust boundaries
+## Secret separation
 
-| Boundary | Authentication | Allowed data |
-| --- | --- | --- |
-| MCP/CLI to local daemon | `HOTLINE_LOCAL_TOKEN` over loopback | Sanitized event/repository context and structured decisions |
-| Samvaad HTTP tools to daemon | `HOTLINE_TOOL_TOKEN` over HTTPS | Event-scoped briefs, bounded repository evidence, and action contracts |
-| Sarvam callback to daemon | Callback-token binding plus idempotency | Normalized attempt status/transcript |
-| Daemon to Sarvam | `SARVAM_API_KEY` | Minimal call configuration and event variables |
-| Daemon to Codex App Server | Direct child stdio pipes | Safe allowlisted task/turn methods |
-| Owner to decision | Daemon-side constant-time PIN match on a correlated live session | One event-bound decision |
-| Owner to high-risk action | Daemon-side constant-time PIN match plus exact phrase | One action-bound confirmation |
-| Missed-call bridge | Independent bearer over HTTPS | Generic notice plus a short-lived fragment URL |
-| Owner fallback browser | Signed fragment capability plus daemon PIN verification | One event-bound decision; no action grant |
+Production uses independent values for:
 
-Use independent random values for the four Hotline tokens. Never reuse the Sarvam API key
-as a local, tool, callback, or fallback-webhook token.
+- local daemon authentication: `HOTLINE_LOCAL_TOKEN`;
+- SIP correlation: `HOTLINE_SIP_CORRELATION_SECRET`;
+- decision and action capability signing: `HOTLINE_ACTION_SIGNING_SECRET`;
+- fallback link signing: `HOTLINE_FALLBACK_SIGNING_SECRET`;
+- fallback delivery authentication: `HOTLINE_FALLBACK_WEBHOOK_TOKEN`;
+- OpenAI webhook verification: `OPENAI_WEBHOOK_SECRET`;
+- Twilio request verification: `TWILIO_AUTH_TOKEN`;
+- owner verification: `OWNER_CONFIRMATION_PIN`.
 
-## Secrets and personal data
+Hotline service secrets must be at least 32 characters and pairwise distinct. Do not reuse an
+API key, webhook secret, auth token, or PIN for another role.
 
-The following are secrets or sensitive personal data:
+## Public ingress
 
-- every phone number;
-- Sarvam API key and all provider identifiers;
-- Hotline local/tool/callback tokens;
-- owner confirmation PIN;
-- transcripts, voice recordings, caller metadata, private URLs, workspace paths, diffs, and
-  logs that may reveal source or infrastructure.
+The production proxy allowlists only:
 
-Store values in the local environment or an operating-system secret store. `.env` and
-`.hotline/` are local-only. `.env.example` contains names and safe defaults, never values.
-Presence-only diagnostics are permitted.
+```text
+POST /v1/openai/realtime/webhook
+POST /v1/twilio/voice/incoming
+POST /v1/twilio/voice/outbound
+POST /v1/twilio/status
+```
 
-`identity_verified` is output-only. Samvaad cannot assert it. Decision requests carry an
-ephemeral, secret-typed `confirmation_pin`; the daemon compares it to
-`OWNER_CONFIRMATION_PIN`, persists only the resulting boolean, and excludes the PIN from
-model dumps, responses, and durable state. Caller allowlisting permits a bounded inbound
-session but never sets identity.
+and, when enabled, the fallback page, assets, and two fallback API routes. Local escalation,
+event, repository, dashboard, health, database, MCP, and Codex-control surfaces stay private.
 
-The missed-call link is a separate non-voice channel. Its bearer remains in the URL fragment
-and is removed from browser history before verification. The initial page is generic; task
-context is returned only after a capped, constant-time PIN check. The daemon then issues a
-shorter-lived submission capability and atomically consumes the durable fallback record
-with the decision. The notification webhook receives no task context, phone number,
-workspace, transcript, or PIN. Fallback decisions always keep `approved_action_ids` empty
-and cannot confirm or execute registered actions.
+OpenAI webhooks are verified against the exact raw body. Twilio form requests are verified
+against the original public URL and body. Provider handlers also apply bounded body sizes,
+rate limits, idempotency, and correlation checks. Put another request-size and rate-limit
+layer at the reverse proxy.
 
-The live `record_decision` tool varies only outcome, instruction, and the ephemeral PIN.
-Its constraints/action-ID arrays remain empty and its confirmation method is fixed to
-`spoken_plus_dtmf`. Every outcome requires a matching PIN and a direction-matched,
-provider-correlated live session; deny, defer, instruct, and auth-completed are
-authority-bearing because they wake the waiting agent.
-Registered actions never receive authority from that decision record: only
-`confirm_action` may issue their scoped one-time grant, and `execute_action` consumes and
-audits it.
+A raw quick tunnel exposes the entire app origin and is suitable only for temporary
+development.
 
-Redact before persistence and again before speech. Avoid reading opaque identifiers aloud.
-Retain full transcripts/recordings only when needed for the demo and with the caller’s
-knowledge; delete them according to the chosen retention policy.
+The daemon and carrier independently cap call lifetime. Outbound Twilio Call creation sets a
+maximum duration and ring timeout, and both inbound and outbound SIP `<Dial>` bridges set
+matching `timeLimit` and setup `timeout` values. Daemon maintenance also expires stale local
+sessions so a missing status callback cannot permanently consume the single active-call slot.
 
-The callback token currently appears as an opaque URL path segment. Treat the full callback
-URL as a secret, prevent it from entering screenshots/logs, and rotate it if exposed.
-The packaged `agent-hotline serve` command disables Uvicorn access logs so this path is not
-printed.
+## Inbound identity
 
-## Repository evidence boundary
+The incoming Twilio route requires all of the following:
 
-Repository context is an operation API, not a command API. Its only operations are Git
-`status`, Git `diff` summary, literal `search`, bounded `read`, and static `tests` inventory.
-It never runs tests and never accepts a shell command. Git is invoked with a fixed argv,
-`shell=False`, external diff/text conversion disabled, prompts disabled, and a short timeout.
+- valid Twilio signature;
+- expected account SID;
+- expected destination number;
+- inbound direction;
+- caller number matching the owner or explicit E.164 allowlist.
 
-Workspace roots are explicit Git-root allowlist entries; there is no process-cwd/home
-fallback. Every public request requires the daemon-verified ephemeral owner PIN. Public
-outbound requests are additionally forced to the workspace stored on their live event and
-fail closed if it is absent; their live session carries the persisted provider `attempt_id`.
-Inbound requests require an allowlisted inbound event and a session carrying the persisted
-provider `interaction_id` in `CONNECTED` or `DISCUSSING`. The daemon validates this
-direction/state/correlation boundary before comparing the PIN, and the public repository
-route is separately capped at six attempts per minute per client.
-Relative paths are resolved under the chosen root. Traversal, absolute paths, symlink,
-junction/reparse-point escapes, secret/credential files, binary or oversized files, and
-common generated/vendor directories are rejected. Reads are capped at 80 lines, searches at
-20 matches plus file/byte/entry scan budgets, Git output at 128 KiB, and the entire response
-at 6,000 serialized characters. Git resolves to an absolute non-workspace executable and
-receives a minimal environment. Known runtime secrets, secret-shaped environment
-assignments, credentialed URLs, phone numbers, metadata, and instruction-like
-prompt-injection strings are redacted or neutralized. The result explicitly remains
-untrusted evidence and confers no authority.
+The returned TwiML adds signed, short-lived correlation data to the OpenAI SIP leg. The signed
+OpenAI incoming-call webhook must match that correlation. Direct SIP, replayed correlation, or
+an allowlist mismatch is rejected.
 
-Git metadata must be a real `.git` directory directly below the allowlisted root. Gitfiles,
-linked worktrees, submodule-style roots, symlinked metadata, junctions, mount points, and
-reparse-point metadata are intentionally unsupported.
+The allowlist grants access to a conversation and bounded read-only task discovery. It does
+not grant a decision, repository read, or write.
 
-The public repository route appends a durable `repository_context_exposed` audit entry
-before attempting the bounded filesystem/Git query. Storage transactions reject every later decision, action
-preparation, action confirmation, and grant consumption for that event. This same-event
-separation is the enforceable prompt-injection boundary; phrase filtering and model
-instructions remain defense in depth. A fresh call without repository evidence is required
-for authority.
+## Exact confirmation
 
-## Approval protocol
+The server, not the model, creates the authoritative readback. The Realtime controller binds a
+completed spoken response transcript to the expected text, waits for OpenAI's SIP output buffer
+to report that playback fully drained, and then observes a later owner speech turn before it
+will arm keypad verification.
 
-For a benign instruction:
+The owner enters the PIN by DTMF followed by `#`. Digits live only in the active controller,
+are compared in constant time, and are never passed to the model or persisted. Failed attempts
+are counted across every decision, action, and repository window in the call. Reaching the
+limit permanently locks verification for that call; preparing a new scope cannot reset it.
+Interruption, correction, or expiry requires a fresh readback and PIN window.
 
-1. Retrieve current context.
-2. Restate the exact instruction and constraints.
-3. Receive a clear confirmation and the owner PIN by DTMF.
-4. Persist through `record_decision` with the ephemeral PIN.
-5. Continue only after `accepted: true`.
+## Decisions and actions
 
-For a medium/high-risk action:
+A live-call decision cannot be recorded until the exact readback and fresh PIN flow completes.
+A changed instruction or constraint requires a new preparation.
 
-1. Resolve an exact registered `runbook_id`.
-2. Strictly validate typed parameters; reject unknown fields and coercion.
-3. Bind the preview to event, workspace, task, commit/state, environment, resource, runbook
-   revision, normalized parameters, and expiry.
-4. Return `exact_readback`, action hash, and an expiring nonce.
-5. Verify the allowlisted owner and configured second factor.
-6. Match the exact confirmation phrase.
-7. Issue a one-time grant.
-8. Recompute the action hash immediately before execution.
-9. Atomically consume the grant.
-10. Verify and audit the outcome.
+Medium- and high-risk actions require an explicit owner response after the immutable scope
+readback plus the fresh server-side DTMF PIN. The model must return the server phrase unchanged
+as a scope-integrity check, but that model-supplied text is not a separate identity factor. The
+resulting grant binds the action type, resource, environment, parameters, workspace and task,
+server-derived state fingerprint when applicable, expiry, and use count. Execution consumes it
+once and records a durable succeeded, failed, or unknown outcome; unknown work is not retried
+automatically.
 
-Do not interpret “yes,” “do it,” or “take it down” as sufficient confirmation for an
-ambiguous or destructive target.
+Two independent default-off gates limit side effects:
 
-## Runbook policy
+- `HOTLINE_ALLOW_CODEX_WRITES` controls voice-initiated Codex task writes.
+- `HOTLINE_ALLOW_REAL_RUNBOOKS` controls registered real runbook executors.
 
-The committed demo registry contains only:
+The default registry contains only mock runbooks. No production cloud, database, deployment,
+or batch executor ships here. Enabling the real-runbook gate does not invent one.
 
-- `demo.increase_db_ru_limit`
-- `demo.pause_deployment`
-- `demo.terminate_batch_runs`
+Codex command and permission callbacks are limited to exact one-turn responses. File-change
+callbacks always decline because the current callback omits the patch needed for a lossless
+readback.
 
-Each is bounded to named demo resources and reports mock execution. Inputs such as
-`environment=production`, an arbitrary resource, an unknown field, or a command string are
-rejected.
+## Repository and agent context
 
-Adding a real runbook requires a separate security review, typed parameters, explicit
-allowlists, deterministic preview, verification, rollback guidance, least-privilege
-credentials, and an intentional `HOTLINE_ALLOW_REAL_ACTIONS=true` deployment decision.
-Changing that flag does not authorize an unregistered action.
+The Realtime model does not receive the agent's native context. It receives a bounded,
+sanitized snapshot and tool results selected by the daemon.
 
-## Prompt-injection defense
+Repository queries are restricted to explicit Git roots, trusted Git executable resolution,
+bounded operations, capped output, and credential-path denials. Repository text is evidence,
+not instruction. Static test inventory is not proof that tests ran.
 
-Code, issue text, logs, diffs, test output, transcripts, and tool responses are untrusted.
-The voice prompt instructs Samvaad to treat them as evidence only. Tool results should be
-structured and concise. Never place policy text, bearer tokens, or hidden instructions in
-agent variables.
+Voice repository access requires a separate warning, consent, and PIN. The event becomes
+evidence-only as soon as the authenticated query is accepted, even if the query later fails.
 
-The daemon enforces policy independently of the model. Even a fully compromised prompt
-cannot:
+## Authentication handoffs
 
-- add a new runbook;
-- change typed bounds;
-- forge an action hash;
-- bypass expiry/replay checks;
-- access App Server shell methods;
-- turn a failed call into approval.
+Never ask the owner to speak a password, OTP, MFA code, recovery code, private key, API key, or
+cloud credential. The phone call may explain why authentication is needed and direct the owner
+to a legitimate device or browser flow. The actual secret stays in that flow.
 
-## Network and API controls
+## Restart and failure behavior
 
-- Bind the daemon to `127.0.0.1` by default.
-- Expose only required tool and callback routes through the tunnel.
-- Require HTTPS for public tool/callback configuration.
-- Reject missing/incorrect bearer tokens with no event disclosure.
-- Enforce request size limits and strict Pydantic schemas.
-- Use constant-time comparisons for secrets/hashes.
-- Rate-limit by caller, event, destination, and active-session count.
-- Deduplicate before contacting Sarvam; Instant Outbound has no documented idempotency
-  header.
-- Use bounded exponential backoff only for transient network/`429`/`5xx` outcomes.
-- Never auto-redial repeatedly; honor quiet hours and explicit retry policy.
-- Do not follow user-supplied callback or authentication URLs from the daemon.
+Realtime exposes no cursor for replaying sideband events. If the daemon restarts or the
+sideband WebSocket loses continuity, Hotline terminates both provider legs and records failure.
+Each provider leg has its own durable termination job. A retry deadline is committed before
+provider I/O, so a timeout, crash, or ambiguous response remains pending for startup and
+background reconciliation rather than being mistaken for a completed hangup. Hotline never
+replays an ambiguous tool output or presents the call as recovered.
 
-## App Server controls
+MCP receives the durable event ID when the call starts and can poll it again after restart.
+Provider completion, carrier status, or a later fallback result can reconcile that event but
+cannot retroactively turn transport success into approval. Every live conversation also has a
+server-enforced overall duration cap, including inbound calls and long pauses.
 
-The adapter launches `codex app-server --stdio` without a shell. On Windows it rejects
-`.cmd` and `.ps1` shims and requires a real executable.
+Failures are sanitized before reaching audio or logs. Never log raw request bodies, provider
+authorization headers, phone numbers, service secrets, PINs, or unrestricted transcripts.
 
-Allowed client methods are limited to task and turn operations. Shell, command-execution,
-filesystem, process-spawn, and dynamic-tool methods are absent. Task references must resolve
-unambiguously, mutations bind to exact task/turn IDs, and root tasks can start only within
-configured workspace roots.
+## Deployment checklist
 
-Interrupting a task does not imply permission to terminate its external processes.
-
-## Failure and recovery policy
-
-| Condition | Safe outcome |
-| --- | --- |
-| No answer/busy/failed call | Pause or defer; no grant |
-| Decision timeout | Return `timed_out`; preserve event |
-| Tool timeout | Say context/recording failed; no claimed success |
-| Duplicate event | Reuse active event; do not redial |
-| Duplicate callback | Return existing receipt; no duplicate transition |
-| Daemon restart | Rebuild waiters from durable state; preserve expiry |
-| Provider outage | Watchdog event remains queued; do not invent contact |
-| LLM provider outage | Call from persisted watchdog snapshot |
-| Target changed | Reject old grant and reconfirm |
-| Token exposure | Rotate affected token, invalidate sessions, audit access |
-
-## Operational checklist
-
-Before a live call:
-
-- `uv run agent-hotline doctor --live` is green;
-- real actions are off;
-- the owner destination is correct without printing it;
-- active-call limit is one;
-- the demo event has a stable dedupe key;
-- the snapshot is sanitized;
-- the exact no-answer policy is set;
-- the backup path is ready.
-
-After a live call:
-
-- confirm attempt/session/decision correlation;
-- confirm no secret appeared in logs or transcript;
-- verify the returned constraints were applied;
-- verify the post-call webhook did not change authorization;
-- rotate any token shown during screen sharing.
+- Bind the daemon to loopback behind a route-allowlisting HTTPS proxy.
+- Keep `.env`, `.hotline/`, logs, databases, and provider payload captures out of source
+  control.
+- Use distinct production credentials and rotate them after exposure.
+- Start with one active call and both write gates off.
+- Verify inbound and outbound calls, interruption, silence, exact readback, DTMF isolation,
+  denial, timeout, and fail-closed restart termination before enabling writes.
+- Audit allowlisted phone numbers and Git roots.
+- Keep real infrastructure executors in a separately reviewed integration package.

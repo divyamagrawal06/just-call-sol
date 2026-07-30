@@ -1,218 +1,125 @@
-# Demo runbook
+# Demo and acceptance walkthrough
 
-The demo proves one outcome: a blocked coding agent calls its owner, answers a follow-up
-from live evidence, receives a scoped decision, and resumes without the owner opening the
-laptop.
+Keep mocked validation and live acceptance visibly separate. The offline demo proves local
+state and action contracts; only a real PSTN call can validate the production voice path.
 
-## Sarvam Epoch gate-check tool
-
-The same MCP server exposes a CSV-backed read-only demo tool:
-
-- `check_event_registration(query)` returns a `YES`, `NO`, or `HOLD` verdict, the
-  registration reason, check-in state, and gate note.
-- `search_event_registrations(query, limit)` finds candidates when a name or organization
-  is incomplete.
-
-The default data source is
-`outputs/sarvam_epoch_event_tracker/sarvam_epoch_registration_tracker.csv`. Override it
-with `SARVAM_EPOCH_CSV` if the file is moved.
-
-After installing the local package/plugin, restart the agent host so it refreshes the MCP
-tool list. A reliable stage prompt is:
-
-```text
-There is a dispute at the Sarvam Epoch entrance. Check whether SEP-26003 is approved.
-Give only the verdict, recorded reason, and gate instruction.
-```
-
-Expected verdict: `NO`. For an ambiguity demonstration, query `Rohan Mehta`; the tool
-returns `HOLD` and asks for a registration ID because two records share that name.
-
-For the live phone demo, ask:
-
-```text
-Can you check if participant SEP 26003 is registered, check sheet_name.csv?
-```
-
-`sheet_name.csv` is a demo alias for the bundled tracker. The answer must distinguish the
-facts: the participant is registered, but their approval status is rejected because the
-submitted ID name does not match. The agent then states the recorded gate instruction.
-
-## Fixed scenario
-
-A deterministic Codex task has completed a rate-limiter change. Its tests pass, but the
-mock deployment reports exhausted database request units. The agent needs a decision:
-temporarily raise the demo limit and continue, or leave the mock deployment paused.
-
-The only executable action shown is `demo.increase_db_ru_limit`. It affects no real
-database, deployment, cloud account, or cost.
-
-## Pre-demo go/no-go
-
-Run from the repository root:
-
-```powershell
-uv sync --python 3.12 --extra dev
-uv run pytest -q
-uv run ruff check .
-uv run agent-hotline doctor --live
-```
-
-Go only if:
-
-- tests and lint pass;
-- daemon, Sarvam, and public tools are healthy;
-- the quick-tunnel URL matches the Agent Studio tool URLs;
-- the committed version exactly matches `SARVAM_APP_VERSION`;
-- the destination was verified without displaying it;
-- active-call limit is one;
-- real actions are disabled;
-- the deterministic event is reset;
-- the phone is charged, audible, and not in a blocked-call mode;
-- the backup recording is locally available.
-
-If any external gate is red, show the offline harness and the prior genuine recording. Say
-which path is live and which is recorded.
-
-## Start services
-
-Terminal A:
-
-```powershell
-uv run agent-hotline serve
-```
-
-Terminal B:
-
-```powershell
-cloudflared tunnel --url http://127.0.0.1:8787
-```
-
-If the hostname changed, update `PUBLIC_BASE_URL` and all nine tools in the deployed Agent
-Studio version, then restart Terminal A.
-
-Terminal C:
-
-```powershell
-uv run agent-hotline doctor --live
-uv run agent-hotline events --limit 10
-```
-
-## Offline rehearsal
+## Offline smoke test
 
 ```powershell
 uv run agent-hotline demo --auto-decide
 ```
 
-Expected:
+Expected output includes:
 
-- one deterministic event;
-- no PSTN call;
-- a scoped synthetic decision;
-- the mock RU runbook verifies;
-- timeline metrics render;
-- rerunning does not create an uncontrolled duplicate.
+```json
+{
+  "mode": "deterministic_mock",
+  "real_resources_changed": false,
+  "verified": true
+}
+```
 
-This is a simulation and must be labeled as such.
+This mode:
 
-## Live run
+- forces the fake transport;
+- creates no Twilio or OpenAI call;
+- uses a generated mock-only PIN;
+- keeps Codex writes and real runbooks disabled;
+- executes only the deterministic mock database-RU runbook.
+
+Do not label it live or end-to-end.
+
+## Two-minute live demo
+
+Prepare a known Codex task in an allowlisted workspace and keep
+`HOTLINE_ALLOW_CODEX_WRITES=false`.
+
+### 0:00–0:20 — show readiness
 
 ```powershell
-uv run agent-hotline demo
+uv run agent-hotline doctor --live
 ```
 
-Expected sequence:
+Say: “This proves the local daemon and provider APIs are reachable. The next phone call is the
+actual voice-path test.”
 
-1. The task changes to `BLOCKED`.
-2. Hotline persists the snapshot and starts Instant Outbound.
-3. The owner’s phone rings.
-4. Samvaad opens with the incident summary and calls `get_context`.
-5. The owner asks: “Explain exactly what changed in the retry logic first.”
-6. Samvaad answers only from the stored diff/test evidence.
-7. The owner says: “Raise the demo limit, rerun the full tests, then continue. Do not run
-   migrations. Call again if the demo still reports server errors.”
-8. Samvaad reads back the instruction and constraints.
-9. The owner gives a clear confirmation and enters the configured owner PIN by DTMF for
-   the decision.
-10. For the mock registered action, Samvaad calls `prepare_action`, reads the exact phrase,
-    and calls `confirm_action` with the ephemeral DTMF PIN.
-11. Only the returned one-time grant is passed to `execute_action`; the mock runbook reports
-    verified completion.
-12. Samvaad calls `record_decision` separately with the resulting instruction, an ephemeral
-    DTMF PIN, and no action ID. This wakes the original request but does not grant the
-    registered action.
-13. The agent resumes within the confirmed instruction.
-14. The callback later reconciles status/transcript.
+### 0:20–1:05 — inbound conversation
 
-The visible timeline should end:
+Call the configured Twilio number from the owner phone.
 
-```text
-BLOCKED -> CALLING -> DISCUSSING -> CONFIRMED -> RESUMED -> COMPLETED
-```
+Ask:
 
-Show the measured time to decision and time to resume. Do not claim a general performance
-improvement from one sample.
+> What Codex tasks are active? Inspect the task about the Realtime migration and tell me its
+> current state.
 
-## Three-minute stage script
+Interrupt the agent once while it is answering, then ask a follow-up. The useful proof is that
+Realtime holds a natural conversation and uses bounded task tools rather than reciting a
+script.
 
-### 0:00–0:30 — problem
+If you ask it to modify the task while the Codex-write gate is off, it should explain that the
+write is unavailable. That is the expected production-safe default.
 
-“Autonomous coding agents can work for hours, then sit blocked because their owner stepped
-away. Agent Hotline turns the phone number into a narrow control plane: the agent calls,
-explains live evidence, gets a scoped decision, and continues.”
+### 1:05–1:45 — outbound decision
 
-### 0:30–0:45 — safety
-
-“Voice is not authority. No answer is no approval, and operational actions are typed,
-expiring, and read back before confirmation.”
-
-### 0:45–2:35 — live interaction
-
-Run the fixed scenario. Let the follow-up question demonstrate live context retrieval.
-Keep the call natural; do not narrate architecture over the conversation.
-
-### 2:35–2:55 — result
-
-Show the task resuming and the timeline metric.
-
-### 2:55–3:00 — secondary proof
-
-Show either Claude discovering the same MCP tools or one inbound Codex task inspection.
-Do not attempt both live.
-
-## Failure recovery
-
-| Failure | Stage response |
-| --- | --- |
-| Phone does not ring | Stop after the bounded attempt; show recorded ring/tool flow |
-| Tool lookup fails | Samvaad must say context is unavailable; show stored event locally |
-| Call drops before decision | Show safe non-approved state; use recording |
-| Callback is late | Continue from mid-call decision; explain reconciliation is asynchronous |
-| Provider/model error | Show watchdog-created event and safe paused state |
-| Tunnel changed | Do not edit live under time pressure; use recording/offline harness |
-| Ambiguous speech | Clarify; never force an approval |
-
-Do not repeatedly redial on stage.
-
-## Backup recording
-
-Create the backup only from a real validated call. Capture:
-
-- the phone ringing without revealing its number;
-- at least three conversational turns;
-- a context-tool lookup;
-- exact readback/confirmation;
-- the originating agent resuming;
-- the final timeline and metric.
-
-Crop/redact caller IDs, provider identifiers, private paths, tokens, and terminal
-environment output. State clearly that the video is a pre-recorded fallback.
-
-## Post-demo evidence
+From another terminal:
 
 ```powershell
-uv run agent-hotline events --limit 10 --json
+uv run agent-hotline call `
+  --kind compute_interrupted `
+  --severity high `
+  --summary "A preemptible compute instance ended the training run." `
+  --question "Retry once with the same configuration, or leave it paused?"
 ```
 
-Record only opaque event/attempt references and aggregate timings in submission material.
-Do not publish the raw transcript, phone numbers, credentials, or callback URL.
+On the call, discuss one constraint, then choose an instruction. The agent should read the
+server-generated decision back exactly, wait for your later reply, ask for keypad PIN entry,
+and return a structured result to the waiting command.
+
+### 1:45–2:00 — show the receipt
+
+```powershell
+uv run agent-hotline events --limit 5
+uv run agent-hotline result evt_... --watch
+```
+
+Show the event summary and exact structured result. Explain that silence, voicemail, failure,
+or an unfinished verification would have returned no approval.
+
+## Optional write demo
+
+Only after the read-only live path passes, set:
+
+```dotenv
+HOTLINE_ALLOW_CODEX_WRITES=true
+```
+
+Restart the daemon, call inbound, and request one exact Codex task instruction or interruption.
+The voice agent must:
+
+1. resolve one exact task and turn where applicable;
+2. prepare the action;
+3. speak the exact server readback;
+4. hear a later explicit owner response;
+5. arm and complete a fresh keypad PIN;
+6. confirm the one-time grant;
+7. execute once and report the actual tool result;
+8. record the final instruction and action result for the waiting agent.
+
+Do not demo a file-change callback; it always declines by design. Do not claim to control AWS,
+databases, deployments, or batch systems: the repository ships no real infrastructure
+runbooks.
+
+## Abort conditions
+
+Stop the demo and keep work paused if:
+
+- provider signatures fail;
+- the webhook and SIP call do not correlate;
+- the wrong task is resolved;
+- the readback is incomplete or changes after confirmation;
+- PIN digits appear in model-visible text or logs;
+- the write gate is unexpectedly enabled;
+- the tool reports an error or times out.
+
+Never fill in a missing result with narration. A visible fail-closed outcome is more accurate
+than claiming success.

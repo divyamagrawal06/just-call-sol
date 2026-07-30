@@ -1,75 +1,74 @@
-# Missed-call secure fallback
+# Missed-call fallback
 
-Agent Hotline can send a one-time decision link when a blocking outbound call ends without
-an authoritative decision. Delivery is provider-neutral: the daemon calls an
-owner-controlled HTTPS webhook, and that bridge may send an SMS, push notification, or
-another private notification.
+The optional fallback gives the owner a short-lived way to respond when a blocking call whose
+`no_answer_policy` is `defer` ends without a decision. The default `pause` policy does not send
+a fallback. This is a recovery channel, not a shortcut around voice verification.
 
-## Configuration
+## Configure
 
-```text
-PUBLIC_BASE_URL=https://<stable-public-origin>
-HOTLINE_FALLBACK_WEBHOOK_URL=https://<owner-controlled-bridge>/agent-hotline
-HOTLINE_FALLBACK_WEBHOOK_TOKEN=<independent-random-bearer>
+```dotenv
+HOTLINE_FALLBACK_WEBHOOK_URL=https://owner-controlled.example/notify
+HOTLINE_FALLBACK_WEBHOOK_TOKEN=<independent 32+ character delivery token>
+HOTLINE_FALLBACK_SIGNING_SECRET=<independent 32+ character signing secret>
 HOTLINE_FALLBACK_TTL_SECONDS=900
 HOTLINE_FALLBACK_MAX_PIN_ATTEMPTS=5
+OWNER_CONFIRMATION_PIN=<6-12 digits>
+PUBLIC_BASE_URL=https://hotline.example.com
 ```
 
-The webhook URL must use HTTPS. Loopback HTTP is accepted for local development. The
-webhook token must be independent of the local, voice-tool, callback, provider, and owner
-credentials.
+The delivery endpoint must be owner-controlled. The daemon sends a generic notification and a
+one-time URL. It does not send task context, a PIN, credentials, or authorization.
 
-## Delivery contract
+## Public routes
 
-The daemon sends:
+When fallback is enabled, the production proxy additionally allows:
 
-```http
-POST <HOTLINE_FALLBACK_WEBHOOK_URL>
-Authorization: Bearer <HOTLINE_FALLBACK_WEBHOOK_TOKEN>
-Idempotency-Key: <fallback_id>
-Content-Type: application/json
+```text
+GET  /fallback
+GET  /fallback/assets/fallback.css
+GET  /fallback/assets/fallback.js
+POST /v1/fallback/open
+POST /v1/fallback/decision
 ```
 
-```json
-{
-  "type": "agent_hotline.missed_call",
-  "version": 1,
-  "event_id": "evt_opaque",
-  "title": "Agent Hotline needs your decision",
-  "message": "A call from Agent Hotline was missed. Open the secure one-time link to review and respond.",
-  "url": "https://<PUBLIC_BASE_URL>/fallback#<one-time-capability>",
-  "expires_at": "2026-07-26T12:00:00Z"
-}
-```
+Keep local daemon APIs blocked.
 
-The notification deliberately contains no task summary, question, workspace, thread name,
-phone number, transcript, or credential. Treat the URL as a short-lived bearer and keep
-notification previews private.
+## Flow
 
-## Browser flow
+1. A blocking call configured with `no_answer_policy=defer` reaches a terminal no-decision
+   state.
+2. The daemon persists a fallback record and sends a generic notification.
+3. The bearer token stays in the URL fragment, so it is not sent in the initial HTTP request.
+4. The page submits the token and owner PIN to `/v1/fallback/open`.
+5. After verification, the server returns bounded context and a separate one-time submission
+   token.
+6. The owner records approve, deny, defer, or an instruction through
+   `/v1/fallback/decision`.
+7. The token is consumed and the durable event is reconciled.
 
-1. The token stays in the URL fragment, so it is not sent in the page request or ordinary
-   proxy access logs.
-2. The page immediately removes the fragment from browser history.
-3. The owner enters the configured PIN before the daemon reveals any event context.
-4. The daemon caps failed PIN attempts and issues a shorter-lived submission capability.
-5. The page displays the exact pending request and requires an explicit confirmation.
-6. The daemon atomically records one decision and consumes the durable fallback record.
-7. Replays, expired links, state drift, prior decisions, and repository-evidence events fail
-   closed.
+The page uses no third-party script, font, analytics, or asset origin. Responses are no-store
+and include restrictive browser security headers.
 
-The fallback may approve, deny, defer, record an instruction, or acknowledge completion of
-a legitimate authentication handoff. It cannot confirm or execute a registered action and
-never returns an action grant.
+## Authority limits
 
-## Failure behavior
+A fallback response can resolve the pending decision shown on that page. It cannot:
 
-- If delivery fails, the original no-answer/busy/failure result remains non-authoritative.
-- If the link expires or reaches its PIN-attempt limit, the event fails and the waiting
-  agent receives no approval.
-- If the daemon restarts, link state and one-time consumption remain in SQLite.
-- A duplicate provider callback does not send a second notification.
-- Rotating the Hotline signing secret invalidates outstanding links.
+- confirm or execute a registered action;
+- authorize a Codex task write;
+- broaden the pending scope;
+- run a shell command;
+- reveal repository evidence;
+- approve a different event.
 
-The current delivery adapter is a generic webhook. Integrate SMS or push at the bridge,
-rather than placing vendor credentials or recipient phone numbers in Agent Hotline.
+If an action is still required, start a fresh verified voice call and perform the normal exact
+readback and PIN flow.
+
+## Restart behavior
+
+Fallback records, expiry, attempt count, and decisions survive daemon restart. MCP callers
+retain the event ID returned when the call starts and can poll it again. A blocking CLI/HTTP
+waiter's process-local socket does not survive restart and must not be represented as an
+uninterrupted waiter.
+
+Expired, consumed, locked, or mismatched links fail closed. Generic error messages avoid
+revealing whether an event or token exists.

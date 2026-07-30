@@ -1,149 +1,168 @@
 # Architecture
 
-Agent Hotline is an independent, local control plane between coding-agent sessions, Sarvam
-Samvaad, and one human owner. Its central property is that the call and policy path does not
-depend on the blocked model being able to take another turn.
-
-## System view
+Agent Hotline separates conversational voice from durable authority. OpenAI Realtime conducts
+the call; the local daemon decides what context and operations that call may access.
 
 ```mermaid
 flowchart LR
-    subgraph Local["Windows host"]
-        Codex["Codex task"]
-        Claude["Claude session"]
-        MCP["Shared stdio MCP"]
-        Daemon["FastAPI control plane"]
-        Store[("SQLite audit/state")]
-        AppServer["Codex 0.144.6 App Server\nstdio child"]
-        Runbooks["Typed runbook registry"]
-    end
-
-    Tunnel["Cloudflare quick tunnel"]
-    Sarvam["Sarvam Instant Outbound\nand inbound deployment"]
-    Voice["Managed Samvaad voice agent"]
-    Owner["Owner phone"]
-
-    Codex --> MCP
-    Claude --> MCP
-    MCP -->|"local bearer"| Daemon
-    Daemon <--> Store
-    Daemon <--> AppServer
-    Daemon --> Runbooks
-    Daemon -->|"X-API-Key"| Sarvam
-    Sarvam <--> Voice
-    Voice <--> Owner
-    Voice -->|"HTTP tool token"| Tunnel
-    Sarvam -->|"completion callback"| Tunnel
-    Tunnel --> Daemon
+    A["Codex or Claude"] -->|stdio MCP| M["Agent Hotline MCP"]
+    M -->|local bearer token| D["FastAPI coordinator"]
+    D --> S["SQLite audit and state"]
+    D --> C["Codex App Server adapter"]
+    D -->|outbound REST call| T["Twilio PSTN carrier"]
+    T -->|SIP| O["OpenAI Realtime"]
+    P["Owner phone"] <--> T
+    O <-->|server-side WebSocket and bounded tools| D
+    T -->|signed inbound TwiML request| D
+    O -->|signed incoming-call webhook| D
 ```
 
-Only Samvaad tool and callback routes need public reachability. The MCP server, task control,
-database, and administrative APIs bind to loopback.
+## Components
 
-## Component responsibilities
+### MCP and CLI
 
-| Component | Owns | Does not own |
-| --- | --- | --- |
-| MCP server | Portable tools and typed results | Telephony, policy state, secrets |
-| Daemon | Orchestration, auth, policy, dedupe, waiters, audit | Speech and arbitrary shell |
-| SQLite store | Durable event/session/decision/action state | Authentication decisions |
-| Sarvam client | Native request shapes, bounded retries, analytics | Duplicate-call policy |
-| Samvaad | PSTN, STT, TTS, multi-turn conversation, barge-in | Final action authority |
-| Codex App Server adapter | Task inspection, steering, interruption, root creation | Shell/runbook execution |
-| Repository context service | Allowlisted status/diff/search/read/test evidence | Commands, test execution, arbitrary filesystem access |
-| Runbook registry | Typed previews and deterministic execution | Free-form commands |
-| Watchdog/hooks | Independent failure detection | Granting approval |
+Codex and Claude use the same local MCP server. It can create an escalation, send a
+notification, request an authentication handoff, list events, report status, or run a bounded
+repository query. The CLI exercises the same local daemon contract.
 
-## Durable state
+The originating MCP request supplies a compact snapshot. It is not a tunnel into the native
+agent runtime.
 
-The minimum records are:
+### Coordinator and store
 
-- `events`: blocker/incident, evidence references, dedupe key, current state;
-- `sessions`: direction, provider, `attempt_id`, `interaction_id`, call state;
-- `decisions`: structured outcome, instruction, constraints, verification state;
-- `prepared_actions`: typed parameters, exact scope, action hash, expiry;
-- `grants`: confirmation method, one-time state, consumption timestamp;
-- `webhook_receipts`: provider idempotency key and normalized status;
-- `fallback_links`: delivered/verified/consumed one-time missed-call capabilities;
-- `timeline`: immutable transitions used for metrics.
+FastAPI owns request authentication, caller admission, deduplication, state transitions,
+readback preparation, PIN verification, action grants, and local API boundaries. SQLite stores
+events, sessions, decisions, action receipts, provider correlation, and fallback state.
 
-The primary state progression is:
+### Twilio
+
+Twilio is the PSTN and SIP carrier:
+
+- outbound: the daemon creates a Twilio parent call with an event-bound TwiML URL; Twilio
+  returns the allocated parent CallSid to that verified route before it receives the SIP bridge;
+- inbound: Twilio calls the signed incoming-voice route, which returns the bridge TwiML;
+- status: the same signed route reconciles outbound parent-call events and the inbound
+  `<Dial action>` result. It is lifecycle evidence, never authority;
+- limits: the parent Call and both `<Dial>` bridges have carrier-enforced duration and setup
+  ceilings in addition to daemon-side session expiry.
+
+Carrier status is lifecycle evidence, never approval.
+
+### OpenAI Realtime
+
+After a signed incoming-call webhook is accepted, the daemon opens a server-side WebSocket to
+that Realtime call. The session receives:
+
+- a bounded system prompt;
+- a compact, sanitized escalation snapshot or inbound task view;
+- narrow application-owned function definitions;
+- no local bearer token, service signing secret, PIN, shell, raw database, or native MCP
+  connection.
+
+The voice agent uses low-eagerness semantic turn detection so the owner can pause without a
+fixed silence cutoff, while automatic interruption still provides barge-in. It can hold a
+natural conversation, list or inspect bounded Codex tasks, prepare decisions and actions, and
+report structured tool results.
+
+## Public and private surfaces
+
+The four provider webhook routes are:
 
 ```text
-DETECTED -> QUEUED -> CALLING -> CONNECTED -> DISCUSSING
-         -> DECIDED -> RESUMED -> COMPLETED
+POST /v1/openai/realtime/webhook
+POST /v1/twilio/voice/incoming
+POST /v1/twilio/voice/outbound
+POST /v1/twilio/status
 ```
 
-Safe terminal alternatives are `NO_ANSWER`, `BUSY`, `FAILED`, `TIMED_OUT`, `DEFERRED`, and
-`CANCELLED`. None implies approval.
+Optional fallback uses `/fallback`, its two static assets, `/v1/fallback/open`, and
+`/v1/fallback/decision`. Everything else remains local or behind separate authentication. A
+production reverse proxy must enforce that split; a raw development tunnel does not.
 
-When configured, a blocking call that ends without a decision may enter
-`FALLBACK_PENDING` instead of terminating immediately. The daemon sends a generic
-notification through an authenticated owner-controlled webhook. The browser verifies the
-owner PIN before loading context, then atomically consumes the fallback when it records one
-structured decision. Registered actions remain unavailable on this channel.
+## Outbound sequence
 
-## Outbound decision path
+```mermaid
+sequenceDiagram
+    participant Agent as "Codex or Claude"
+    participant Daemon as "Hotline daemon"
+    participant Twilio
+    participant Realtime as "OpenAI Realtime"
+    participant Owner
 
-1. An MCP tool, App Server event, hook, watchdog, or CLI submits a sanitized context packet.
-2. The daemon atomically deduplicates the event before any provider request.
-3. The daemon persists the snapshot and creates a contact session.
-4. The native client starts Instant Outbound and stores the returned `attempt_id`.
-5. Samvaad retrieves the event by `event_id`; the daemon returns a compact spoken brief.
-6. Samvaad discusses options and records the confirmed structured decision during the call.
-7. The daemon commits the decision and wakes the exact waiting request.
-8. The originating agent continues with the returned constraints.
-9. The post-call webhook reconciles status/transcript idempotently; it does not authorize.
+    Agent->>Daemon: contact_human(snapshot)
+    Daemon->>Daemon: persist event and dedupe
+    Daemon->>Twilio: create parent PSTN call
+    Daemon-->>Agent: durable event ID and calling status
+    Twilio->>Realtime: bridge to project SIP
+    Realtime->>Daemon: signed incoming-call webhook
+    Daemon->>Realtime: accept and open sideband WebSocket
+    Realtime<<->>Owner: conversational audio
+    Realtime->>Daemon: prepare_decision
+    Daemon-->>Realtime: exact server readback
+    Realtime<<->>Owner: readback, later reply, keypad PIN
+    Daemon->>Daemon: verify and persist decision
+    Agent->>Daemon: get_hotline_result(event ID)
+    Daemon-->>Agent: structured terminal result
+```
 
-## Inbound task-control path
+## Inbound sequence
 
-1. The deployed Sarvam number receives a call.
-2. Hotline correlates the required provider interaction and allowlists the caller before
-   exposing task state; neither caller ID nor allowlisting proves identity.
-3. A task reference is resolved through `thread/list`; ambiguity produces choices, never an
-   automatic selection.
-4. `thread/read` grounds the spoken summary.
-5. Safe task mutations use `turn/steer` or `turn/interrupt`, bound to exact IDs.
-6. Root creation is constrained to configured workspace roots.
-7. Infrastructure actions go through registered runbooks, not the App Server or shell.
-8. Source questions use the event-bound repository context service after daemon-side PIN
-   verification; repository text remains untrusted and read-only, and that event cannot
-   later carry an authority-bearing decision or action.
+Twilio first verifies the caller-facing phone leg. The incoming route checks Twilio's
+signature, account, called number, direction, and E.164 allowlist, then embeds signed
+correlation headers in the SIP bridge. The OpenAI webhook is where the durable inbound event
+is correlated and accepted. Direct or uncorrelated SIP is rejected.
 
-“Pause task” means interrupt the active turn and persist a pause intent. It is not permission
-to terminate compute. “Terminate all batch runs” is a separate high-risk runbook requiring
-readback and confirmation.
+An allowlisted caller may converse and use bounded read-only task inspection. Caller ID alone
+does not authorize a decision or write.
 
-## Failure independence
+## Decision and action protocol
 
-The persisted snapshot is sufficient for a call when OpenAI or Anthropic is unavailable.
-App Server notifications, Claude hooks, or external infrastructure monitors can submit an
-event without model tool choice. If Sarvam fails, the daemon safely pauses or defers the
-agent and preserves the event for retry. If the daemon restarts, durable events and grants
-are recovered; in-memory waiters are recreated from stored state.
+A decision follows:
 
-## Swappable seams
+```text
+prepare -> exact transcript + drained audio readback -> later owner speech ->
+arm -> fresh DTMF PIN -> record
+```
 
-The internal contracts are provider-neutral, but the MVP deliberately has one native
-transport. A future provider implements call creation and status normalization behind the
-service boundary; it does not change MCP schemas or action policy. Coding-agent adapters
-normalize task state into the same context packet. Message channels can consume the same
-event/decision records.
+A medium- or high-risk action follows:
 
-This seam is not a reason to build a provider framework before the native Sarvam vertical
-slice works.
+```text
+prepare -> exact transcript + drained audio readback -> later owner response -> arm ->
+fresh DTMF PIN -> confirm one-time grant -> execute once ->
+record final decision and action result
+```
 
-## Observability
+Codex task writes are additionally blocked unless `HOTLINE_ALLOW_CODEX_WRITES=true`. Real
+runbook executors are independently blocked unless `HOTLINE_ALLOW_REAL_RUNBOOKS=true`. The
+built-in runbooks are mocks, so the second gate does not make them touch real infrastructure.
 
-The timeline records:
+Codex command and turn-permission callbacks can return only exact, one-turn approvals. Codex
+file-change callbacks always decline because the callback does not include a complete patch
+that can be represented and read back losslessly.
 
-- `event_detected_at`
-- `call_started_at`
-- `call_answered_at`
-- `decision_recorded_at`
-- `agent_resumed_at`
-- `action_completed_at`
+## Repository evidence
 
-Derived metrics are time to contact, decision, resume, and completion. Logs contain opaque
-references and state changes, never credentials, phone numbers, confirmation phrases, or
-full transcripts by default.
+Repository access is limited to allowlisted Git roots and five operations: status, diff
+summary, literal search, bounded read, and static test inventory. Results are capped, redacted,
+and treated as untrusted text.
+
+A voice repository query requires its own warning, explicit consent, and fresh PIN. Once
+repository evidence is returned, that call becomes evidence-only and cannot authorize a
+decision or action.
+
+## Restart behavior
+
+Events, sessions, correlation, tool receipts, decisions, grants, and fallback state are
+durable. The MCP caller retains the event ID and can poll it again after reconnecting. Realtime
+sideband events have no replay cursor, so an active call cannot be resumed safely across a
+daemon restart or WebSocket continuity gap. Termination of each OpenAI and carrier leg is a
+separate durable job: intent and the next retry are committed before provider I/O, ambiguous
+outcomes remain pending, and startup plus background maintenance retry until the provider
+confirms the leg is gone. Startup records failure instead of pretending the event stream was
+recovered.
+
+Readback delivery, owner-reply observation, collected DTMF digits, and PIN-verification windows
+are deliberately transient and are never recovered.
+
+The blocking CLI/HTTP waiter's process-local socket does not survive a daemon restart. Its
+event remains durable, while MCP callers use the event ID returned at call start.

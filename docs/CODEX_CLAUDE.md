@@ -1,204 +1,120 @@
 # Codex and Claude integration
 
-Agent Hotline presents one stdio MCP contract to both clients. Codex also has a deeper,
-independent App Server adapter for task enumeration and control.
-
-## Shared MCP tools
-
-| Tool | Purpose | Blocking |
-| --- | --- | --- |
-| `contact_human` | Discuss a meaningful blocker and return a structured decision | Yes |
-| `notify_human` | Send an informational call without waiting | No |
-| `request_authentication` | Request a legitimate device/browser sign-in handoff | Yes |
-| `list_hotline_events` | Read recent event states | No |
-| `hotline_status` | Read daemon/provider readiness | No |
-| `query_repository_context` | Read bounded evidence from an allowlisted repository | No |
-
-The MCP subprocess contains no provider credential. It calls the loopback daemon with
-`HOTLINE_LOCAL_TOKEN`.
-
-`query_repository_context` supports only `status`, `diff`, `search`, `read`, and `tests`.
-Search is literal, reads are repository-relative and capped at 80 lines, and `tests` is a
-static inventory rather than a test runner. The daemon rejects roots outside
-`HOTLINE_WORKSPACE_ROOTS`, path/symlink escapes, binary or oversized files, credential files,
-and generated/vendor trees. Returned source remains untrusted evidence.
+Codex and Claude share the same local MCP contract. The voice runtime is a separate OpenAI
+Realtime session with bounded application tools; it is not a remote copy of either agent.
 
 ## Install both clients
 
-First install the project:
-
 ```powershell
-uv sync --python 3.12 --extra dev
 uv run agent-hotline install-clients --client all
 ```
 
-Verify:
+This registers the packaged Codex plugin and a user-scoped Claude MCP server. Start a new
+Codex task or Claude session after installation.
+
+Install one client instead:
 
 ```powershell
-codex mcp get agent_hotline
-claude mcp get agent-hotline
+uv run agent-hotline install-clients --client codex
+uv run agent-hotline install-clients --client claude
 ```
 
-Restart Codex/Claude sessions after installation.
+The packaged MCP configurations set `HOTLINE_MCP_CLIENT` for audit attribution. Callers do not
+need to invent or pass a `source` field, and attribution is never authentication.
 
-`install-clients` is idempotent for matching registrations. It inspects the editable uv tool,
-Codex marketplace/plugin, and Claude user-scoped MCP entry before changing anything. A
-same-name entry that points elsewhere is reported as a conflict and is never silently replaced.
-On Windows, running the command from the Agent Hotline uv tool skips self-reinstallation so uv
-does not try to remove the environment containing the active process.
-
-Manual fallback:
+The daemon must be running:
 
 ```powershell
-uv tool install --editable .
-codex mcp add agent_hotline -- agent-hotline-mcp
-claude mcp add --scope user agent-hotline -- agent-hotline-mcp
+uv run agent-hotline serve
 ```
 
-The repository’s Codex plugin also provides the operational skill and safety policy under
-`plugins/agent-hotline/`.
+## MCP tools
 
-## Codex behavior
+| Tool | Purpose | Authority |
+| --- | --- | --- |
+| `contact_human` | Start a call about a material blocker, incident, or decision | Returns a durable event ID |
+| `notify_human` | Send a one-way informational call | Cannot approve anything |
+| `request_authentication` | Coordinate a legitimate device/browser handoff | Never collects credentials |
+| `list_hotline_events` | Read the durable event history | Read-only |
+| `get_hotline_result` | Poll one structured result by event ID | Read-only |
+| `hotline_status` | Check daemon and transport readiness | Read-only |
+| `query_repository_context` | Get bounded status, diff, search, read, or test inventory | Read-only, untrusted evidence |
 
-Call `contact_human` only when work genuinely needs a human decision, authentication
-handoff, or urgent incident response. Before calling, supply:
+Use `contact_human` only when work genuinely cannot proceed safely. Send a compact snapshot:
+task identity, workspace, branch or state, exact blocker, relevant test result, realistic
+options, risks, and the safest default. Redact credentials and irrelevant logs. Retain the
+returned event ID, keep the blocked operation paused, and poll `get_hotline_result`.
 
-- exact task and workspace reference;
-- branch/commit/dirty state when relevant;
-- compact diff and test summaries;
-- exact last error;
-- pending decision and realistic options;
-- durable constraints;
-- a stable dedupe key.
+Continue only from a structured `resolved` result. Treat `no_answer`, `busy`, `failed`,
+`timed_out`, `fallback_pending`, `deferred`, an expired result, or vague instructions as no
+approval.
 
-Continue only when the result is `resolved`. Apply `instruction` and every `constraint`
-literally. Approved action references authorize only their exact scope and expiry.
+`timeout_seconds` is a hard decision deadline, not merely an HTTP wait timeout. When it
+elapses, the event becomes expired, the carrier call is terminated, and a later voice response
+cannot authorize work. `no_answer_policy=pause` is the default; use `defer` only when the
+configured secure fallback should be sent. `notify_only` is valid only for non-blocking
+notifications.
 
-Codex `0.144.6` deep control runs as a supervised direct child:
+## What the voice agent knows
 
-```text
-codex app-server --stdio
-```
+For an outbound escalation, the daemon gives Realtime a bounded sanitized snapshot derived
+from the MCP request. For an inbound call, Realtime can list or inspect sanitized Codex task
+candidates through application-owned tools.
 
-The client performs `initialize`/`initialized` and permits only:
+Realtime does not automatically receive:
 
-```text
-thread/list
-thread/read
-thread/start
-thread/resume
-thread/archive
-turn/start
-turn/steer
-turn/interrupt
-```
+- the full Codex or Claude conversation;
+- native client tools or MCP connections;
+- an unrestricted repository;
+- the shell, environment, credentials, or local bearer token;
+- arbitrary historical tasks.
 
-It intentionally exposes no shell or arbitrary command method.
+If more evidence is needed, the owner must explicitly authorize a bounded repository query.
+That makes the call evidence-only.
 
-Inbound phrases map conservatively:
+## Codex capabilities
 
-| Caller intent | App Server behavior |
-| --- | --- |
-| “Check task X” | `thread/list`, disambiguate, `thread/read` |
-| “Tell X to use the safer migration” | `turn/steer` if active, otherwise `turn/start` |
-| “Pause X” | Resolve exact active turn, then `turn/interrupt` |
-| “Start a root task in repo Y” | Validate workspace root, `thread/start`, then `turn/start` |
-| “Archive X” | Resolve exact task and `thread/archive` |
-| “Terminate batch runs” | No App Server command; use a registered runbook |
+With the Codex App Server adapter enabled and roots allowlisted, an inbound voice call can:
 
-The minimum watcher consumes `turn/started` and `turn/completed`. A registered handler can
-answer the installed version’s `item/commandExecution/requestApproval`. Unrecognized
-server-initiated requests fail closed.
+- list bounded task candidates;
+- inspect one exact task;
+- prepare and, after full verification, send an instruction;
+- interrupt one exact active turn;
+- spawn one root task in an allowlisted workspace;
+- archive one exact task.
 
-## Claude behavior
+The write operations require `HOTLINE_ALLOW_CODEX_WRITES=true`, exact server readback, a later
+owner response, a fresh keypad PIN, and a one-time action grant.
 
-Claude Code `2.1.211` uses the same MCP server and result schemas. Invoke with
-`source="claude_mcp"` so audit records preserve origin.
+App Server callbacks for exact command execution and turn-scoped permissions can ask the owner
+for a one-turn decision. File-change approval callbacks always decline because the current
+callback does not provide the complete patch needed for an exact readback.
 
-Mandatory compatibility:
+## Claude capabilities
 
-- outbound blocker/incident call;
-- multi-turn grounded discussion;
-- structured decision returned to the calling Claude turn;
-- authentication handoff;
-- event/status lookup.
+Claude can call the owner and consume the same structured MCP results. Optional Claude
+lifecycle hooks can raise non-authoritative alerts for blocked or denied work.
 
-Claude hooks can independently report:
+There is no equivalent deep inbound Claude session-control adapter in this repository. Do not
+claim that a phone call can inspect, steer, interrupt, or spawn Claude sessions.
 
-- `PermissionRequest` for interactive permission decisions;
-- `PermissionDenied` for auto-mode policy denials;
-- `PostToolUseFailure` for failed tools;
-- `Stop` when a continuation instruction is useful;
-- `StopFailure` for authentication, rate-limit, and provider failures.
+## Actions and runbooks
 
-The optional hook executable is installed with the Python package:
+The Realtime voice agent can list registered actions and exercise the full
+prepare/readback/PIN/confirm/execute flow. The built-in runbooks are deterministic mocks only.
+No real infrastructure runbooks ship with the project.
+
+Real runbook execution has a separate `HOTLINE_ALLOW_REAL_RUNBOOKS` gate. Keep it off unless a
+separately reviewed integration has registered a real executor and verifier.
+
+## Safe local validation
 
 ```powershell
-uv tool install --editable --force .
-Get-Command agent-hotline-claude-hook
+uv run agent-hotline demo --auto-decide
 ```
 
-Merge `integrations/claude/settings.example.json` into the desired Claude settings file.
-Every example handler is an async command hook. The adapter accepts bounded JSON on stdin,
-submits a sanitized `source="claude_hook"` event, emits no hook-control output, and fails
-open if the daemon is unavailable. It never opens the transcript path, embeds a token in
-settings, returns `allow`, `deny`, `retry`, or `block`, or treats a phone response as a
-Claude permission decision.
+This runs a fake-call mock and does not validate Codex, Claude, Twilio, OpenAI, PSTN audio, or
+DTMF end to end. Use [VERIFICATION.md](VERIFICATION.md) for the live acceptance checklist.
 
-Routine `Stop` events are ignored. A stop alert requires `[HOTLINE]` in Claude's final
-message or an explicit statement that human input is needed, and is suppressed while
-background work remains. `StopFailure` is an alert/recovery trigger only; Claude Code
-ignores its hook output and the failed turn must be resumed independently.
-
-Use the MCP `contact_human` tool, not a hook, when a structured phone decision must return
-to the current Claude turn. Hook behavior and installation details are documented under
-`integrations/claude/`; event schemas come from the official
-[Claude Code hooks reference](https://code.claude.com/docs/en/hooks).
-
-Deep inbound multi-session enumeration, interruption, and root creation are not promised for
-Claude. The MVP performs those operations through Codex App Server. Do not describe MCP
-alone as a universal remote-control API for arbitrary Claude sessions.
-
-## Example escalation
-
-The agent should send facts, not a conversational script:
-
-```json
-{
-  "kind": "compute_interrupted",
-  "severity": "high",
-  "summary": "The demo training worker ended after a checkpoint.",
-  "question": "Resume the demo run, switch its mode, or stop?",
-  "source": "claude_mcp",
-  "dedupe_key": "demo-training-checkpoint-v1",
-  "context": {
-    "task_summary": "Deterministic training demonstration.",
-    "agent_summary": "A recent checkpoint is available.",
-    "owner_constraints": ["Do not use production credentials."]
-  }
-}
-```
-
-Samvaad owns the spoken turn-taking. The calling model receives only the structured result.
-
-## Authentication handoff
-
-Use `request_authentication` with a legitimate provider-created browser/device handoff. A
-safe interaction says where to complete sign-in and waits for independent success. It never
-asks the owner to dictate passwords, OTPs, MFA codes, private keys, or recovery codes.
-
-For AWS, prefer the official browser/device flow generated by the AWS CLI. Agent Hotline
-may communicate a safe handoff reference, but secrets stay in the browser/CLI session.
-
-## Compatibility test
-
-With the daemon running:
-
-1. In Codex, call `hotline_status`.
-2. In Claude, call `hotline_status`.
-3. Run one offline `contact_human` flow from each client.
-4. Verify both results have the same fields and different `source` values.
-5. Only then run one native outbound call from the chosen demo client.
-
-No client may infer approval from `failed`, `timed_out`, `no_answer`, `busy`, `deferred`, or
-vague natural-language text.
+If MCP cannot reach the daemon, report that local dependency failure and leave the operation
+paused. Do not claim that the owner was contacted.

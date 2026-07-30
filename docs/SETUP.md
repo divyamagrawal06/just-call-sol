@@ -1,295 +1,228 @@
-# Windows setup
+# Production setup
 
-These instructions configure Agent Hotline without putting credentials or phone numbers in
-the repository.
+This guide configures the OpenAI Realtime and Twilio production voice path. Use Python 3.12 or
+3.13 and keep all credentials outside source control.
 
-## 1. Install the project
+## 1. Install
 
-From the repository root in PowerShell:
+From a checkout:
 
 ```powershell
 uv sync --python 3.12 --extra dev
-uv run python --version
-uv run agent-hotline doctor
-```
-
-The Python check must report a 3.12 runtime. The workstation’s global `python` may be a
-different version; use `uv run` for project commands.
-
-## 2. Create local service tokens
-
-```powershell
 uv run agent-hotline init-secrets
+uv run agent-hotline install-clients --client all
 ```
 
-On Windows this stores four generated Hotline-only tokens in the current user environment
-without printing them. Start a new PowerShell process afterward. Use
-`uv run agent-hotline init-secrets --force` only when intentionally rotating all four.
+`init-secrets` stores five independent service secrets:
 
-## 3. Configure Sarvam values
+- `HOTLINE_LOCAL_TOKEN`
+- `HOTLINE_SIP_CORRELATION_SECRET`
+- `HOTLINE_ACTION_SIGNING_SECRET`
+- `HOTLINE_FALLBACK_SIGNING_SECRET`
+- `HOTLINE_FALLBACK_WEBHOOK_TOKEN`
 
-Use the names from `.env.example`:
+On Windows they are written to the user environment. On Linux and macOS they are written to
+`${XDG_CONFIG_HOME:-~/.config}/agent-hotline/runtime.env` with owner-only permissions, so the
+Codex and Claude MCP processes can find them from any repository. Rotate them with
+`agent-hotline init-secrets --force`. Rerunning without `--force` preserves existing values;
+either mode changes only those five managed keys and preserves provider settings or comments
+already present in `runtime.env`.
+
+## 2. Configure the environment
+
+Copy `.env.example` to an ignored `.env` and set:
 
 ```dotenv
-SARVAM_API_KEY=<secret>
-SARVAM_ORG_ID=<opaque>
-SARVAM_WORKSPACE_ID=<opaque>
-SARVAM_APP_ID=<opaque>
-SARVAM_APP_VERSION=1
-SARVAM_CONNECTION_ID=<opaque>
-SARVAM_AGENT_PHONE_NUMBER=<secret E.164 value>
-SARVAM_INBOUND_SCHEDULE={"start_time":"09:00","end_time":"18:00","allowed_days":["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"],"timezone":"Asia/Kolkata"}
-OWNER_PHONE_NUMBER=<secret E.164 value>
-OWNER_CONFIRMATION_PIN=<required 6-12 digit secret for decisions/actions>
-HOTLINE_WORKSPACE_ROOTS=C:\exact\repo-one;C:\exact\repo-two
-HOTLINE_GIT_BIN=C:\Program Files\Git\cmd\git.exe
+HOTLINE_ENV=production
+HOTLINE_TRANSPORT=openai_realtime
+HOTLINE_HOST=127.0.0.1
+HOTLINE_PORT=8787
+HOTLINE_DAEMON_URL=http://127.0.0.1:8787
+PUBLIC_BASE_URL=https://hotline.example.com
+
+OPENAI_API_KEY=
+OPENAI_WEBHOOK_SECRET=
+OPENAI_PROJECT_ID=
+OPENAI_REALTIME_MODEL=gpt-realtime-2.1
+OPENAI_REALTIME_VOICE=marin
+OPENAI_REALTIME_REASONING_EFFORT=low
+
+TWILIO_ACCOUNT_SID=
+TWILIO_AUTH_TOKEN=
+TWILIO_PHONE_NUMBER=+12025550124
+
+OWNER_PHONE_NUMBER=+12025550123
+HOTLINE_OWNER_NAME=Owner
+OWNER_CONFIRMATION_PIN=
+HOTLINE_ALLOWLISTED_CALLERS=
+
+HOTLINE_WORKSPACE_ROOTS=C:\work\repo-a;C:\work\repo-b
+HOTLINE_ALLOW_CODEX_WRITES=false
+HOTLINE_ALLOW_REAL_RUNBOOKS=false
+HOTLINE_MAX_ACTIVE_CALLS=1
+HOTLINE_MAX_CALL_DURATION_SECONDS=1800
+HOTLINE_OUTBOUND_RING_TIMEOUT_SECONDS=30
 ```
 
-Either place them in an ignored `.env` copied from `.env.example`, or store them in the
-Windows user environment/secret manager. Never paste values into documentation, source,
-tests, chat transcripts, screenshots, or shell history shared with others.
-Without `OWNER_CONFIRMATION_PIN`, every decision and action grant fails closed.
+Requirements:
 
-The app version is an immutable numeric deployment input. After committing an Agent Studio
-draft, set `SARVAM_APP_VERSION` to the exact committed version and restart the daemon. Never
-leave it at an older value merely because `1` is the example default.
+- `OPENAI_PROJECT_ID` is the `proj_...` project that receives the SIP calls.
+- Both phone numbers use strict E.164 format.
+- `OWNER_CONFIRMATION_PIN` contains 6–12 ASCII digits and is never placed in the Realtime
+  prompt or agent variables.
+- Every Hotline service secret is at least 32 characters and pairwise distinct.
+- `HOTLINE_WORKSPACE_ROOTS` contains only explicit Git roots that voice inspection may reach.
+- Keep both write gates off until the read-only call path has passed live acceptance.
 
-`SARVAM_INBOUND_SCHEDULE` is optional and atomic. Omit it (or leave it empty) to omit
-`inbound_config` and use Sarvam's documented 24/7 default. If the provider deployment has an
-explicit schedule, set one JSON object with `HH:MM` `start_time`/`end_time`, one or more
-canonical English weekday names, and its timezone. Invalid or partial JSON fails before any
-provider mutation.
+`HOTLINE_MAX_ACTIVE_CALLS` is enforced during call admission and is intentionally fixed at
+`1`. `HOTLINE_MAX_CALL_DURATION_SECONDS` is enforced by the daemon, the outbound Twilio Call,
+and each SIP `<Dial>` bridge, including for inbound conversations and long pauses.
+`HOTLINE_OUTBOUND_RING_TIMEOUT_SECONDS` bounds both owner ringing and SIP bridge setup.
 
-`HOTLINE_WORKSPACE_ROOTS` is the explicit, semicolon-separated Git-repository allowlist for
-voice/MCP context queries. If it is empty, repository context uses
-only an explicitly configured `CODEX_APP_SERVER_CWD` that is itself a Git root; otherwise it
-fails closed. It never falls back to the process cwd or user home. Prefer exact repository
-roots rather than a broad parent directory. `HOTLINE_GIT_BIN` may pin the trusted absolute
-Git executable; auto-discovery resolves an absolute executable and rejects anything inside
-an allowlisted workspace.
+## 3. Configure OpenAI
 
-## 4. Validate the local runtime
+In the same OpenAI project identified by `OPENAI_PROJECT_ID`:
 
-Terminal A:
+1. Create or select an API key with access to the configured Realtime model.
+2. Create a webhook pointing to:
 
-```powershell
-uv run agent-hotline serve
+   ```text
+   https://hotline.example.com/v1/openai/realtime/webhook
+   ```
+
+3. Put the resulting signing secret in `OPENAI_WEBHOOK_SECRET`.
+4. Confirm that the project can receive SIP calls at:
+
+   ```text
+   sip:<project-id>@sip.api.openai.com;transport=tls
+   ```
+
+The daemon verifies the exact raw OpenAI webhook body before accepting a call. It then opens
+an authenticated server-side Realtime WebSocket for the conversation and function tools.
+
+## 4. Configure Twilio
+
+For the number in `TWILIO_PHONE_NUMBER`, set the incoming voice webhook to:
+
+```text
+POST https://hotline.example.com/v1/twilio/voice/incoming
 ```
 
-Terminal B:
+The daemon verifies Twilio's request signature, account, destination, direction, and caller
+allowlist before returning TwiML that bridges the call to OpenAI SIP.
 
-```powershell
-uv run agent-hotline doctor --live
+Outbound calls are created by the Twilio REST API with a signed TwiML URL:
+
+```text
+POST https://hotline.example.com/v1/twilio/voice/outbound?event_id=<event>&event_sig=<binding>
 ```
 
-Go only if the daemon is healthy and Sarvam is reachable. `doctor` reports presence/state,
-not secret values.
+Twilio fetches this route only after allocating the parent CallSid. The daemon verifies the
+Twilio form and event binding, atomically attaches that real parent ID to the durable session,
+and then returns the signed OpenAI SIP bridge. This also recovers a call whose Calls API
+response was lost.
 
-## 5. Start the public HTTPS tunnel
+The parent call separately reports lifecycle events to:
 
-Terminal C:
+```text
+POST https://hotline.example.com/v1/twilio/status?event_id=<event>&event_sig=<binding>
+```
+
+as their event-bound parent-call status callback. The binding is an HMAC correlation value,
+not owner authority. Inbound TwiML uses the same route without that query as its Twilio-signed
+`<Dial action>` target and submits `DialCallStatus`. Neither callback is used as authority for
+a decision, and neither claims to represent an independent nested SIP-child callback.
+
+Outbound Call creation includes exact `TimeLimit` and `Timeout` parameters. Both inbound and
+outbound bridge TwiML repeat the same duration and setup limits as carrier-side defense in
+depth, so a lost daemon connection cannot turn into an unbounded carrier call.
+
+If a reverse proxy changes scheme, host, port, path, or form data before verification, Twilio
+signatures will fail. Preserve the original public URL and request body exactly.
+
+## 5. Publish only required routes
+
+The production proxy should allow:
+
+```text
+POST /v1/openai/realtime/webhook
+POST /v1/twilio/voice/incoming
+POST /v1/twilio/voice/outbound
+POST /v1/twilio/status
+```
+
+When missed-call fallback is enabled, also allow:
+
+```text
+GET  /fallback
+GET  /fallback/assets/fallback.css
+GET  /fallback/assets/fallback.js
+POST /v1/fallback/open
+POST /v1/fallback/decision
+```
+
+Block all other routes at the public proxy. In particular, do not publish local escalation,
+event, repository-context, health, dashboard, or Codex-control APIs.
+
+For a short development test only:
 
 ```powershell
 cloudflared tunnel --url http://127.0.0.1:8787
 ```
 
-Copy only the generated HTTPS origin into `PUBLIC_BASE_URL`. Do not append a path. Restart
-the daemon after changing the environment.
+The quick tunnel publishes the whole origin and is not a production access-control boundary.
+Use a stable HTTPS proxy with an explicit route allowlist for deployment.
 
-Quick tunnels are ephemeral. If the hostname changes, update Agent Studio tools and
-`PUBLIC_BASE_URL` together. Treat tunnel access logs as sensitive because callback URLs can
-contain an opaque callback token.
+## 6. Start and verify
 
-Go only if:
-
-- the public health/tool smoke test reaches this daemon;
-- unknown or missing bearer tokens receive `401`;
-- local administrative routes are not exposed without local authentication.
-
-### Optional missed-call fallback
-
-To deliver a one-time response link through your own SMS or push bridge, configure:
-
-```text
-HOTLINE_FALLBACK_WEBHOOK_URL=https://<your-bridge>/agent-hotline
-HOTLINE_FALLBACK_WEBHOOK_TOKEN=<independent-random-bearer>
-HOTLINE_FALLBACK_TTL_SECONDS=900
-HOTLINE_FALLBACK_MAX_PIN_ATTEMPTS=5
-```
-
-The bridge receives a generic message and the link, not task context or a phone number.
-Keep notification previews private. The owner must enter `OWNER_CONFIRMATION_PIN` before
-the browser receives the summary or question. Test delivery through the bridge before
-depending on it; a delivery failure never becomes approval. See `docs/FALLBACK.md` for the
-exact webhook contract.
-
-## 6. Configure the Samvaad app
-
-Generate a secret-free copy/paste manifest:
+Start the daemon:
 
 ```powershell
-uv run agent-hotline-sarvam tools-manifest --format markdown
+uv run agent-hotline serve
 ```
 
-In the existing draft app:
-
-1. Use `samvaad/agent_prompt.md` as the system instructions.
-2. Configure the input variables from `samvaad/variables.json`.
-3. Add all nine HTTP tools exactly as described in `samvaad/tool_contracts.md`:
-   `begin_inbound`, `get_context`, `record_decision`, `prepare_action`,
-   `confirm_action`, `execute_action`, `list_threads`, `inspect_thread`, and
-   `repo_context`.
-   For `repo_context`, set `event_id` to **Agent variable**; `workspace` to a **Fixed
-   value** of empty string for the single demo root; `operation`, `query`, `path`,
-   `line_start`, and the ephemeral DTMF PIN to **Let the agent decide**; and
-   `line_count=40`/`max_results=10` to **Fixed value**. Do not create response-variable
-   mappings.
-4. Store `HOTLINE_TOOL_TOKEN` as an Agent Studio secret/header, never an agent variable.
-5. Keep the live `record_decision` schema aligned with the manifest: outcome, instruction,
-   and ephemeral PIN are dynamic; constraints and action IDs stay empty; confirmation
-   method is fixed to `spoken_plus_dtmf`. Every outcome requires the PIN.
-6. Select the lowest-latency managed telephony model available.
-7. Enable English with Hindi/Hinglish switching and barge-in.
-8. Save/commit the draft and put its exact numeric version in `SARVAM_APP_VERSION`.
-
-Tool URLs:
-
-```text
-${PUBLIC_BASE_URL}/v1/sarvam/tools/begin-inbound
-${PUBLIC_BASE_URL}/v1/sarvam/tools/context
-${PUBLIC_BASE_URL}/v1/sarvam/tools/record-instruction
-${PUBLIC_BASE_URL}/v1/sarvam/tools/prepare-action
-${PUBLIC_BASE_URL}/v1/sarvam/tools/confirm-action
-${PUBLIC_BASE_URL}/v1/sarvam/tools/execute-action
-${PUBLIC_BASE_URL}/v1/sarvam/tools/threads/list
-${PUBLIC_BASE_URL}/v1/sarvam/tools/threads/inspect
-${PUBLIC_BASE_URL}/v1/sarvam/tools/repository-context
-```
-
-Go only after `get_context` returns an event-bound brief from a synthetic event
-and a wrong `event_id` does not disclose other event data. Verify `repo_context` rejects a
-non-allowlisted workspace and `../` path before committing the new Agent Studio version.
-Also verify that, after the daemon accepts one authenticated, schema-valid `repo_context`
-request, the same event rejects `record_decision`, action confirmation, and grant execution
-even when the repository query itself fails or returns no evidence.
-
-## 7. Reconcile the inbound deployment
-
-First run the safe plan:
+In another terminal:
 
 ```powershell
-uv run agent-hotline-sarvam deployments
-uv run agent-hotline-sarvam ensure-deployment
+uv run agent-hotline doctor
+uv run agent-hotline doctor --live
 ```
 
-The second command is read-only without `--apply`. It verifies a deployment binding:
+`doctor` reports only presence and readiness metadata. `doctor --live` also checks the local
+daemon and configured OpenAI and Twilio APIs. It does not prove that a PSTN call, webhook,
+sideband socket, audio turn, or DTMF event works end to end.
 
-- `${SARVAM_APP_ID}`;
-- the exact `${SARVAM_APP_VERSION}`;
-- `${SARVAM_CONNECTION_ID}`;
-- `${SARVAM_AGENT_PHONE_NUMBER}`;
-- the exact `${SARVAM_INBOUND_SCHEDULE}` when configured, otherwise the 24/7 default represented
-  by an omitted `inbound_config`.
-
-If the plan reports `missing`, create it explicitly:
+Run the offline mock separately:
 
 ```powershell
-uv run agent-hotline-sarvam ensure-deployment --apply
-```
-
-The command adopts one equivalent deployment, reports paused/unknown state without changing
-it, and refuses same-name, version, schedule, or phone-binding conflicts. It never silently
-migrates a deployment from an older app version or different schedule. Sarvam's list response
-omits connection details, so the reconciler fetches each detail before deciding; a failed
-detail lookup stops safely without creating. Resolve an intentional migration in Sarvam,
-then rerun the plan. Store resulting deployment references only in local operational state.
-
-Go only after the deployment is active and an allowlisted inbound caller can reach the app.
-If the number is already assigned incompatibly, stop and resolve the binding in Sarvam
-instead of changing transport.
-
-## 8. Install Codex and Claude integrations
-
-```powershell
-uv run agent-hotline install-clients --client all
-codex mcp get agent_hotline
-claude mcp get agent-hotline
-```
-
-This installs the local Codex plugin and the same stdio MCP executable for Claude. Restart
-both clients after installation. The command is safe to repeat: it skips an editable uv tool,
-Codex marketplace/plugin, or Claude user-scoped MCP registration that already matches. It
-refuses same-name registrations from another source instead of removing or overwriting them.
-On Windows it also skips reinstalling the uv tool when that tool environment is running the
-command, avoiding an in-use environment deletion.
-
-Manual registration fallback:
-
-```powershell
-uv tool install --editable .
-codex mcp add agent_hotline -- agent-hotline-mcp
-claude mcp add --scope user agent-hotline -- agent-hotline-mcp
-```
-
-Go only if both clients show `contact_human`, `notify_human`,
-`request_authentication`, `list_hotline_events`, and `hotline_status`.
-
-## 9. Test
-
-```powershell
-uv run pytest -q
-uv run ruff check .
 uv run agent-hotline demo --auto-decide
 ```
 
-The offline demo must not dial. It proves deterministic state transitions and the mock
-runbook. Then run:
+This is deterministic local validation, not a live-call result.
 
-```powershell
-uv run agent-hotline doctor --live
-uv run agent-hotline demo
-uv run agent-hotline events --limit 10
-```
+## 7. Live acceptance order
 
-The native demo is a go only after one bounded call returns an `attempt_id`, rings, performs
-one live context lookup, records a decision mid-call, wakes the caller, and later receives a
-completion callback.
+1. Call the Twilio number from `OWNER_PHONE_NUMBER`.
+2. Confirm the casual Agent Hotline greeting and a natural interruption.
+3. Ask it to list and inspect a known Codex task.
+4. End the call normally and inspect the durable event.
+5. Place an outbound read-only incident call with `agent-hotline call`.
+6. Verify exact readback, a later spoken response, keypad PIN entry followed by `#`, and the
+   resulting structured decision.
+7. Only then consider `HOTLINE_ALLOW_CODEX_WRITES=true` for a scoped Codex task-control test.
 
-## 10. Normal operation
+Keep `HOTLINE_ALLOW_REAL_RUNBOOKS=false`. No real infrastructure runbooks ship in this
+repository, so enabling the gate alone does not create an AWS, database, deployment, or
+batch-control capability.
 
-Start these in order:
+See [VERIFICATION.md](VERIFICATION.md) for the difference between automated, mocked, and live
+validation.
 
-1. `uv run agent-hotline serve`
-2. `cloudflared tunnel --url http://127.0.0.1:8787`
-3. update `PUBLIC_BASE_URL` and Agent Studio URLs if the quick-tunnel hostname changed;
-4. `uv run agent-hotline doctor --live`;
-5. start new Codex/Claude sessions.
+## Provider references
 
-Useful read-only command:
-
-```powershell
-uv run agent-hotline events --limit 20
-```
-
-For a manual bounded call:
-
-```powershell
-uv run agent-hotline call --kind clarification --severity medium
-```
-
-The CLI prompts for the factual summary and exact question. Do not place secrets in either.
-
-## Troubleshooting
-
-| Symptom | Check |
-| --- | --- |
-| MCP says daemon unavailable | Start `agent-hotline serve`; verify `HOTLINE_DAEMON_URL` |
-| Public tools not configured | Set `PUBLIC_BASE_URL`, tool token, and callback token; restart |
-| Secure fallback not configured | Set the fallback webhook URL/token, public URL, and owner PIN |
-| Fallback notification missing | Check the bridge response and idempotency key; no automatic redial occurs |
-| Sarvam `4xx` | Confirm app version, connection binding, E.164 values, and entitlement |
-| Sarvam `429`/`5xx` | Observe bounded retry; do not manually create a call storm |
-| No inbound call | Verify deployment is active and owns the provisioned number |
-| Codex App Server fails on Windows | Configure a real `codex.exe`; `.cmd`/`.ps1` shims are rejected |
-| Claude cannot see tools | Re-run user-scope MCP registration and start a new session |
-| No answer/busy | Expected safe terminal state; never override it into approval |
+- [OpenAI Realtime API with SIP](https://developers.openai.com/api/docs/guides/realtime-sip)
+- [OpenAI Realtime server-side controls](https://developers.openai.com/api/docs/guides/realtime-server-controls)
+- [OpenAI Realtime voice activity detection](https://developers.openai.com/api/docs/guides/realtime-vad)
+- [Twilio Call resource](https://www.twilio.com/docs/voice/api/call-resource)
+- [Twilio `<Dial>`](https://www.twilio.com/docs/voice/twiml/dial)
+- [Twilio `<Sip>`](https://www.twilio.com/docs/voice/twiml/sip)

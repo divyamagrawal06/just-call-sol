@@ -1,28 +1,25 @@
-# JUST CALL SOL — site
+# Just Call Sol site
 
-A one-page site for the agent-hotline plugin, staged as a hostage situation for
-coding agents: when Codex or Claude gets blocked, it doesn't guess — it phones Sol.
-
-No build step. Serve the folder and open it:
+This folder contains the static product page for Agent Hotline, branded as “Just Call Sol.”
+There is no build step.
 
 ```powershell
 python -m http.server 8123 --directory app
 ```
 
-Then visit <http://localhost:8123>.
+Then open <http://localhost:8123>.
 
 ## Files
 
-- `index.html` — content (the note, the situation, the call on tape, Sol's rules, the kit, the drill)
-- `sol.css` — the paper/typewriter world, CRT glass, ticket + emboss, chroma glow
-- `sol.js` — ransom-note composer, phosphor call simulation, copy buttons
-- `typer.js` — the character-reveal engine
-- `assets/ransom/` — cut-out letter sprites (Resource Boy "Ransom Note Letters" pack, royalty-free)
+- `index.html` — product copy and semantic structure
+- `sol.css` — paper, typewriter, CRT, ticket, emboss, and glow styling
+- `sol.js` — ransom-letter composition, call simulation, and copy buttons
+- `typer.js` — progressive text-reveal behavior
+- `assets/ransom/` — cut-out letter sprites
 
-## Stolen goods
+## Attribution
 
-Effects lifted directly from the [arlan.me vault](https://www.arlan.me/vault)
-(MIT → free to copy): the ransom-note cutouts and its seeded composer, the typer
-(engine + pill-merge CSS, verbatim), the CRT old-TV treatment from the Midjourney
-ASCII entry, the emboss recipe as the ticket seal, and the chromatic glow in the
-footer.
+The visual treatment adapts MIT-licensed examples from the
+[arlan.me vault](https://www.arlan.me/vault), including the seeded ransom-letter composer,
+typing effect, CRT treatment, emboss recipe, and chromatic glow. The cut-out letter sprites
+come from Resource Boy's royalty-free “Ransom Note Letters” pack.
