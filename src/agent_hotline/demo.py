@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import secrets
+from pathlib import Path
 from typing import Any
 
 from pydantic import SecretStr
@@ -72,11 +73,10 @@ async def run_demo(*, auto_decide: bool = False) -> dict[str, Any]:
     demo_confirmation_pin = SecretStr(f"{secrets.randbelow(100_000_000):08d}")
     settings = get_settings().model_copy(
         update={
-            "hotline_database_path": get_settings().hotline_database_path.with_name(
-                "demo-hotline.db"
-            ),
+            "hotline_database_path": Path(":memory:"),
             "hotline_transport": "fake",
-            "hotline_allow_real_actions": False,
+            "hotline_allow_codex_writes": False,
+            "hotline_allow_real_runbooks": False,
             "owner_confirmation_pin": demo_confirmation_pin,
         }
     )
@@ -117,21 +117,21 @@ async def run_demo(*, auto_decide: bool = False) -> dict[str, Any]:
         )
         if not confirmed.confirmed or confirmed.grant_id is None:
             raise RuntimeError("deterministic demo confirmation unexpectedly failed")
-        decision = await coordinator.record_instruction(
-            RecordInstructionRequest(
-                event_id=call.event_id,
-                outcome="approve",
-                instruction="Run only the exact confirmed mock RU increase.",
-                approved_action_ids=[prepared.action_id],
-                confirmation_method="spoken_plus_dtmf",
-                confirmation_pin=demo_confirmation_pin,
-            )
-        )
         execution = await coordinator.execute_action(
             ExecuteActionRequest(
                 event_id=call.event_id,
                 action_id=prepared.action_id,
                 grant_id=confirmed.grant_id,
+            )
+        )
+        decision = await coordinator.record_instruction(
+            RecordInstructionRequest(
+                event_id=call.event_id,
+                outcome="approve",
+                instruction="The exact confirmed mock RU increase completed.",
+                approved_action_ids=[prepared.action_id],
+                confirmation_method="spoken_plus_dtmf",
+                confirmation_pin=demo_confirmation_pin,
             )
         )
         return {

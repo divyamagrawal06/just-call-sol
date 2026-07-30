@@ -14,6 +14,7 @@ import pytest_asyncio
 from pydantic import SecretStr
 
 from agent_hotline.api import create_app
+from agent_hotline.coordinator import HotlineCoordinator
 from agent_hotline.fallback_delivery import (
     FallbackDeliveryError,
     FallbackNotification,
@@ -27,6 +28,7 @@ from agent_hotline.models import (
     EventState,
     FallbackLink,
     FallbackState,
+    ProviderWebhookPayload,
     SessionState,
     Severity,
     utc_now,
@@ -35,10 +37,9 @@ from agent_hotline.providers import FakeCallProvider
 from agent_hotline.settings import Settings
 from agent_hotline.storage import SQLiteStore
 
-LOCAL_TOKEN = "local-fallback-token-123456"
-TOOL_TOKEN = "tool-fallback-token-1234567"
-CALLBACK_TOKEN = "callback-fallback-token-1234"
-WEBHOOK_TOKEN = "push-fallback-token-12345678"
+LOCAL_TOKEN = "local-fallback-token-1234567890-abcdef"
+CALLBACK_TOKEN = "action-fallback-token-1234567890-abcdef"
+WEBHOOK_TOKEN = "webhook-fallback-token-1234567890-abcdef"
 OWNER_PIN = "246810"
 
 
@@ -64,6 +65,7 @@ class FallbackHarness:
     notifier: RecordingNotifier
     store: SQLiteStore
     database_path: Path
+    coordinator: HotlineCoordinator
 
 
 @pytest_asyncio.fixture
@@ -75,8 +77,8 @@ async def fallback_api(tmp_path: Path) -> AsyncIterator[FallbackHarness]:
         hotline_database_path=database_path,
         hotline_transport="fake",
         hotline_local_token=LOCAL_TOKEN,
-        hotline_tool_token=TOOL_TOKEN,
-        hotline_callback_token=CALLBACK_TOKEN,
+        hotline_action_signing_secret=CALLBACK_TOKEN,
+        hotline_fallback_signing_secret="fallback-signing-token-1234567890-abcdef",
         public_base_url="https://hotline.example.invalid",
         hotline_fallback_webhook_url="https://push.example.invalid/hotline",
         hotline_fallback_webhook_token=WEBHOOK_TOKEN,
@@ -104,6 +106,7 @@ async def fallback_api(tmp_path: Path) -> AsyncIterator[FallbackHarness]:
                 notifier=notifier,
                 store=app.state.store,
                 database_path=database_path,
+                coordinator=app.state.coordinator,
             )
 
 
@@ -121,6 +124,7 @@ def _contact_payload() -> dict[str, object]:
             "owner_constraints": ["Do not change production credentials."],
         },
         "dedupe_key": "fallback-release-decision-v1",
+        "no_answer_policy": "defer",
         "wait_for_decision": True,
         "timeout_seconds": 5,
     }
@@ -130,12 +134,18 @@ def _local_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {LOCAL_TOKEN}"}
 
 
-async def _wait_for_provider_call(provider: FakeCallProvider) -> str:
+async def _wait_for_provider_call(
+    provider: FakeCallProvider,
+    store: SQLiteStore,
+) -> str:
     for _ in range(200):
         if provider.calls:
-            return provider.calls[-1][0]
+            event_id = provider.calls[-1][0]
+            attempt_id = f"fake-attempt-{event_id}"
+            if await store.get_session_by_attempt(attempt_id) is not None:
+                return event_id
         await asyncio.sleep(0.01)
-    pytest.fail("fake provider did not receive the call")
+    pytest.fail("fake provider call was not durably linked")
 
 
 async def test_missed_call_fallback_is_pin_gated_and_consumed_once(
@@ -148,18 +158,25 @@ async def test_missed_call_fallback_is_pin_gated_and_consumed_once(
             headers=_local_headers(),
         )
     )
-    event_id = await _wait_for_provider_call(fallback_api.provider)
-    webhook = await fallback_api.client.post(
-        f"/v1/sarvam/webhooks/instant-outbound/{CALLBACK_TOKEN}",
-        json={
-            "attempt_id": f"fake-attempt-{event_id}",
-            "status": "no_answer",
-            "channel_info": {"direction": "outbound"},
-            "failure_reason": "The owner did not answer.",
-        },
+    event_id = await _wait_for_provider_call(
+        fallback_api.provider,
+        fallback_api.store,
+    )
+    webhook = await fallback_api.coordinator.reconcile_provider_completion(
+        ProviderWebhookPayload(
+            attempt_id=f"fake-attempt-{event_id}",
+            status="no_answer",
+            provider="fake",
+            failure_reason="The owner did not answer.",
+        )
     )
 
-    assert webhook.status_code == 200
+    assert webhook == {
+        "accepted": True,
+        "created": True,
+        "event_id": event_id,
+        "status": "no_answer",
+    }
     assert len(fallback_api.notifier.notifications) == 1
     assert not pending.done()
     event = await fallback_api.store.require_event(event_id)
@@ -251,8 +268,8 @@ async def test_fallback_delivery_failure_preserves_no_answer(
         hotline_database_path=tmp_path / "delivery-failure.sqlite3",
         hotline_transport="fake",
         hotline_local_token=LOCAL_TOKEN,
-        hotline_tool_token=TOOL_TOKEN,
-        hotline_callback_token=CALLBACK_TOKEN,
+        hotline_action_signing_secret=CALLBACK_TOKEN,
+        hotline_fallback_signing_secret="fallback-signing-token-1234567890-abcdef",
         public_base_url="https://hotline.example.invalid",
         owner_phone_number="+919876543210",
         owner_confirmation_pin=OWNER_PIN,
@@ -278,20 +295,23 @@ async def test_fallback_delivery_failure_preserves_no_answer(
                     headers=_local_headers(),
                 )
             )
-            event_id = await _wait_for_provider_call(provider)
-            webhook = await client.post(
-                f"/v1/sarvam/webhooks/instant-outbound/{CALLBACK_TOKEN}",
-                json={
-                    "attempt_id": f"fake-attempt-{event_id}",
-                    "status": "busy",
-                    "channel_info": {"direction": "outbound"},
-                },
+            event_id = await _wait_for_provider_call(
+                provider,
+                app.state.store,
+            )
+            webhook = await app.state.coordinator.reconcile_provider_completion(
+                ProviderWebhookPayload(
+                    attempt_id=f"fake-attempt-{event_id}",
+                    status="busy",
+                    provider="fake",
+                )
             )
             result = await asyncio.wait_for(pending, timeout=2)
             fallback = await app.state.store.get_fallback_for_event(event_id)
             decision = await app.state.store.get_decision(event_id)
 
-    assert webhook.status_code == 200
+    assert webhook["accepted"] is True
+    assert webhook["created"] is True
     assert result.json()["status"] == "busy"
     assert result.json()["identity_verified"] is False
     assert fallback is not None

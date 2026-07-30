@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
@@ -12,20 +13,23 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _WINDOWS_USER_ENV_KEYS = (
-    "SARVAM_API_KEY",
-    "SARVAM_ORG_ID",
-    "SARVAM_WORKSPACE_ID",
-    "SARVAM_APP_ID",
-    "SARVAM_APP_VERSION",
-    "SARVAM_CONNECTION_ID",
-    "SARVAM_AGENT_PHONE_NUMBER",
-    "SARVAM_INBOUND_SCHEDULE",
+    "OPENAI_API_KEY",
+    "OPENAI_WEBHOOK_SECRET",
+    "OPENAI_PROJECT_ID",
+    "OPENAI_REALTIME_MODEL",
+    "OPENAI_REALTIME_VOICE",
+    "OPENAI_REALTIME_REASONING_EFFORT",
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN",
+    "TWILIO_PHONE_NUMBER",
     "OWNER_PHONE_NUMBER",
     "OWNER_CONFIRMATION_PIN",
-    "HOTLINE_TOOL_TOKEN",
-    "HOTLINE_PUBLIC_TOOLS_REQUIRE_TOKEN",
+    "HOTLINE_OWNER_NAME",
+    "HOTLINE_VOICE_PIN_MAX_ATTEMPTS",
     "HOTLINE_LOCAL_TOKEN",
-    "HOTLINE_CALLBACK_TOKEN",
+    "HOTLINE_SIP_CORRELATION_SECRET",
+    "HOTLINE_ACTION_SIGNING_SECRET",
+    "HOTLINE_FALLBACK_SIGNING_SECRET",
     "HOTLINE_FALLBACK_WEBHOOK_URL",
     "HOTLINE_FALLBACK_WEBHOOK_TOKEN",
     "HOTLINE_FALLBACK_TTL_SECONDS",
@@ -68,12 +72,27 @@ def hydrate_windows_user_environment() -> None:
 hydrate_windows_user_environment()
 
 
+def runtime_env_path() -> Path:
+    """Return the stable per-user secret file used outside Windows registry storage."""
+
+    configured_root = os.environ.get("XDG_CONFIG_HOME")
+    if configured_root and Path(configured_root).is_absolute():
+        config_root = Path(configured_root)
+    elif platform.system() == "Windows":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        config_root = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+    else:
+        config_root = Path.home() / ".config"
+    return config_root / "agent-hotline" / "runtime.env"
+
+
 class Settings(BaseSettings):
     """Configuration for the daemon, MCP bridge, and provider client."""
 
     model_config = SettingsConfigDict(
-        env_file=(".env", ".hotline/runtime.env"),
+        env_file=(str(runtime_env_path()), ".env"),
         env_file_encoding="utf-8",
+        env_ignore_empty=True,
         extra="ignore",
         case_sensitive=False,
     )
@@ -83,13 +102,10 @@ class Settings(BaseSettings):
     hotline_port: int = Field(default=8787, ge=1, le=65535)
     hotline_database_path: Path = Path(".hotline/hotline.db")
     hotline_daemon_url: str = "http://127.0.0.1:8787"
-    hotline_tool_token: SecretStr = SecretStr("")
-    # Sarvam rejects some custom Authorization configurations before making the
-    # request. Development demos may explicitly disable bearer auth for the
-    # Sarvam tool surface; coordinator session/PIN/readback/grant gates remain.
-    hotline_public_tools_require_token: bool = True
     hotline_local_token: SecretStr = SecretStr("")
-    hotline_callback_token: SecretStr = SecretStr("")
+    hotline_sip_correlation_secret: SecretStr = SecretStr("")
+    hotline_action_signing_secret: SecretStr = SecretStr("")
+    hotline_fallback_signing_secret: SecretStr = SecretStr("")
     hotline_fallback_webhook_url: str | None = None
     hotline_fallback_webhook_token: SecretStr = SecretStr("")
     hotline_fallback_ttl_seconds: int = Field(default=900, ge=60, le=3600)
@@ -98,18 +114,41 @@ class Settings(BaseSettings):
     hotline_log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     public_base_url: str | None = None
 
-    sarvam_api_key: SecretStr = SecretStr("")
-    sarvam_org_id: str | None = None
-    sarvam_workspace_id: str | None = None
-    sarvam_app_id: str | None = None
-    sarvam_app_version: int = Field(default=1, ge=1)
-    sarvam_connection_id: str | None = None
-    sarvam_agent_phone_number: str | None = None
-    # Optional atomic JSON object. When absent, Sarvam's documented 24/7 default
-    # is preserved by omitting inbound_config from the deployment request.
-    sarvam_inbound_schedule: str | None = None
+    # OpenAI Realtime is the conversational runtime. A SIP carrier (Twilio by
+    # default) originates PSTN calls and forwards both inbound and outbound legs
+    # to the project-scoped OpenAI SIP endpoint.
+    openai_api_key: SecretStr = SecretStr("")
+    openai_webhook_secret: SecretStr = SecretStr("")
+    openai_project_id: str | None = None
+    openai_realtime_model: str = "gpt-realtime-2.1"
+    openai_realtime_voice: Literal[
+        "alloy",
+        "ash",
+        "ballad",
+        "coral",
+        "echo",
+        "sage",
+        "shimmer",
+        "verse",
+        "marin",
+        "cedar",
+    ] = "marin"
+    openai_realtime_reasoning_effort: Literal[
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    ] = "low"
+
+    twilio_account_sid: str | None = None
+    twilio_auth_token: SecretStr = SecretStr("")
+    twilio_phone_number: str | None = None
+
     owner_phone_number: SecretStr = SecretStr("")
     owner_confirmation_pin: SecretStr = SecretStr("")
+    hotline_owner_name: str = Field(default="Owner", min_length=1, max_length=80)
+    hotline_voice_pin_max_attempts: int = Field(default=3, ge=1, le=10)
 
     codex_bin: str = "codex"
     codex_app_server_enabled: bool = True
@@ -119,11 +158,14 @@ class Settings(BaseSettings):
     hotline_workspace_roots: str = ""
     hotline_git_bin: Path | None = None
 
-    hotline_transport: Literal["sarvam", "fake", "disabled"] = "sarvam"
-    hotline_allow_real_actions: bool = False
-    hotline_demo_auto_execute_actions: bool = False
+    hotline_transport: Literal["openai_realtime", "fake", "disabled"] = "openai_realtime"
+    hotline_allow_codex_writes: bool = False
+    hotline_allow_real_runbooks: bool = False
     hotline_allowlisted_callers: str = ""
-    hotline_max_active_calls: int = Field(default=1, ge=1, le=10)
+    hotline_max_active_calls: int = Field(default=1, ge=1, le=1)
+    hotline_max_call_duration_seconds: int = Field(default=1800, ge=60, le=7200)
+    hotline_outbound_ring_timeout_seconds: int = Field(default=30, ge=5, le=600)
+    hotline_carrier_admission_ttl_seconds: int = Field(default=300, ge=60, le=900)
     hotline_retry_attempts: int = Field(default=2, ge=0, le=5)
 
     @field_validator(
@@ -140,12 +182,9 @@ class Settings(BaseSettings):
         return value
 
     @field_validator(
-        "sarvam_org_id",
-        "sarvam_workspace_id",
-        "sarvam_app_id",
-        "sarvam_connection_id",
-        "sarvam_agent_phone_number",
-        "sarvam_inbound_schedule",
+        "openai_project_id",
+        "twilio_account_sid",
+        "twilio_phone_number",
         mode="before",
     )
     @classmethod
@@ -163,42 +202,114 @@ class Settings(BaseSettings):
             raise ValueError("OWNER_CONFIRMATION_PIN must contain 6 to 12 ASCII digits")
         return value
 
+    @field_validator(
+        "hotline_local_token",
+        "hotline_sip_correlation_secret",
+        "hotline_action_signing_secret",
+        "hotline_fallback_signing_secret",
+        "hotline_fallback_webhook_token",
+    )
+    @classmethod
+    def validate_hotline_secret_strength(cls, value: SecretStr) -> SecretStr:
+        raw = value.get_secret_value()
+        if raw and len(raw) < 32:
+            raise ValueError("Hotline service secrets must contain at least 32 characters")
+        return value
+
+    @field_validator("owner_phone_number")
+    @classmethod
+    def validate_owner_phone_number(cls, value: SecretStr) -> SecretStr:
+        raw = value.get_secret_value()
+        if raw and re.fullmatch(r"\+[1-9]\d{7,14}", raw) is None:
+            raise ValueError("OWNER_PHONE_NUMBER must be strict E.164")
+        return value
+
+    @field_validator("twilio_phone_number")
+    @classmethod
+    def validate_twilio_phone_number(cls, value: str | None) -> str | None:
+        if value is not None and re.fullmatch(r"\+[1-9]\d{7,14}", value) is None:
+            raise ValueError("TWILIO_PHONE_NUMBER must be strict E.164")
+        return value
+
+    @field_validator("openai_project_id")
+    @classmethod
+    def validate_openai_project_id(cls, value: str | None) -> str | None:
+        if value is not None and (
+            not value.startswith("proj_") or not value.replace("_", "").replace("-", "").isalnum()
+        ):
+            raise ValueError("OPENAI_PROJECT_ID must be a project ID with a proj_ prefix")
+        return value
+
+    @field_validator("openai_realtime_model")
+    @classmethod
+    def validate_realtime_model(cls, value: str) -> str:
+        value = value.strip()
+        if not value.startswith("gpt-realtime"):
+            raise ValueError("OPENAI_REALTIME_MODEL must be a gpt-realtime model")
+        return value
+
+    @field_validator("hotline_owner_name")
+    @classmethod
+    def normalize_owner_name(cls, value: str) -> str:
+        return " ".join(value.split())
+
     @model_validator(mode="after")
-    def reject_headerless_public_tools_in_production(self) -> Settings:
-        if self.hotline_env == "production" and not self.hotline_public_tools_require_token:
-            raise ValueError("HOTLINE_PUBLIC_TOOLS_REQUIRE_TOKEN cannot be disabled in production")
-        if self.hotline_env == "production" and self.hotline_demo_auto_execute_actions:
-            raise ValueError("HOTLINE_DEMO_AUTO_EXECUTE_ACTIONS cannot be enabled in production")
-        if self.hotline_demo_auto_execute_actions and self.hotline_allow_real_actions:
-            raise ValueError(
-                "HOTLINE_DEMO_AUTO_EXECUTE_ACTIONS cannot be combined with "
-                "HOTLINE_ALLOW_REAL_ACTIONS"
+    def hotline_secrets_are_independent(self) -> Settings:
+        configured = [
+            value
+            for value in (
+                self.hotline_local_token.get_secret_value(),
+                self.hotline_sip_correlation_secret.get_secret_value(),
+                self.hotline_action_signing_secret.get_secret_value(),
+                self.hotline_fallback_signing_secret.get_secret_value(),
+                self.hotline_fallback_webhook_token.get_secret_value(),
             )
+            if value
+        ]
+        if len(configured) != len(set(configured)):
+            raise ValueError("Hotline service secrets must be pairwise distinct")
         return self
 
     @property
-    def sarvam_configured(self) -> bool:
+    def openai_realtime_configured(self) -> bool:
         return all(
             (
-                self.sarvam_api_key.get_secret_value(),
-                self.sarvam_org_id,
-                self.sarvam_workspace_id,
-                self.sarvam_app_id,
-                self.sarvam_connection_id,
-                self.sarvam_agent_phone_number,
-                self.owner_phone_number.get_secret_value(),
+                self.openai_api_key.get_secret_value(),
+                self.openai_webhook_secret.get_secret_value(),
+                self.openai_project_id,
+                self.public_base_url,
+                self.hotline_sip_correlation_secret.get_secret_value(),
+                self.hotline_action_signing_secret.get_secret_value(),
+                self.owner_confirmation_pin.get_secret_value(),
             )
         )
 
     @property
-    def public_tools_configured(self) -> bool:
-        return bool(
-            self.public_base_url
-            and self.hotline_callback_token.get_secret_value()
-            and (
-                not self.hotline_public_tools_require_token
-                or self.hotline_tool_token.get_secret_value()
+    def twilio_configured(self) -> bool:
+        return all(
+            (
+                self.twilio_account_sid,
+                self.twilio_auth_token.get_secret_value(),
+                self.twilio_phone_number,
+                self.owner_phone_number.get_secret_value(),
+                self.openai_project_id,
+                self.public_base_url,
+                self.hotline_sip_correlation_secret.get_secret_value(),
             )
+        )
+
+    @property
+    def openai_sip_uri(self) -> str | None:
+        if self.openai_project_id is None:
+            return None
+        return f"sip:{self.openai_project_id}@sip.api.openai.com;transport=tls"
+
+    @property
+    def openai_realtime_runtime_ready(self) -> bool:
+        return bool(
+            self.openai_realtime_configured
+            and self.twilio_configured
+            and self.hotline_local_token.get_secret_value()
         )
 
     @property
@@ -207,6 +318,7 @@ class Settings(BaseSettings):
             self.public_base_url
             and self.hotline_fallback_webhook_url
             and self.hotline_fallback_webhook_token.get_secret_value()
+            and self.hotline_fallback_signing_secret.get_secret_value()
             and self.owner_confirmation_pin.get_secret_value()
         )
 
@@ -235,26 +347,36 @@ class Settings(BaseSettings):
         return {
             "environment": self.hotline_env,
             "transport": self.hotline_transport,
-            "demo_auto_execute_actions": self.hotline_demo_auto_execute_actions,
             "daemon_url": self.hotline_daemon_url,
             "database_path": str(self.hotline_database_path),
             "public_base_url_configured": bool(self.public_base_url),
-            "tool_token_configured": bool(self.hotline_tool_token.get_secret_value()),
-            "public_tools_require_token": self.hotline_public_tools_require_token,
             "local_token_configured": bool(self.hotline_local_token.get_secret_value()),
-            "callback_token_configured": bool(self.hotline_callback_token.get_secret_value()),
+            "sip_correlation_secret_configured": bool(
+                self.hotline_sip_correlation_secret.get_secret_value()
+            ),
+            "action_signing_secret_configured": bool(
+                self.hotline_action_signing_secret.get_secret_value()
+            ),
+            "fallback_signing_secret_configured": bool(
+                self.hotline_fallback_signing_secret.get_secret_value()
+            ),
             "secure_fallback_configured": self.secure_fallback_configured,
             "fallback_webhook_configured": bool(self.hotline_fallback_webhook_url),
             "fallback_webhook_token_configured": bool(
                 self.hotline_fallback_webhook_token.get_secret_value()
             ),
-            "sarvam_api_key_configured": bool(self.sarvam_api_key.get_secret_value()),
-            "sarvam_org_configured": bool(self.sarvam_org_id),
-            "sarvam_workspace_configured": bool(self.sarvam_workspace_id),
-            "sarvam_app_configured": bool(self.sarvam_app_id),
-            "sarvam_connection_configured": bool(self.sarvam_connection_id),
-            "sarvam_number_configured": bool(self.sarvam_agent_phone_number),
-            "sarvam_inbound_schedule_configured": bool(self.sarvam_inbound_schedule),
+            "openai_api_key_configured": bool(self.openai_api_key.get_secret_value()),
+            "openai_webhook_secret_configured": bool(self.openai_webhook_secret.get_secret_value()),
+            "openai_project_configured": bool(self.openai_project_id),
+            "openai_realtime_model": self.openai_realtime_model,
+            "openai_realtime_voice": self.openai_realtime_voice,
+            "openai_realtime_reasoning_effort": self.openai_realtime_reasoning_effort,
+            "openai_realtime_configured": self.openai_realtime_configured,
+            "openai_realtime_runtime_ready": self.openai_realtime_runtime_ready,
+            "twilio_account_configured": bool(self.twilio_account_sid),
+            "twilio_auth_token_configured": bool(self.twilio_auth_token.get_secret_value()),
+            "twilio_number_configured": bool(self.twilio_phone_number),
+            "twilio_configured": self.twilio_configured,
             "owner_number_configured": bool(self.owner_phone_number.get_secret_value()),
             "owner_confirmation_pin_configured": bool(
                 self.owner_confirmation_pin.get_secret_value()
@@ -262,7 +384,8 @@ class Settings(BaseSettings):
             "codex_app_server_enabled": self.codex_app_server_enabled,
             "workspace_roots_configured": len(self.workspace_roots),
             "git_bin_configured": self.hotline_git_bin is not None,
-            "real_actions_enabled": self.hotline_allow_real_actions,
+            "codex_writes_enabled": self.hotline_allow_codex_writes,
+            "real_runbooks_enabled": self.hotline_allow_real_runbooks,
         }
 
 

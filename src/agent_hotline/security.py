@@ -621,7 +621,7 @@ _SENSITIVE_KEY_RE = re.compile(
     r"(?:"
     r"api[_-]?key|auth(?:orization)?|bearer|callback[_-]?token|client[_-]?secret|"
     r"cookie|credential|hotline[_-]?.*token|otp|pass(?:phrase|word)?|pin|"
-    r"private[_-]?key|refresh[_-]?token|sarvam[_-]?api[_-]?key|secret|"
+    r"private[_-]?key|refresh[_-]?token|secret|"
     r"session(?:id|[_-]?cookie|[_-]?token)?|token"
     r")",
     flags=re.IGNORECASE,

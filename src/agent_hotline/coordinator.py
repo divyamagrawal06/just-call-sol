@@ -1,4 +1,4 @@
-"""Durable orchestration between MCP callers, Sarvam, and agent controls."""
+"""Durable orchestration between MCP callers, voice providers, and agent controls."""
 
 from __future__ import annotations
 
@@ -6,10 +6,9 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
-import json
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -17,6 +16,7 @@ from typing import Any
 from pydantic import JsonValue, SecretStr
 
 from .codex_app_server import SafeThreadController
+from .codex_protocol import ThreadStateError, ThreadWritePlan
 from .contracts import (
     BeginInboundSessionRequest,
     BeginInboundSessionResponse,
@@ -40,15 +40,17 @@ from .contracts import (
     RecordInstructionResponse,
     RepositoryContextQuery,
     RepositoryContextResponse,
-    SarvamRepositoryContextRequest,
     ThreadInspectRequest,
     ThreadListRequest,
+    VoiceRepositoryContextRequest,
 )
 from .fallback_delivery import (
     FallbackNotification,
     FallbackNotifier,
 )
 from .models import (
+    TERMINAL_EVENT_STATES,
+    TERMINAL_SESSION_STATES,
     ActionKind,
     ActionScope,
     ActionState,
@@ -71,35 +73,32 @@ from .models import (
     PendingActionSnapshot,
     PreparedAction,
     ProposedAction,
+    ProviderWebhookPayload,
     RiskLevel,
-    SarvamWebhookPayload,
     SessionState,
     Severity,
     TimelineEntry,
     TimelineKind,
-    TranscriptRole,
-    TranscriptTurn,
     WebhookStatus,
     utc_now,
 )
-from .providers import CallProvider
+from .providers import CallAttempt, CallPlacementOutcomeUnknownError, CallProvider
 from .repository_context import RepositoryContextService
 from .runbooks import RunbookRegistry
-from .sarvam import InstantOutboundWebhook
 from .security import (
     CallerAllowlist,
     ExpiredTokenError,
     ExpiringTokenSigner,
     InvalidTokenError,
     action_hash,
-    redact_secrets,
+    canonical_json,
     sanitize_untrusted_text,
 )
 from .settings import Settings
 from .storage import (
-    ActionAlreadyConsumedError,
     ActiveSessionError,
     DecisionAlreadyExistsError,
+    EventDeadlineExpiredError,
     FallbackLinkError,
     InvalidStateTransitionError,
     NotFoundError,
@@ -142,6 +141,7 @@ _THREAD_STATUS_QUERY_ALIASES: dict[str, frozenset[str]] = {
 }
 _VOICE_THREAD_STATUS_QUERY_LIMIT = 10
 _VOICE_THREAD_QUERY_SCAN_LIMIT = 100
+CallTerminationScheduler = Callable[[ContactSession], Awaitable[None]]
 
 
 class HotlineCoordinator:
@@ -164,93 +164,213 @@ class HotlineCoordinator:
         self.runbooks = runbooks
         self.controller = controller
         self.fallback_notifier = fallback_notifier
+        self._call_termination_scheduler: CallTerminationScheduler | None = None
         self.repository_context = repository_context or RepositoryContextService(
             settings,
             known_secrets=(
-                settings.sarvam_api_key.get_secret_value(),
-                settings.hotline_tool_token.get_secret_value(),
+                settings.openai_api_key.get_secret_value(),
+                settings.openai_webhook_secret.get_secret_value(),
+                settings.twilio_auth_token.get_secret_value(),
                 settings.hotline_local_token.get_secret_value(),
-                settings.hotline_callback_token.get_secret_value(),
+                settings.hotline_sip_correlation_secret.get_secret_value(),
+                settings.hotline_action_signing_secret.get_secret_value(),
+                settings.hotline_fallback_signing_secret.get_secret_value(),
                 settings.owner_confirmation_pin.get_secret_value(),
                 settings.hotline_fallback_webhook_token.get_secret_value(),
             ),
         )
-        signing_secret = (
-            settings.hotline_callback_token.get_secret_value()
-            or settings.hotline_tool_token.get_secret_value()
-            or settings.hotline_fallback_webhook_token.get_secret_value()
-        )
-        if len(signing_secret) < 16:
+        action_signing_secret = settings.hotline_action_signing_secret.get_secret_value()
+        if len(action_signing_secret) < 16:
             # This branch is useful for isolated unit tests. Production startup
-            # rejects empty public tokens before any tool route can be reached.
-            signing_secret = "development-only-hotline-signing-key"
-        self._signer = ExpiringTokenSigner(signing_secret, max_ttl_seconds=300)
+            # rejects an incomplete Realtime configuration before any call is accepted.
+            action_signing_secret = "development-only-action-signing-key"
+        fallback_signing_secret = settings.hotline_fallback_signing_secret.get_secret_value()
+        if len(fallback_signing_secret) < 16:
+            fallback_signing_secret = "development-only-fallback-signing-key"
+        self._signer = ExpiringTokenSigner(action_signing_secret, max_ttl_seconds=300)
         self._fallback_signer = ExpiringTokenSigner(
-            signing_secret,
+            fallback_signing_secret,
             issuer="agent-hotline-fallback",
             max_ttl_seconds=settings.hotline_fallback_ttl_seconds,
         )
         self._waiters: dict[str, asyncio.Event] = {}
-        self._demo_action_locks: dict[str, asyncio.Lock] = {}
+        self._action_execution_locks: dict[str, asyncio.Lock] = {}
+        self._placement_link_barriers: set[asyncio.Event] = set()
+
+    def bind_call_termination_scheduler(
+        self,
+        scheduler: CallTerminationScheduler,
+    ) -> None:
+        """Route call teardown through the Realtime manager's durable queue."""
+
+        self._call_termination_scheduler = scheduler
 
     async def contact_human(self, request: ContactHumanRequest) -> ContactHumanResult:
+        started = await self.start_contact_human(request)
+        if not request.wait_for_decision or started.status in {
+            "resolved",
+            "deferred",
+            "no_answer",
+            "busy",
+            "failed",
+            "timed_out",
+        }:
+            return started
+        result = await self._wait_for_result(started.event_id)
+        if result is not None:
+            return result
+        return await self._expire_unresolved_event(started.event_id)
+
+    async def start_contact_human(
+        self,
+        request: ContactHumanRequest,
+    ) -> ContactHumanResult:
+        """Persist and originate a call, returning its event ID without awaiting the owner."""
+
         event = self._event_from_request(request)
-        ingested = await self.store.create_event(event)
+        create_event_task = asyncio.create_task(
+            self.store.create_event(event),
+            name=f"agent-hotline-create-event-{event.event_id}",
+        )
+        try:
+            ingested = await asyncio.shield(create_event_task)
+        except asyncio.CancelledError as cancelled:
+            try:
+                ingested = await create_event_task
+            except BaseException:
+                raise cancelled from None
+            if ingested.created:
+                cleanup_task = asyncio.create_task(
+                    self._terminalize_aborted_contact_start(
+                        ingested.event.event_id,
+                        session_id=None,
+                        reason="contact_start_cancelled",
+                        failure_reason="contact start was cancelled",
+                    ),
+                    name=f"agent-hotline-create-event-cleanup-{event.event_id}",
+                )
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    with contextlib.suppress(Exception):
+                        await cleanup_task
+            raise cancelled
         event = ingested.event
 
         if not ingested.created:
-            if request.wait_for_decision:
-                resolved = await self._wait_for_result(
-                    event.event_id,
-                    timeout_seconds=request.timeout_seconds,
-                )
-                if resolved is not None:
-                    return resolved
             return await self._result_for_event(event.event_id, duplicate=True)
 
-        await self.store.save_snapshot(self._snapshot_from_request(event, request))
-        await self.store.transition_event(event.event_id, EventState.QUEUED)
-        session = ContactSession(
-            event_id=event.event_id,
-            direction=ContactDirection.OUTBOUND_ESCALATION,
-            state=SessionState.PENDING,
-        )
+        session: ContactSession | None = None
+        attempt: CallAttempt | None = None
+        placement_task: asyncio.Task[CallAttempt] | None = None
+        placement_link_barrier: asyncio.Event | None = None
         try:
-            session = await self.store.create_session(session)
-        except ActiveSessionError as exc:
-            await self.store.transition_event(
-                event.event_id,
-                EventState.FAILED,
-                details={"reason": "owner_channel_busy"},
-            )
-            return ContactHumanResult(
+            await self.store.save_snapshot(self._snapshot_from_request(event, request))
+            await self.store.transition_event(event.event_id, EventState.QUEUED)
+            if event.deadline_at is not None and utc_now() >= event.deadline_at:
+                await self.store.transition_event(
+                    event.event_id,
+                    EventState.EXPIRED,
+                    details={"reason": "decision_deadline_elapsed_before_dial"},
+                )
+                return await self._result_for_event(event.event_id)
+            session = ContactSession(
                 event_id=event.event_id,
-                status="failed",
-                outcome="none",
-                channel="none",
-                failure_reason=str(exc),
-                created_at=event.detected_at,
+                direction=ContactDirection.OUTBOUND_ESCALATION,
+                state=SessionState.PENDING,
+                provider=_conversation_provider(settings=self.settings),
             )
+            try:
+                session = await self.store.create_session(session)
+            except ActiveSessionError as exc:
+                await self.store.transition_event(
+                    event.event_id,
+                    EventState.FAILED,
+                    details={"reason": "owner_channel_busy"},
+                )
+                return ContactHumanResult(
+                    event_id=event.event_id,
+                    status="failed",
+                    outcome="none",
+                    channel="none",
+                    failure_reason=str(exc),
+                    created_at=event.detected_at,
+                )
 
-        await self.store.transition_event(event.event_id, EventState.DIALING)
-        await self.store.transition_session(session.session_id, SessionState.DIALING)
-        try:
-            attempt = await self.provider.place_call(event.event_id, request)
-            session = await self.store.link_attempt(session.session_id, attempt.attempt_id)
+            await self.store.transition_event(event.event_id, EventState.DIALING)
+            session = await self.store.transition_session(
+                session.session_id,
+                SessionState.DIALING,
+            )
+            placement_link_barrier = asyncio.Event()
+            self._placement_link_barriers.add(placement_link_barrier)
+            placement_task = asyncio.create_task(
+                self.provider.place_call(event.event_id, request),
+                name=f"agent-hotline-place-call-{event.event_id}",
+            )
+            try:
+                attempt = await asyncio.shield(placement_task)
+            except CallPlacementOutcomeUnknownError:
+                logger.warning(
+                    "Carrier call creation outcome is unknown event_id=%s; "
+                    "awaiting signed callback",
+                    event.event_id,
+                )
+                latest_event = await self.store.require_event(event.event_id)
+                latest_session = (
+                    await self.store.get_session(session.session_id)
+                    if session is not None
+                    else None
+                )
+                if latest_event.state in TERMINAL_EVENT_STATES or (
+                    latest_session is not None and latest_session.state in TERMINAL_SESSION_STATES
+                ):
+                    return await self._result_for_event(event.event_id)
+                if latest_event.deadline_at is not None and utc_now() >= latest_event.deadline_at:
+                    return await self._expire_unresolved_event(event.event_id)
+                return ContactHumanResult(
+                    event_id=event.event_id,
+                    status="calling",
+                    outcome="none",
+                    channel="voice",
+                    failure_reason=(
+                        "The carrier may have created the call but did not return its "
+                        "identifier. The daemon is waiting for the signed status callback."
+                    ),
+                    created_at=event.detected_at,
+                )
+            session = await self.store.link_attempt(
+                session.session_id,
+                attempt.attempt_id,
+                require_active=True,
+            )
         except Exception as exc:
             safe_detail = self._sanitize(str(exc), 400)
             reason = f"{type(exc).__name__}: {safe_detail}"
-            await self.store.transition_session(
-                session.session_id,
-                SessionState.FAILED,
-                failure_reason=reason,
+            if attempt is not None:
+                await self._cleanup_aborted_contact_start(
+                    event_id=event.event_id,
+                    session=session,
+                    attempt=attempt,
+                    placement_task=placement_task,
+                    reason="provider_failure",
+                    failure_reason=reason,
+                )
+            else:
+                await self._terminalize_aborted_contact_start(
+                    event.event_id,
+                    session_id=session.session_id if session is not None else None,
+                    reason="provider_failure",
+                    failure_reason=reason,
+                )
+            latest_event = await self.store.get_event(event.event_id)
+            latest_session = (
+                await self.store.get_session(session.session_id) if session is not None else None
             )
-            await self.store.transition_event(
-                event.event_id,
-                EventState.FAILED,
-                details={"reason": "provider_failure"},
-            )
-            self._signal(event.event_id)
+            if (latest_event is not None and latest_event.state in TERMINAL_EVENT_STATES) or (
+                latest_session is not None and latest_session.state in TERMINAL_SESSION_STATES
+            ):
+                return await self._result_for_event(event.event_id)
             return ContactHumanResult(
                 event_id=event.event_id,
                 status="failed",
@@ -259,28 +379,134 @@ class HotlineCoordinator:
                 failure_reason=reason,
                 created_at=event.detected_at,
             )
-
-        if not request.wait_for_decision:
-            return ContactHumanResult(
-                event_id=event.event_id,
-                status="calling",
-                attempt_id=session.attempt_id,
-                created_at=event.detected_at,
+        except BaseException:
+            cleanup_task = asyncio.create_task(
+                self._cleanup_aborted_contact_start(
+                    event_id=event.event_id,
+                    session=session,
+                    attempt=attempt,
+                    placement_task=placement_task,
+                    reason="contact_start_cancelled",
+                    failure_reason="contact start was cancelled",
+                ),
+                name=f"agent-hotline-aborted-call-cleanup-{event.event_id}",
             )
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                with contextlib.suppress(Exception):
+                    await cleanup_task
+            except Exception as cleanup_exc:
+                logger.error(
+                    "Cancelled call-start cleanup failed error_type=%s",
+                    type(cleanup_exc).__name__,
+                )
+            raise
+        finally:
+            if placement_link_barrier is not None:
+                placement_link_barrier.set()
+                self._placement_link_barriers.discard(placement_link_barrier)
 
-        result = await self._wait_for_result(
-            event.event_id,
-            timeout_seconds=request.timeout_seconds,
-        )
-        if result is not None:
-            return result
+        assert session is not None
         return ContactHumanResult(
             event_id=event.event_id,
-            status="timed_out",
-            outcome="none",
+            status="calling",
             attempt_id=session.attempt_id,
             created_at=event.detected_at,
         )
+
+    async def _cleanup_aborted_contact_start(
+        self,
+        *,
+        event_id: str,
+        session: ContactSession | None,
+        attempt: CallAttempt | None,
+        placement_task: asyncio.Task[CallAttempt] | None,
+        reason: str,
+        failure_reason: str,
+    ) -> None:
+        """Classify cancellation across non-idempotent placement, then fail closed."""
+
+        outcome_unknown = False
+        if attempt is None and placement_task is not None:
+            try:
+                attempt = await placement_task
+            except CallPlacementOutcomeUnknownError:
+                outcome_unknown = True
+            except BaseException:
+                attempt = None
+        if attempt is None and session is not None:
+            persisted = await self.store.get_session(session.session_id)
+            if persisted is not None:
+                session = persisted
+                if persisted.attempt_id is not None:
+                    attempt = CallAttempt(
+                        attempt_id=persisted.attempt_id,
+                        provider=persisted.provider,
+                    )
+        if attempt is None and outcome_unknown:
+            logger.warning(
+                "Cancelled call start has an unknown carrier outcome event_id=%s; "
+                "retaining callback correlation until lifecycle expiry",
+                event_id,
+            )
+            return
+        if attempt is not None and session is not None:
+            persisted = await self.store.get_session(session.session_id)
+            if persisted is not None and persisted.attempt_id is None:
+                try:
+                    persisted = await self.store.link_attempt(
+                        persisted.session_id,
+                        attempt.attempt_id,
+                    )
+                except Exception:
+                    persisted = persisted.model_copy(
+                        update={"attempt_id": attempt.attempt_id},
+                    )
+            if persisted is not None:
+                session = persisted
+            else:
+                session = session.model_copy(
+                    update={"attempt_id": attempt.attempt_id},
+                )
+            if self._call_termination_scheduler is not None:
+                await self._call_termination_scheduler(session)
+            else:
+                with contextlib.suppress(Exception):
+                    await self.provider.terminate_call(attempt.attempt_id)
+        await self._terminalize_aborted_contact_start(
+            event_id,
+            session_id=session.session_id if session is not None else None,
+            reason=reason,
+            failure_reason=failure_reason,
+        )
+
+    async def _terminalize_aborted_contact_start(
+        self,
+        event_id: str,
+        *,
+        session_id: str | None,
+        reason: str,
+        failure_reason: str,
+    ) -> None:
+        if session_id is not None:
+            session = await self.store.get_session(session_id)
+            if session is not None and session.state not in TERMINAL_SESSION_STATES:
+                with contextlib.suppress(InvalidStateTransitionError):
+                    await self.store.transition_session(
+                        session.session_id,
+                        SessionState.FAILED,
+                        failure_reason=failure_reason,
+                    )
+        event = await self.store.get_event(event_id)
+        if event is not None and event.state not in TERMINAL_EVENT_STATES:
+            with contextlib.suppress(InvalidStateTransitionError):
+                await self.store.transition_event(
+                    event.event_id,
+                    EventState.FAILED,
+                    details={"reason": reason},
+                )
+        self._signal(event_id)
 
     async def list_events(self, limit: int = 20) -> list[EventSummary]:
         events = await self.store.list_events(limit=limit)
@@ -316,6 +542,11 @@ class HotlineCoordinator:
             "decision": decision.model_dump(mode="json") if decision else None,
             "timeline": [item.model_dump(mode="json") for item in timeline],
         }
+
+    async def get_result(self, event_id: str) -> ContactHumanResult:
+        """Return the current structured outcome for post-restart agent recovery."""
+
+        return await self._result_for_event(event_id)
 
     async def escalation_context(
         self, request: EscalationContextRequest
@@ -412,12 +643,18 @@ class HotlineCoordinator:
             raise PermissionError("owner second-factor verification failed")
         for action_id in request.approved_action_ids:
             action = await self.store.get_action(action_id)
-            if (
-                action is None
-                or action.event_id != event.event_id
-                or action.state.value != "confirmed"
-            ):
+            if action is None or action.event_id != event.event_id:
                 raise ValueError(f"action {action_id!r} is not confirmed for this event")
+            execution = await self.store.get_action_execution(action_id)
+            execution_succeeded = (
+                execution is not None and execution.kind is TimelineKind.ACTION_EXECUTION_SUCCEEDED
+            )
+            if action.state is not ActionState.CONFIRMED and not (
+                action.state is ActionState.CONSUMED and execution_succeeded
+            ):
+                raise ValueError(
+                    f"action {action_id!r} is neither confirmed nor successfully executed"
+                )
         decision = Decision(
             event_id=event.event_id,
             session_id=session_id,
@@ -430,6 +667,10 @@ class HotlineCoordinator:
         )
         try:
             decision = await self.store.record_decision(decision)
+        except EventDeadlineExpiredError as exc:
+            await self._terminate_expired_event_sessions(event.event_id)
+            self._signal(event.event_id)
+            raise PermissionError("the event decision deadline has elapsed") from exc
         except DecisionAlreadyExistsError:
             existing = await self.store.get_decision(event.event_id)
             if existing is None:
@@ -454,24 +695,49 @@ class HotlineCoordinator:
         event = await self.store.require_event(request.event_id)
         session_id = await self._require_live_voice_session(event)
         expires_at = utc_now() + timedelta(minutes=2)
+        if event.deadline_at is not None:
+            expires_at = min(expires_at, event.deadline_at)
         resolved_workspace = request.workspace_ref or event.workspace
         resolved_thread_id = request.thread_id or event.thread_id
-        scope_bindings = {
-            "event_id": event.event_id,
-            "host_id": event.host_id,
-            "workspace": resolved_workspace,
-            "thread_id": resolved_thread_id,
-            "state_hash": request.commit_or_state_hash,
-        }
         if request.action_type in _THREAD_ACTIONS:
+            if not self.settings.hotline_allow_codex_writes:
+                raise PermissionError(
+                    "Codex task writes are disabled by HOTLINE_ALLOW_CODEX_WRITES"
+                )
             kind, risk = _THREAD_ACTIONS[request.action_type]
             parameters = _validate_thread_parameters(request.action_type, request.parameters)
+            (
+                parameters,
+                resolved_workspace,
+                resolved_thread_id,
+                resolved_state_hash,
+            ) = await self._bind_thread_action(
+                request.action_type,
+                parameters,
+                requested_workspace=resolved_workspace,
+                requested_thread_id=resolved_thread_id,
+            )
+            scope_bindings = {
+                "event_id": event.event_id,
+                "host_id": event.host_id,
+                "workspace": resolved_workspace,
+                "thread_id": resolved_thread_id,
+                "state_hash": resolved_state_hash,
+            }
             digest = action_hash(
                 request.action_type,
                 parameters,
                 bindings=scope_bindings,
             )
-            impact = _thread_action_impact(request.action_type, parameters)
+            impact = _thread_action_impact(
+                request.action_type,
+                parameters,
+                workspace=resolved_workspace,
+                thread_id=resolved_thread_id,
+                state_hash=resolved_state_hash,
+                expires_at=expires_at,
+                risk=risk,
+            )
         else:
             preview = self.runbooks.preview(request.action_type, request.parameters)
             kind = ActionKind.REGISTERED_RUNBOOK
@@ -479,6 +745,13 @@ class HotlineCoordinator:
             parameters = {
                 "input": preview.normalized_parameters,
                 "runbook_action_hash": preview.action_hash,
+            }
+            scope_bindings = {
+                "event_id": event.event_id,
+                "host_id": event.host_id,
+                "workspace": resolved_workspace,
+                "thread_id": resolved_thread_id,
+                "state_hash": None,
             }
             digest = action_hash(
                 "registered_runbook",
@@ -488,7 +761,18 @@ class HotlineCoordinator:
                     "runbook_action_hash": preview.action_hash,
                 },
             )
-            impact = preview.impact
+            impact = _runbook_action_impact(
+                preview.impact,
+                parameters=preview.normalized_parameters,
+                execution_mode=preview.execution_mode.value,
+                rollback_guidance=preview.rollback_guidance,
+                workspace=resolved_workspace,
+                thread_id=resolved_thread_id,
+                state_hash=None,
+                expires_at=expires_at,
+                risk=risk,
+            )
+            resolved_state_hash = None
 
         # The phrase is derived from the immutable action hash, so a changed
         # target or parameter set necessarily requires a new readback.
@@ -503,7 +787,7 @@ class HotlineCoordinator:
                 host_id=event.host_id,
                 workspace=resolved_workspace,
                 thread_id=resolved_thread_id,
-                commit=request.commit_or_state_hash,
+                commit=resolved_state_hash,
             ),
             risk=risk,
             action_hash=digest,
@@ -511,10 +795,7 @@ class HotlineCoordinator:
             requires_confirmation=True,
             expires_at=expires_at,
         )
-        prepared = await self.store.prepare_action(
-            prepared,
-            dedupe_consumed=self.settings.hotline_demo_auto_execute_actions,
-        )
+        prepared = await self.store.prepare_action(prepared)
         nonce = self._signer.issue_nonce(
             subject=prepared.action_id,
             action_hash=prepared.action_hash,
@@ -524,12 +805,6 @@ class HotlineCoordinator:
             ),
             claims={"event_id": event.event_id},
         )
-        if self.settings.hotline_demo_auto_execute_actions:
-            return await self._demo_auto_execute_prepared_action(
-                prepared,
-                nonce=nonce,
-                impact=impact,
-            )
         return PrepareActionResponse(
             action_id=prepared.action_id,
             action_hash=prepared.action_hash,
@@ -539,243 +814,78 @@ class HotlineCoordinator:
             expires_at=prepared.expires_at,
         )
 
-    async def _demo_auto_execute_prepared_action(
+    async def _bind_thread_action(
         self,
-        prepared: PreparedAction,
+        action_type: str,
+        parameters: dict[str, JsonValue],
         *,
-        nonce: str,
-        impact: str,
-    ) -> PrepareActionResponse:
-        lock = self._demo_action_locks.setdefault(prepared.action_id, asyncio.Lock())
-        async with lock:
-            action = await self.store.get_action(prepared.action_id)
-            if action is None:
-                raise NotFoundError(f"action {prepared.action_id!r} does not exist")
+        requested_workspace: str | None,
+        requested_thread_id: str | None,
+    ) -> tuple[dict[str, JsonValue], str | None, str | None, str | None]:
+        controller = self.controller
+        if controller is None:
+            raise PermissionError("Codex task control is not configured")
 
-            receipt = await self.store.get_action_execution(action.action_id)
-            if receipt is not None and (receipt.kind is TimelineKind.ACTION_EXECUTION_SUCCEEDED):
-                grant = await self.store.get_grant_for_action(action.action_id)
-                return self._demo_execution_receipt_response(
-                    action,
-                    receipt,
-                    nonce=nonce,
-                    impact=impact,
-                    grant_id=grant.grant_id if grant is not None else None,
-                    already_executed=True,
-                )
+        if action_type == "thread.spawn_root":
+            if requested_thread_id is not None:
+                raise ValueError("spawning a root task cannot be bound to an existing thread")
+            cwd = controller.canonicalize_workspace(str(parameters["cwd"]))
+            if requested_workspace is not None and not _same_workspace(requested_workspace, cwd):
+                raise PermissionError("spawn workspace does not match the requested action scope")
+            task = self._sanitize(str(parameters["task"]), 2000)
+            return {"task": task, "cwd": cwd}, cwd, None, None
 
-            if action.state is ActionState.CONSUMED:
-                return await self._demo_consumed_action_response(
-                    action,
-                    receipt=receipt,
-                    nonce=nonce,
-                    impact=impact,
-                )
-
-            if receipt is not None and (receipt.kind is TimelineKind.ACTION_EXECUTION_FAILED):
-                retryable = receipt.details.get("retryable") is True
-                if not retryable or action.state is not ActionState.CONFIRMED:
-                    grant = await self.store.get_grant_for_action(action.action_id)
-                    return self._demo_execution_receipt_response(
-                        action,
-                        receipt,
-                        nonce=nonce,
-                        impact=impact,
-                        grant_id=grant.grant_id if grant is not None else None,
-                        already_executed=False,
-                    )
-
-            if action.state is ActionState.PREPARED:
-                try:
-                    grant = await self.store.confirm_action(
-                        action.action_id,
-                        owner_ref="owner_demo_auto_execute",
-                        confirmation_method=ConfirmationMethod.TRUSTED_LOCAL,
-                        confirmation_hash=action.confirmation_phrase_hash,
-                    )
-                except ActionAlreadyConsumedError:
-                    current = await self.store.get_action(action.action_id)
-                    if current is None:
-                        raise NotFoundError(f"action {action.action_id!r} does not exist") from None
-                    return await self._demo_consumed_action_response(
-                        current,
-                        receipt=await self.store.get_action_execution(action.action_id),
-                        nonce=nonce,
-                        impact=impact,
-                    )
-            elif action.state is ActionState.CONFIRMED:
-                grant = await self.store.get_grant_for_action(action.action_id)
-                if grant is None:
-                    raise RuntimeError("confirmed demo action has no durable grant")
-            else:
-                message = (
-                    f"This demo action is {action.state.value} and cannot be executed. "
-                    "No action was run."
-                )
-                return PrepareActionResponse(
-                    action_id=action.action_id,
-                    action_hash=action.action_hash,
-                    confirmation_nonce=nonce,
-                    risk=_contract_risk(action.risk.value),
-                    exact_readback=f"{impact} {message}",
-                    expires_at=action.expires_at,
-                    message_to_user=message,
-                    result={"status": action.state.value, "retryable": False},
-                )
-
-            try:
-                execution = await self.execute_action(
-                    ExecuteActionRequest(
-                        event_id=action.event_id,
-                        action_id=action.action_id,
-                        grant_id=grant.grant_id,
-                    )
-                )
-            except ActionAlreadyConsumedError:
-                current = await self.store.get_action(action.action_id)
-                if current is None:
-                    raise NotFoundError(f"action {action.action_id!r} does not exist") from None
-                return await self._demo_consumed_action_response(
-                    current,
-                    receipt=await self.store.get_action_execution(action.action_id),
-                    nonce=nonce,
-                    impact=impact,
-                )
-            except Exception as exc:
-                current = await self.store.get_action(action.action_id)
-                if current is None:
-                    raise NotFoundError(f"action {action.action_id!r} does not exist") from exc
-                retryable = current.state is ActionState.CONFIRMED
-                if retryable:
-                    message = (
-                        "Demo action execution failed before its one-time grant was "
-                        "consumed. The same prepared action can be retried safely."
-                    )
-                else:
-                    message = (
-                        "Demo action execution failed after its one-time grant was "
-                        "claimed. It will not be retried automatically, preventing a "
-                        "duplicate action."
-                    )
-                result: dict[str, Any] = {
-                    "status": "failed",
-                    "retryable": retryable,
-                    "error_type": type(exc).__name__,
-                }
-                logger.warning(
-                    "demo_auto_execution_failed action_id=%s retryable=%s error_type=%s",
-                    current.action_id,
-                    retryable,
-                    type(exc).__name__,
-                )
-                receipt = await self.store.record_action_execution(
-                    current.action_id,
-                    succeeded=False,
-                    message_to_user=message,
-                    result=result,
-                    retryable=retryable,
-                )
-                return self._demo_execution_receipt_response(
-                    current,
-                    receipt,
-                    nonce=nonce,
-                    impact=impact,
-                    grant_id=grant.grant_id,
-                    already_executed=False,
-                )
-
-            receipt = await self.store.record_action_execution(
-                action.action_id,
-                succeeded=True,
-                message_to_user=execution.message_to_user,
-                operation_id=execution.operation_id,
-                result=execution.result,
+        reference = str(parameters["reference"])
+        if action_type == "thread.instruct":
+            plan = await controller.prepare_instruction(
+                reference,
+                self._sanitize(str(parameters["instruction"]), 2000),
             )
-            return self._demo_execution_receipt_response(
-                action,
-                receipt,
-                nonce=nonce,
-                impact=impact,
-                grant_id=execution.grant_id,
-                already_executed=False,
+            if requested_thread_id is not None and requested_thread_id != plan.thread_id:
+                raise PermissionError(
+                    "resolved Codex task does not match the requested action scope"
+                )
+            if requested_workspace is not None and not _same_workspace(
+                requested_workspace,
+                plan.cwd,
+            ):
+                raise PermissionError(
+                    "resolved Codex task moved outside the requested workspace scope"
+                )
+            bound: dict[str, JsonValue] = {
+                "thread_id": plan.thread_id,
+                "cwd": plan.cwd,
+                "operation": plan.operation,
+                "turn_id": plan.turn_id,
+                "state_fingerprint": plan.state_fingerprint,
+                "instruction": plan.instruction,
+            }
+            return bound, plan.cwd, plan.thread_id, plan.state_fingerprint
+        if action_type == "thread.interrupt":
+            supplied_turn = parameters.get("turn_id")
+            candidate, turn_id = await controller.resolve_interrupt_target(
+                reference,
+                turn_id=str(supplied_turn) if supplied_turn is not None else None,
             )
+            bound: dict[str, JsonValue] = {
+                "thread_id": candidate.thread_id,
+                "turn_id": turn_id,
+            }
+        else:
+            candidate = await controller.resolve_thread(reference)
+            confirmed_thread_id = str(parameters["confirmed_thread_id"])
+            if confirmed_thread_id != candidate.thread_id:
+                raise PermissionError("archive confirmation does not match the resolved Codex task")
+            bound = {"thread_id": candidate.thread_id}
 
-    async def _demo_consumed_action_response(
-        self,
-        prepared: PreparedAction,
-        *,
-        receipt: TimelineEntry | None,
-        nonce: str,
-        impact: str,
-    ) -> PrepareActionResponse:
-        grant = await self.store.get_grant_for_action(prepared.action_id)
-        grant_id = grant.grant_id if grant is not None else None
-        if receipt is not None:
-            return self._demo_execution_receipt_response(
-                prepared,
-                receipt,
-                nonce=nonce,
-                impact=impact,
-                grant_id=grant_id,
-                already_executed=(receipt.kind is TimelineKind.ACTION_EXECUTION_SUCCEEDED),
-            )
-
-        message = (
-            "This exact action's one-time grant was already claimed, but no durable "
-            "completion receipt is available. It was not retried, preventing a "
-            "duplicate action."
-        )
-        return PrepareActionResponse(
-            action_id=prepared.action_id,
-            action_hash=prepared.action_hash,
-            confirmation_nonce=nonce,
-            risk=_contract_risk(prepared.risk.value),
-            exact_readback=f"{impact} {message}",
-            expires_at=prepared.expires_at,
-            executed=False,
-            already_executed=False,
-            grant_id=grant_id,
-            message_to_user=message,
-            result={"status": "outcome_unknown", "retryable": False},
-        )
-
-    @staticmethod
-    def _demo_execution_receipt_response(
-        prepared: PreparedAction,
-        receipt: TimelineEntry,
-        *,
-        nonce: str,
-        impact: str,
-        grant_id: str | None,
-        already_executed: bool,
-    ) -> PrepareActionResponse:
-        succeeded = receipt.kind is TimelineKind.ACTION_EXECUTION_SUCCEEDED
-        stored_message = receipt.details.get("message_to_user")
-        message = (
-            stored_message
-            if isinstance(stored_message, str)
-            else (
-                "The demo action completed." if succeeded else "The demo action did not complete."
-            )
-        )
-        stored_operation_id = receipt.details.get("operation_id")
-        operation_id = stored_operation_id if isinstance(stored_operation_id, str) else None
-        stored_result = receipt.details.get("result")
-        result = dict(stored_result) if isinstance(stored_result, dict) else {}
-        return PrepareActionResponse(
-            action_id=prepared.action_id,
-            action_hash=prepared.action_hash,
-            confirmation_nonce=nonce,
-            risk=_contract_risk(prepared.risk.value),
-            exact_readback=f"{impact} {message}",
-            expires_at=prepared.expires_at,
-            executed=succeeded,
-            already_executed=succeeded and already_executed,
-            grant_id=grant_id,
-            operation_id=operation_id,
-            message_to_user=message,
-            result=result,
-        )
+        if requested_thread_id is not None and requested_thread_id != candidate.thread_id:
+            raise PermissionError("resolved Codex task does not match the requested action scope")
+        if requested_workspace is not None and not _same_workspace(
+            requested_workspace,
+            candidate.cwd,
+        ):
+            raise PermissionError("resolved Codex task moved outside the requested workspace scope")
+        return bound, candidate.cwd, candidate.thread_id, None
 
     async def confirm_action(self, request: ConfirmActionRequest) -> ConfirmActionResponse:
         action = await self.store.get_action(request.action_id)
@@ -822,51 +932,138 @@ class HotlineCoordinator:
         )
 
     async def execute_action(self, request: ExecuteActionRequest) -> ExecuteActionResponse:
-        action = await self.store.get_action(request.action_id)
-        if action is None or action.event_id != request.event_id:
-            raise NotFoundError("prepared action does not match this event")
-        if action.kind is not ActionKind.REGISTERED_RUNBOOK and self.controller is None:
-            raise RuntimeError("Codex thread control is unavailable")
-        event = await self.store.require_event(action.event_id)
-        await self._require_live_voice_session(
-            event,
-            expected_session_id=action.session_id,
-        )
-        await self.store.consume_action(
-            request.grant_id,
-            action_hash=action.action_hash,
-        )
-        if action.kind is ActionKind.REGISTERED_RUNBOOK:
-            inputs = action.parameters.get("input")
-            runbook_hash = action.parameters.get("runbook_action_hash")
-            if not isinstance(inputs, dict) or not isinstance(runbook_hash, str):
-                raise RuntimeError("prepared runbook action is malformed")
-            execution = self.runbooks.execute(
-                action.target,
-                inputs,
-                confirmed_action_hash=runbook_hash,
+        lock = self._action_execution_locks.setdefault(request.action_id, asyncio.Lock())
+        async with lock:
+            action = await self.store.get_action(request.action_id)
+            if action is None or action.event_id != request.event_id:
+                raise NotFoundError("prepared action does not match this event")
+            grant = await self.store.get_grant_for_action(action.action_id)
+            if grant is None or grant.grant_id != request.grant_id:
+                raise NotFoundError("action grant does not match this prepared action")
+            existing = await self.store.get_action_execution(action.action_id)
+            if existing is not None:
+                return _execution_response(action, request.grant_id, existing)
+            if action.state is ActionState.CONSUMED:
+                receipt = await self.store.record_action_execution(
+                    action.action_id,
+                    succeeded=None,
+                    message_to_user=(
+                        "The prior action attempt has an unknown outcome and will not be "
+                        "retried automatically."
+                    ),
+                    operation_id=f"action-{action.action_id}",
+                    retryable=False,
+                )
+                return _execution_response(action, request.grant_id, receipt)
+            if action.kind is not ActionKind.REGISTERED_RUNBOOK and self.controller is None:
+                raise RuntimeError("Codex thread control is unavailable")
+            event = await self.store.require_event(action.event_id)
+            await self._require_live_voice_session(
+                event,
+                expected_session_id=action.session_id,
             )
-            return ExecuteActionResponse(
-                executed=True,
-                action_id=action.action_id,
-                grant_id=request.grant_id,
-                operation_id=execution.operation_id,
-                message_to_user=execution.message,
-                result=execution.model_dump(mode="json"),
+            expected_hash = _prepared_action_hash(action)
+            if not hmac.compare_digest(expected_hash, action.action_hash):
+                raise PermissionError("prepared action content no longer matches its hash")
+            await self.store.consume_action(
+                request.grant_id,
+                action_hash=action.action_hash,
             )
 
-        result = await self._execute_thread_action(action)
-        return ExecuteActionResponse(
-            executed=True,
-            action_id=action.action_id,
-            grant_id=request.grant_id,
-            operation_id=f"codex-{action.action_id}",
-            message_to_user=f"Codex thread action completed: {result['action']}.",
-            result=result,
-        )
+            try:
+                if action.kind is ActionKind.REGISTERED_RUNBOOK:
+                    inputs = action.parameters.get("input")
+                    runbook_hash = action.parameters.get("runbook_action_hash")
+                    if not isinstance(inputs, dict) or not isinstance(runbook_hash, str):
+                        raise RuntimeError("prepared runbook action is malformed")
+                    definition = self.runbooks.get(action.target)
+                    async with asyncio.timeout(definition.maximum_execution_seconds):
+                        execution = await asyncio.to_thread(
+                            self.runbooks.execute,
+                            action.target,
+                            inputs,
+                            confirmed_action_hash=runbook_hash,
+                        )
+                    operation_id = execution.operation_id
+                    message = execution.message
+                    result = execution.model_dump(mode="json")
+                else:
+                    result = await self._execute_thread_action(action)
+                    operation_id = f"codex-{action.action_id}"
+                    message = f"Codex task action completed: {result['action']}."
+            except ThreadStateError as exc:
+                receipt = await self.store.record_action_execution(
+                    action.action_id,
+                    succeeded=False,
+                    message_to_user=self._sanitize(str(exc), 500),
+                    operation_id=f"codex-{action.action_id}",
+                    retryable=False,
+                )
+                return _execution_response(action, request.grant_id, receipt)
+            except Exception as exc:
+                logger.warning(
+                    "Action execution outcome is ambiguous action_id=%s error_type=%s",
+                    action.action_id,
+                    type(exc).__name__,
+                )
+                receipt = await self.store.record_action_execution(
+                    action.action_id,
+                    succeeded=None,
+                    message_to_user=(
+                        "The action result could not be confirmed and will not be retried "
+                        "automatically."
+                    ),
+                    operation_id=f"action-{action.action_id}",
+                    retryable=False,
+                )
+                return _execution_response(action, request.grant_id, receipt)
+
+            receipt = await self.store.record_action_execution(
+                action.action_id,
+                succeeded=True,
+                message_to_user=message,
+                operation_id=operation_id,
+                result=result,
+                retryable=False,
+            )
+            return _execution_response(action, request.grant_id, receipt)
+
+    async def reconcile_timed_out_action(
+        self,
+        request: ExecuteActionRequest,
+    ) -> ExecuteActionResponse | None:
+        """Persist an unknown result if cancellation crossed grant consumption."""
+
+        lock = self._action_execution_locks.setdefault(request.action_id, asyncio.Lock())
+        async with lock:
+            action = await self.store.get_action(request.action_id)
+            if action is None or action.event_id != request.event_id:
+                return None
+            grant = await self.store.get_grant_for_action(action.action_id)
+            if grant is None or grant.grant_id != request.grant_id:
+                return None
+            existing = await self.store.get_action_execution(action.action_id)
+            if existing is not None:
+                return _execution_response(action, request.grant_id, existing)
+            if action.state is not ActionState.CONSUMED:
+                return None
+            receipt = await self.store.record_action_execution(
+                action.action_id,
+                succeeded=None,
+                message_to_user=(
+                    "The action crossed its execution deadline after authorization. "
+                    "Its outcome is unknown and it will not be retried automatically."
+                ),
+                operation_id=f"action-{action.action_id}",
+                retryable=False,
+            )
+            return _execution_response(action, request.grant_id, receipt)
 
     async def begin_inbound_session(
-        self, request: BeginInboundSessionRequest
+        self,
+        request: BeginInboundSessionRequest,
+        *,
+        provider: str = "openai_realtime",
     ) -> BeginInboundSessionResponse:
         configured_numbers = [
             self.settings.owner_phone_number.get_secret_value(),
@@ -911,32 +1108,56 @@ class HotlineCoordinator:
             blocking=False,
             evidence={"caller_allowlisted": True, "direction": "inbound"},
         )
-        created = await self.store.create_event(event)
-        event = created.event
-        await self.store.transition_event(event.event_id, EventState.QUEUED)
-        session = ContactSession(
-            event_id=event.event_id,
-            direction=ContactDirection.INBOUND_CONTROL,
-            state=SessionState.CONNECTED,
-            interaction_id=request.interaction_id,
-        )
+        session: ContactSession | None = None
         try:
-            await self.store.create_session(session)
-        except ActiveSessionError:
-            await self.store.transition_event(
-                event.event_id,
-                EventState.FAILED,
-                details={"reason": "owner_channel_busy"},
+            created = await self.store.create_event(event)
+            event = created.event
+            await self.store.transition_event(event.event_id, EventState.QUEUED)
+            session = ContactSession(
+                event_id=event.event_id,
+                direction=ContactDirection.INBOUND_CONTROL,
+                state=SessionState.CONNECTED,
+                interaction_id=request.interaction_id,
+                provider=provider,
             )
-            return BeginInboundSessionResponse(
-                accepted=False,
-                identity_verified=False,
-                message_to_user=(
-                    "Another owner call is already active. No task data can be disclosed."
+            try:
+                session = await self.store.create_session(session)
+            except ActiveSessionError:
+                await self.store.transition_event(
+                    event.event_id,
+                    EventState.FAILED,
+                    details={"reason": "owner_channel_busy"},
+                )
+                return BeginInboundSessionResponse(
+                    accepted=False,
+                    identity_verified=False,
+                    message_to_user=(
+                        "Another owner call is already active. No task data can be disclosed."
+                    ),
+                )
+            await self.store.transition_event(event.event_id, EventState.DIALING)
+            await self.store.transition_event(event.event_id, EventState.CONNECTED)
+        except BaseException:
+            cleanup_task = asyncio.create_task(
+                self._terminalize_aborted_contact_start(
+                    event.event_id,
+                    session_id=session.session_id if session is not None else None,
+                    reason="inbound_session_start_aborted",
+                    failure_reason="inbound session start was aborted",
                 ),
+                name=f"agent-hotline-inbound-cleanup-{event.event_id}",
             )
-        await self.store.transition_event(event.event_id, EventState.DIALING)
-        await self.store.transition_event(event.event_id, EventState.CONNECTED)
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                with contextlib.suppress(Exception):
+                    await cleanup_task
+            except Exception as cleanup_exc:
+                logger.error(
+                    "Inbound session cleanup failed error_type=%s",
+                    type(cleanup_exc).__name__,
+                )
+            raise
         return BeginInboundSessionResponse(
             accepted=True,
             event_id=event.event_id,
@@ -960,13 +1181,19 @@ class HotlineCoordinator:
             raise RuntimeError("Codex thread control is unavailable")
         query = request.query.strip().casefold() if request.query else None
         status_aliases = _THREAD_STATUS_QUERY_ALIASES.get(query) if query is not None else None
-        candidates = await self.controller.list_candidates(
-            limit=(
-                _VOICE_THREAD_STATUS_QUERY_LIMIT
-                if status_aliases is not None
-                else (_VOICE_THREAD_QUERY_SCAN_LIMIT if query else request.limit)
+        if query is not None and status_aliases is None:
+            candidates = await self.controller.search_candidates(
+                request.query or "",
+                limit=min(request.limit, _VOICE_THREAD_QUERY_SCAN_LIMIT),
             )
-        )
+        else:
+            candidates = await self.controller.list_candidates(
+                limit=(
+                    _VOICE_THREAD_STATUS_QUERY_LIMIT
+                    if status_aliases is not None
+                    else request.limit
+                )
+            )
         if query:
             if status_aliases is not None:
                 candidates = tuple(
@@ -1063,9 +1290,9 @@ class HotlineCoordinator:
 
     async def query_repository_for_voice(
         self,
-        request: SarvamRepositoryContextRequest,
+        request: VoiceRepositoryContextRequest,
     ) -> RepositoryContextResponse:
-        """Serve a live, event-bound Samvaad query without broad filesystem access."""
+        """Serve a live, event-bound voice query without broad filesystem access."""
 
         event = await self.store.require_event(request.event_id)
         sessions = await self.store.list_sessions(event_id=event.event_id, limit=5)
@@ -1242,48 +1469,29 @@ class HotlineCoordinator:
             self._signal(event_id)
         return len(event_ids)
 
-    async def reconcile_webhook(self, payload: InstantOutboundWebhook) -> dict[str, JsonValue]:
-        metadata: dict[str, JsonValue] = {}
-        webhook_config = payload.webhook_config or {}
-        nested_metadata = webhook_config.get("metadata")
-        if isinstance(nested_metadata, dict):
-            metadata = redact_secrets(
-                nested_metadata,
-                known_secrets=self._known_secrets(),
-                redact_phone_numbers=True,
-            )
-        normalized = SarvamWebhookPayload(
-            webhook_id=_provider_webhook_id(payload),
-            attempt_id=payload.attempt_id,
-            interaction_id=payload.interaction_id,
-            status=(
-                WebhookStatus.COMPLETED
-                if payload.status == "connected"
-                else WebhookStatus(payload.status)
-            ),
-            duration_seconds=payload.duration,
-            failure_reason=(
-                self._sanitize(payload.failure_reason, 900) if payload.failure_reason else None
-            ),
-            final_agent_variables=redact_secrets(
-                payload.final_agent_variables or {},
-                known_secrets=self._known_secrets(),
-                redact_phone_numbers=True,
-            ),
-            transcript=[
-                TranscriptTurn(
-                    role=(TranscriptRole.AGENT if turn.role == "agent" else TranscriptRole.OWNER),
-                    text=sanitize_untrusted_text(
-                        turn.en_text,
-                        max_chars=3900,
-                        known_secrets=self._known_secrets(),
-                    ),
-                )
-                for turn in (payload.interaction_transcript or [])
-                if turn.en_text.strip()
-            ],
-            metadata=metadata,
-        )
+    async def expire_prepared_actions(self) -> int:
+        return await self.store.expire_actions()
+
+    async def expire_decision_deadlines(self) -> int:
+        """Expire due events and terminate every still-active carrier session."""
+
+        event_ids = await self.store.expire_due_events()
+        for event_id in event_ids:
+            await self._terminate_expired_event_sessions(event_id)
+            self._signal(event_id)
+        return len(event_ids)
+
+    async def reconcile_provider_completion(
+        self,
+        normalized: ProviderWebhookPayload,
+    ) -> dict[str, JsonValue]:
+        """Apply provider-neutral terminal-call policy after adapter normalization."""
+
+        barriers = tuple(self._placement_link_barriers)
+        if barriers:
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(2):
+                    await asyncio.gather(*(barrier.wait() for barrier in barriers))
         receipt = await self.store.record_webhook(normalized)
         if not receipt.created:
             if receipt.event_id:
@@ -1307,10 +1515,14 @@ class HotlineCoordinator:
                     EventState.RESOLVED,
                 }
             ):
-                fallback_delivered = event.blocking and await self._deliver_secure_fallback(
-                    event,
-                    session_id=receipt.session_id,
-                    reason=f"call_{normalized.status.value}_without_decision",
+                fallback_delivered = (
+                    event.blocking
+                    and event.no_answer_policy is NoAnswerPolicy.TEXT_AND_PAUSE
+                    and await self._deliver_secure_fallback(
+                        event,
+                        session_id=receipt.session_id,
+                        reason=f"call_{normalized.status.value}_without_decision",
+                    )
                 )
                 if not fallback_delivered:
                     final_state = (
@@ -1327,7 +1539,7 @@ class HotlineCoordinator:
                                 "reason": (
                                     "notification_delivered"
                                     if final_state is EventState.RESOLVED
-                                    else f"call_{payload.status}_without_decision"
+                                    else f"call_{normalized.status.value}_without_decision"
                                 )
                             },
                         )
@@ -1391,16 +1603,21 @@ class HotlineCoordinator:
         assert self.controller is not None
         parameters = action.parameters
         if action.target == "thread.instruct":
-            result = await self.controller.send_instruction(
-                str(parameters["reference"]),
-                str(parameters["instruction"]),
+            raw_turn_id = parameters.get("turn_id")
+            result = await self.controller.execute_instruction(
+                ThreadWritePlan(
+                    thread_id=str(parameters["thread_id"]),
+                    cwd=str(parameters["cwd"]),
+                    operation=str(parameters["operation"]),
+                    turn_id=str(raw_turn_id) if raw_turn_id is not None else None,
+                    state_fingerprint=str(parameters["state_fingerprint"]),
+                    instruction=str(parameters["instruction"]),
+                )
             )
         elif action.target == "thread.interrupt":
             result = await self.controller.interrupt(
-                str(parameters["reference"]),
-                turn_id=(
-                    str(parameters["turn_id"]) if parameters.get("turn_id") is not None else None
-                ),
+                str(parameters["thread_id"]),
+                turn_id=str(parameters["turn_id"]),
             )
         elif action.target == "thread.spawn_root":
             result = await self.controller.spawn_root(
@@ -1409,8 +1626,8 @@ class HotlineCoordinator:
             )
         elif action.target == "thread.archive":
             result = await self.controller.archive(
-                str(parameters["reference"]),
-                confirmed_thread_id=str(parameters["confirmed_thread_id"]),
+                str(parameters["thread_id"]),
+                confirmed_thread_id=str(parameters["thread_id"]),
             )
         else:
             raise ValueError("unsupported thread action")
@@ -1423,9 +1640,12 @@ class HotlineCoordinator:
     async def _wait_for_result(
         self,
         event_id: str,
-        *,
-        timeout_seconds: int,
     ) -> ContactHumanResult | None:
+        event = await self.store.require_event(event_id)
+        if event.deadline_at is None:
+            timeout_seconds = self.settings.hotline_decision_timeout_seconds
+        else:
+            timeout_seconds = max(0.0, (event.deadline_at - utc_now()).total_seconds())
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         waiter = self._waiters.setdefault(event_id, asyncio.Event())
         try:
@@ -1437,6 +1657,7 @@ class HotlineCoordinator:
                     "busy",
                     "failed",
                     "deferred",
+                    "timed_out",
                 }:
                     return result
                 remaining = deadline - asyncio.get_running_loop().time()
@@ -1451,6 +1672,75 @@ class HotlineCoordinator:
             if not waiter.is_set():
                 self._waiters.pop(event_id, None)
 
+    async def _expire_unresolved_event(self, event_id: str) -> ContactHumanResult:
+        """Make the decision deadline durable and prevent every later write."""
+
+        existing = await self._result_for_event(event_id)
+        if existing.status in {
+            "resolved",
+            "deferred",
+            "no_answer",
+            "busy",
+            "failed",
+        }:
+            return existing
+        if existing.status != "timed_out":
+            try:
+                await self.store.transition_event(
+                    event_id,
+                    EventState.EXPIRED,
+                    details={"reason": "decision_deadline_elapsed"},
+                )
+            except InvalidStateTransitionError:
+                latest = await self._result_for_event(event_id)
+                if latest.status != "timed_out":
+                    return latest
+        await self._terminate_expired_event_sessions(event_id)
+        self._signal(event_id)
+        return await self._result_for_event(event_id)
+
+    async def _terminate_expired_event_sessions(self, event_id: str) -> None:
+        """Cancel local session state and end carrier legs for an expired event."""
+
+        sessions = await self.store.list_sessions(event_id=event_id, limit=5)
+        for session in sessions:
+            was_active = session.state not in {
+                SessionState.COMPLETED,
+                SessionState.NO_ANSWER,
+                SessionState.BUSY,
+                SessionState.FAILED,
+                SessionState.CANCELLED,
+            }
+            if (
+                was_active
+                and self._call_termination_scheduler is not None
+                and (session.interaction_id is not None or session.attempt_id is not None)
+            ):
+                try:
+                    await self._call_termination_scheduler(session)
+                except Exception as exc:
+                    logger.error(
+                        "Durable call termination scheduling failed error_type=%s",
+                        type(exc).__name__,
+                    )
+                    continue
+            elif was_active and session.attempt_id is not None:
+                try:
+                    await self.provider.terminate_call(session.attempt_id)
+                except Exception as exc:
+                    logger.error(
+                        "Carrier termination after decision deadline failed error_type=%s",
+                        type(exc).__name__,
+                    )
+                    continue
+            if was_active:
+                with contextlib.suppress(InvalidStateTransitionError):
+                    await self.store.transition_session(
+                        session.session_id,
+                        SessionState.CANCELLED,
+                        failure_reason="decision deadline elapsed",
+                    )
+
     async def _result_for_event(
         self,
         event_id: str,
@@ -1462,6 +1752,16 @@ class HotlineCoordinator:
         sessions = await self.store.list_sessions(event_id=event_id, limit=1)
         session = sessions[0] if sessions else None
         if decision is not None:
+            action_results: list[dict[str, Any]] = []
+            for action_id in decision.approved_action_ids:
+                receipt = await self.store.get_action_execution(action_id)
+                if receipt is not None:
+                    action_results.append(
+                        {
+                            "action_id": action_id,
+                            **dict(receipt.details),
+                        }
+                    )
             return ContactHumanResult(
                 event_id=event.event_id,
                 status=("deferred" if decision.outcome is DecisionOutcome.DEFER else "resolved"),
@@ -1469,6 +1769,7 @@ class HotlineCoordinator:
                 instruction=decision.instruction,
                 constraints=decision.constraints,
                 approved_action_ids=decision.approved_action_ids,
+                action_results=action_results,
                 identity_verified=decision.identity_verified,
                 decision_id=decision.decision_id,
                 attempt_id=session.attempt_id if session else None,
@@ -1518,6 +1819,17 @@ class HotlineCoordinator:
                 failure_reason="Escalation failed before a decision was saved.",
                 created_at=event.detected_at,
             )
+        if event.state is EventState.EXPIRED:
+            return ContactHumanResult(
+                event_id=event.event_id,
+                status="timed_out",
+                attempt_id=session.attempt_id if session else None,
+                failure_reason=(
+                    "The decision deadline elapsed. The call was terminated and no later "
+                    "voice response can authorize work."
+                ),
+                created_at=event.detected_at,
+            )
         return ContactHumanResult(
             event_id=event.event_id,
             status=(
@@ -1534,6 +1846,15 @@ class HotlineCoordinator:
         )
 
     def _event_from_request(self, request: ContactHumanRequest) -> EscalationEvent:
+        detected_at = utc_now()
+        timeout_deadline = detected_at + timedelta(seconds=request.timeout_seconds)
+        deadline_at = (
+            min(request.deadline, timeout_deadline)
+            if request.deadline is not None
+            else timeout_deadline
+            if request.wait_for_decision
+            else request.deadline
+        )
         context = request.context
         source = _SOURCE_MAP.get(request.source, EventSource.MANUAL)
         agent_type = (
@@ -1600,7 +1921,8 @@ class HotlineCoordinator:
             },
             blocking=request.wait_for_decision,
             no_answer_policy=_NO_ANSWER_MAP[request.no_answer_policy],
-            deadline_at=request.deadline,
+            detected_at=detected_at,
+            deadline_at=deadline_at,
             dedupe_key=request.dedupe_key,
         )
 
@@ -1693,6 +2015,17 @@ class HotlineCoordinator:
         require_provider_correlation: bool = False,
         allowed_states: set[SessionState] | None = None,
     ) -> str:
+        if event.deadline_at is not None and utc_now() >= event.deadline_at:
+            await self.store.expire_event_if_due(
+                event.event_id,
+                reason="authority_requested_after_deadline",
+            )
+            current = await self.store.require_event(event.event_id)
+            if current.state is EventState.EXPIRED:
+                await self._terminate_expired_event_sessions(event.event_id)
+                self._signal(event.event_id)
+                raise PermissionError("the event decision deadline has elapsed")
+            event = current
         if event.state not in {
             EventState.DIALING,
             EventState.CONNECTED,
@@ -1796,10 +2129,13 @@ class HotlineCoordinator:
         return tuple(
             value
             for value in (
-                self.settings.sarvam_api_key.get_secret_value(),
-                self.settings.hotline_tool_token.get_secret_value(),
+                self.settings.openai_api_key.get_secret_value(),
+                self.settings.openai_webhook_secret.get_secret_value(),
+                self.settings.twilio_auth_token.get_secret_value(),
                 self.settings.hotline_local_token.get_secret_value(),
-                self.settings.hotline_callback_token.get_secret_value(),
+                self.settings.hotline_sip_correlation_secret.get_secret_value(),
+                self.settings.hotline_action_signing_secret.get_secret_value(),
+                self.settings.hotline_fallback_signing_secret.get_secret_value(),
                 self.settings.owner_confirmation_pin.get_secret_value(),
                 self.settings.hotline_fallback_webhook_token.get_secret_value(),
             )
@@ -1820,6 +2156,12 @@ def _model_severity(value: str) -> Severity:
     if value in {"high", "critical"}:
         return Severity.CRITICAL
     return Severity.WARNING
+
+
+def _conversation_provider(*, settings: Settings) -> str:
+    if settings.hotline_transport == "openai_realtime":
+        return "openai_realtime"
+    return settings.hotline_transport
 
 
 def _fallback_contract_severity(
@@ -1855,18 +2197,6 @@ def _confirmation_phrase(digest: str) -> str:
 
 def _phrase_hash(value: str) -> str:
     return hashlib.sha256(value.strip().encode("utf-8")).hexdigest()
-
-
-def _provider_webhook_id(payload: InstantOutboundWebhook) -> str:
-    """Derive a stable receipt key because Sarvam does not publish a webhook ID."""
-
-    canonical = json.dumps(
-        payload.model_dump(mode="json"),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
-    return "whk_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _same_decision_intent(left: Decision, right: Decision) -> bool:
@@ -1925,20 +2255,149 @@ def _validate_thread_parameters(
     for key, value in raw.items():
         if value is None:
             continue
-        if not isinstance(value, str) or not value.strip() or len(value) > 12_000:
+        maximum = 2000 if key in {"instruction", "task"} else 500
+        if not isinstance(value, str) or not value.strip() or len(value) > maximum:
             raise ValueError(f"thread action parameter {key!r} must be bounded text")
         result[key] = value.strip()
     return result
 
 
-def _thread_action_impact(action_type: str, parameters: Mapping[str, JsonValue]) -> str:
+def _thread_action_impact(
+    action_type: str,
+    parameters: Mapping[str, JsonValue],
+    *,
+    workspace: str | None,
+    thread_id: str | None,
+    state_hash: str | None,
+    expires_at: Any,
+    risk: RiskLevel,
+) -> str:
     if action_type == "thread.instruct":
-        return f"Send one instruction to Codex task {parameters['reference']}."
-    if action_type == "thread.interrupt":
-        return f"Interrupt the active turn in Codex task {parameters['reference']}."
-    if action_type == "thread.spawn_root":
-        return f"Spawn a new root Codex task in workspace {Path(str(parameters['cwd'])).name}."
-    return f"Archive Codex task {parameters['confirmed_thread_id']}."
+        action = (
+            f"Send this exact instruction to Codex task ID {parameters['thread_id']}: "
+            f"{parameters['instruction']}."
+        )
+    elif action_type == "thread.interrupt":
+        action = (
+            f"Interrupt exact turn ID {parameters['turn_id']} in Codex task ID "
+            f"{parameters['thread_id']}."
+        )
+    elif action_type == "thread.spawn_root":
+        action = (
+            f"Spawn one new root Codex task in exact workspace {parameters['cwd']} with this "
+            f"exact task: {parameters['task']}."
+        )
+    else:
+        action = f"Archive exact Codex task ID {parameters['thread_id']}."
+    return action + _scope_readback(
+        workspace=workspace,
+        thread_id=thread_id,
+        state_hash=state_hash,
+        expires_at=expires_at,
+        risk=risk,
+        execution_mode="real Codex write",
+    )
+
+
+def _runbook_action_impact(
+    impact: str,
+    *,
+    parameters: Mapping[str, JsonValue],
+    execution_mode: str,
+    rollback_guidance: str,
+    workspace: str | None,
+    thread_id: str | None,
+    state_hash: str | None,
+    expires_at: Any,
+    risk: RiskLevel,
+) -> str:
+    return (
+        f"{impact} Exact normalized parameters: {canonical_json(parameters)}. "
+        f"Rollback guidance: {rollback_guidance}."
+        + _scope_readback(
+            workspace=workspace,
+            thread_id=thread_id,
+            state_hash=state_hash,
+            expires_at=expires_at,
+            risk=risk,
+            execution_mode=execution_mode,
+        )
+    )
+
+
+def _scope_readback(
+    *,
+    workspace: str | None,
+    thread_id: str | None,
+    state_hash: str | None,
+    expires_at: Any,
+    risk: RiskLevel,
+    execution_mode: str,
+) -> str:
+    return (
+        f" Risk is {risk.value}. Execution mode is {execution_mode}. "
+        f"Workspace scope is {workspace or 'not supplied'}. "
+        f"Codex task scope is {thread_id or 'not supplied'}. "
+        f"Commit or state hash is {state_hash or 'not supplied'}. "
+        f"This is a one-time grant expiring at {expires_at.isoformat()}."
+    )
+
+
+def _prepared_action_hash(action: PreparedAction) -> str:
+    bindings: dict[str, object] = {
+        "event_id": action.event_id,
+        "host_id": action.scope.host_id,
+        "workspace": action.scope.workspace,
+        "thread_id": action.scope.thread_id,
+        "state_hash": action.scope.commit,
+    }
+    if action.kind is ActionKind.REGISTERED_RUNBOOK:
+        inputs = action.parameters.get("input")
+        runbook_hash = action.parameters.get("runbook_action_hash")
+        if not isinstance(inputs, dict) or not isinstance(runbook_hash, str):
+            raise RuntimeError("prepared runbook action is malformed")
+        return action_hash(
+            "registered_runbook",
+            inputs,
+            bindings={
+                **bindings,
+                "runbook_action_hash": runbook_hash,
+            },
+        )
+    return action_hash(
+        action.target,
+        action.parameters,
+        bindings=bindings,
+    )
+
+
+def _execution_response(
+    action: PreparedAction,
+    grant_id: str,
+    receipt: TimelineEntry,
+) -> ExecuteActionResponse:
+    status = receipt.details.get("status")
+    message = receipt.details.get("message_to_user")
+    operation_id = receipt.details.get("operation_id")
+    result = receipt.details.get("result")
+    return ExecuteActionResponse(
+        executed=status == "succeeded",
+        action_id=action.action_id,
+        grant_id=grant_id,
+        operation_id=operation_id if isinstance(operation_id, str) else None,
+        message_to_user=(
+            message
+            if isinstance(message, str)
+            else "The action has a durable terminal execution receipt."
+        ),
+        result=dict(result) if isinstance(result, dict) else {},
+    )
+
+
+def _same_workspace(left: str, right: str) -> bool:
+    return Path(left).expanduser().resolve(strict=False) == Path(right).expanduser().resolve(
+        strict=False
+    )
 
 
 def _json_scalar(value: object) -> JsonValue:

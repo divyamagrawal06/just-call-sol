@@ -4,30 +4,52 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 import pytest_asyncio
+from pydantic import ValidationError
 
 import agent_hotline.api as api_module
+import agent_hotline.storage as storage_module
 from agent_hotline.api import create_app
 from agent_hotline.codex_protocol import ThreadCandidate, ThreadControlResult
+from agent_hotline.contracts import (
+    BeginInboundSessionRequest,
+    ConfirmActionRequest,
+    ContactHumanRequest,
+    EscalationContextRequest,
+    ExecuteActionRequest,
+    PrepareActionRequest,
+    RecordInstructionRequest,
+    ThreadInspectRequest,
+    ThreadListRequest,
+)
+from agent_hotline.coordinator import HotlineCoordinator
 from agent_hotline.models import (
     ContactDirection,
     ContactSession,
     EscalationEvent,
     EventState,
+    ProviderWebhookPayload,
     SessionState,
+    utc_now,
 )
-from agent_hotline.providers import FakeCallProvider
+from agent_hotline.openai_realtime import RealtimeToolDispatcher
+from agent_hotline.providers import CallAttempt, FakeCallProvider
+from agent_hotline.runbooks import create_default_registry
 from agent_hotline.settings import Settings
-from agent_hotline.storage import SQLiteStore
+from agent_hotline.storage import (
+    ActionHashMismatchError,
+    DecisionAlreadyExistsError,
+    SQLiteStore,
+)
 
-LOCAL_TOKEN = "local-test-token-1234567890"
-TOOL_TOKEN = "tool-test-token-12345678901"
-CALLBACK_TOKEN = "callback-test-token-123456"
+LOCAL_TOKEN = "local-test-token-1234567890-abcdef"
+CALLBACK_TOKEN = "action-signing-test-token-1234567890-abcdef"
 OWNER_PIN = "246810"
 
 
@@ -35,16 +57,10 @@ class FakeThreadController:
     def __init__(self) -> None:
         self.extra_candidates: tuple[ThreadCandidate, ...] = ()
         self.list_limits: list[int] = []
+        self.searches: list[tuple[str, int]] = []
         self.spawn_calls: list[tuple[str, str]] = []
 
-    async def list_candidates(
-        self,
-        *,
-        limit: int = 100,
-        archived: bool = False,
-    ) -> tuple[ThreadCandidate, ...]:
-        del archived
-        self.list_limits.append(limit)
+    def _candidates(self) -> tuple[ThreadCandidate, ...]:
         return (
             ThreadCandidate(
                 thread_id="thread-running",
@@ -55,6 +71,39 @@ class FakeThreadController:
                 updated_at=1,
             ),
             *self.extra_candidates,
+        )
+
+    async def list_candidates(
+        self,
+        *,
+        limit: int = 100,
+        archived: bool = False,
+    ) -> tuple[ThreadCandidate, ...]:
+        del archived
+        self.list_limits.append(limit)
+        return self._candidates()[:limit]
+
+    async def search_candidates(
+        self,
+        query: str,
+        *,
+        limit: int = 100,
+    ) -> tuple[ThreadCandidate, ...]:
+        self.searches.append((query, limit))
+        normalized = query.strip().casefold()
+        return tuple(
+            item
+            for item in self._candidates()
+            if normalized
+            in " ".join(
+                (
+                    item.thread_id,
+                    item.name or "",
+                    item.preview,
+                    Path(item.cwd).name,
+                    item.status,
+                )
+            ).casefold()
         )[:limit]
 
     async def inspect_thread(self, reference: str) -> dict[str, Any]:
@@ -84,6 +133,7 @@ class APIHarness:
     client: httpx.AsyncClient
     provider: FakeCallProvider
     store: SQLiteStore
+    coordinator: HotlineCoordinator
     controller: FakeThreadController
 
 
@@ -95,9 +145,7 @@ async def api(tmp_path: Path) -> AsyncIterator[APIHarness]:
         hotline_database_path=tmp_path / "hotline.sqlite3",
         hotline_transport="fake",
         hotline_local_token=LOCAL_TOKEN,
-        hotline_tool_token=TOOL_TOKEN,
-        hotline_public_tools_require_token=True,
-        hotline_callback_token=CALLBACK_TOKEN,
+        hotline_action_signing_secret=CALLBACK_TOKEN,
         owner_phone_number="+919876543210",
         owner_confirmation_pin=OWNER_PIN,
         hotline_allowlisted_callers="+12025550147",
@@ -120,76 +168,16 @@ async def api(tmp_path: Path) -> AsyncIterator[APIHarness]:
                 client=client,
                 provider=provider,
                 store=app.state.store,
+                coordinator=app.state.coordinator,
                 controller=controller,
             )
 
 
-@pytest.mark.asyncio
-async def test_public_demo_registration_tool_needs_no_auth(api: APIHarness) -> None:
-    response = await api.client.post(
-        "/v1/demo/sarvam/check-registration",
-        json={"query": "SEP-26003"},
-    )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["verdict"] == "NO"
-    assert payload["approved"] is False
-    assert "does not match" in payload["reason"]
-
-
-@pytest.mark.asyncio
-async def test_public_demo_registration_tool_accepts_sheet_name(api: APIHarness) -> None:
-    response = await api.client.post(
-        "/v1/demo/sarvam/check-registration",
-        json={"query": "SEP 26003", "sheet_name": "sheet_name.csv"},
-    )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["registered"] is True
-    assert payload["approval_status"] == "REJECTED"
-    assert payload["sheet_name"] == "sarvam_epoch_registration_tracker.csv"
-
-
-@pytest_asyncio.fixture
-async def auto_execute_api(tmp_path: Path) -> AsyncIterator[APIHarness]:
-    settings = Settings(
-        _env_file=None,
-        hotline_env="development",
-        hotline_database_path=tmp_path / "auto-execute.sqlite3",
-        hotline_transport="fake",
-        hotline_local_token=LOCAL_TOKEN,
-        hotline_tool_token=TOOL_TOKEN,
-        hotline_public_tools_require_token=True,
-        hotline_callback_token=CALLBACK_TOKEN,
-        owner_phone_number="+919876543210",
-        owner_confirmation_pin=OWNER_PIN,
-        hotline_demo_auto_execute_actions=True,
-        codex_app_server_enabled=False,
-    )
-    provider = FakeCallProvider()
-    controller = FakeThreadController()
-    app = create_app(
-        settings=settings,
-        provider=provider,
-        controller=controller,  # type: ignore[arg-type]
-    )
-    async with app.router.lifespan_context(app):
-        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-        async with httpx.AsyncClient(
-            transport=transport,
-            base_url="http://testserver",
-        ) as client:
-            yield APIHarness(
-                client=client,
-                provider=provider,
-                store=app.state.store,
-                controller=controller,
-            )
-
-
-def _contact_payload(*, wait_for_decision: bool = True) -> dict[str, object]:
+def _contact_payload(
+    *,
+    wait_for_decision: bool = True,
+    dedupe_key: str = "api-test-database-ru-incident",
+) -> dict[str, object]:
     return {
         "source": "codex_mcp",
         "kind": "incident",
@@ -201,18 +189,14 @@ def _contact_payload(*, wait_for_decision: bool = True) -> dict[str, object]:
             "workspace_ref": "workspace-demo",
             "last_error": "Every request is returning a throttling error.",
         },
-        "dedupe_key": "api-test-database-ru-incident",
+        "dedupe_key": dedupe_key,
         "wait_for_decision": wait_for_decision,
-        "timeout_seconds": 5,
+        "timeout_seconds": 5 if wait_for_decision else 1,
     }
 
 
 def _local_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {LOCAL_TOKEN}"}
-
-
-def _tool_headers() -> dict[str, str]:
-    return {"Authorization": f"Bearer {TOOL_TOKEN}"}
 
 
 async def _wait_for_provider_call(provider: FakeCallProvider) -> tuple[str, object]:
@@ -221,6 +205,19 @@ async def _wait_for_provider_call(provider: FakeCallProvider) -> tuple[str, obje
             return provider.calls[-1]
         await asyncio.sleep(0.01)
     pytest.fail("fake call provider was not invoked")
+
+
+async def _create_nonblocking_event(api: APIHarness, *, suffix: str) -> str:
+    response = await api.client.post(
+        "/v1/escalations/notify",
+        json=_contact_payload(
+            wait_for_decision=False,
+            dedupe_key=f"api-test-{suffix}",
+        ),
+        headers=_local_headers(),
+    )
+    assert response.status_code == 200
+    return response.json()["event_id"]
 
 
 async def test_runtime_startup_prewarms_unfiltered_top_ten_with_sixty_second_budget(
@@ -233,7 +230,11 @@ async def test_runtime_startup_prewarms_unfiltered_top_ten_with_sixty_second_bud
         def __init__(self, **_kwargs: object) -> None:
             pass
 
-        def register_server_request_handler(self, _method: str, _handler: object) -> None:
+        def register_server_request_handler(
+            self,
+            _method: str,
+            _handler: object,
+        ) -> None:
             pass
 
         async def start(self) -> dict[str, object]:
@@ -286,211 +287,172 @@ async def test_runtime_startup_prewarms_unfiltered_top_ten_with_sixty_second_bud
     assert calls[-1] == ("close", None)
 
 
-async def test_api_authentication_boundaries_are_separate_and_fail_closed(
+@pytest.mark.asyncio
+async def test_local_api_authentication_and_error_responses_fail_closed(
     api: APIHarness,
 ) -> None:
-    missing = await api.client.post("/v1/escalations/contact", json=_contact_payload())
+    missing = await api.client.post(
+        "/v1/escalations/contact",
+        json=_contact_payload(),
+    )
     invalid = await api.client.post(
         "/v1/escalations/contact",
         json=_contact_payload(),
         headers={"Authorization": "Bearer wrong-token"},
     )
-    crossed_tokens = await api.client.post(
-        "/v1/sarvam/tools/context",
-        json={"event_id": "evt_does-not-exist"},
-        headers=_local_headers(),
+    unauthenticated_start = await api.client.post(
+        "/v1/escalations/start",
+        json=_contact_payload(),
     )
-    missing_tool_token = await api.client.post(
-        "/v1/sarvam/tools/context",
-        json={"event_id": "evt_does-not-exist"},
-    )
-    accepted_auth = await api.client.post(
-        "/v1/sarvam/tools/context",
-        json={"event_id": "evt_does-not-exist"},
-        headers=_tool_headers(),
+    crossed = await api.client.post(
+        "/v1/repository/context",
+        json={"operation": "status"},
+        headers={"Authorization": "Bearer wrong-token"},
     )
     blocking_notify = await api.client.post(
         "/v1/escalations/notify",
-        json={
-            **_contact_payload(wait_for_decision=False),
-            "wait_for_decision": True,
-            "timeout_seconds": 5,
-        },
+        json=_contact_payload(wait_for_decision=True),
         headers=_local_headers(),
-    )
-    invalid_callback = await api.client.post(
-        "/v1/sarvam/webhooks/instant-outbound/not-the-callback-token",
-        json={
-            "attempt_id": "attempt-unknown",
-            "status": "no_answer",
-            "channel_info": {},
-        },
     )
 
     assert missing.status_code == 401
     assert invalid.status_code == 403
-    assert crossed_tokens.status_code == 403
-    assert missing_tool_token.status_code == 401
-    assert accepted_auth.status_code == 404
+    assert crossed.status_code == 403
     assert blocking_notify.status_code == 422
-    assert invalid_callback.status_code == 404
     for response in (
         missing,
         invalid,
-        crossed_tokens,
-        missing_tool_token,
-        accepted_auth,
+        unauthenticated_start,
+        crossed,
         blocking_notify,
-        invalid_callback,
     ):
         assert response.headers["cache-control"] == "no-store"
         assert LOCAL_TOKEN not in response.text
-        assert TOOL_TOKEN not in response.text
         assert CALLBACK_TOKEN not in response.text
 
 
-async def test_development_demo_can_omit_bearer_for_all_sarvam_tools(
+@pytest.mark.asyncio
+async def test_start_route_returns_calling_immediately_and_can_be_polled(
+    api: APIHarness,
+) -> None:
+    response = await asyncio.wait_for(
+        api.client.post(
+            "/v1/escalations/start",
+            json=_contact_payload(dedupe_key="api-test-nonblocking-start"),
+            headers=_local_headers(),
+        ),
+        timeout=1,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "calling"
+    assert response.json()["outcome"] == "none"
+    event_id = response.json()["event_id"]
+    assert response.json()["attempt_id"] == f"fake-attempt-{event_id}"
+    assert api.provider.calls[-1][1].wait_for_decision is True
+
+    pending = await api.client.get(
+        f"/v1/events/{event_id}/result",
+        headers=_local_headers(),
+    )
+    assert pending.status_code == 200
+    assert pending.json()["status"] == "calling"
+    assert pending.json()["identity_verified"] is False
+
+    recorded = await api.coordinator.record_instruction(
+        RecordInstructionRequest(
+            event_id=event_id,
+            outcome="instruct",
+            instruction="Keep the task paused while I inspect it.",
+            confirmation_pin=OWNER_PIN,
+        )
+    )
+    resolved = await api.client.get(
+        f"/v1/events/{event_id}/result",
+        headers=_local_headers(),
+    )
+    assert resolved.status_code == 200
+    assert resolved.json()["status"] == "resolved"
+    assert resolved.json()["decision_id"] == recorded.decision_id
+
+
+@pytest.mark.asyncio
+async def test_cancelled_contact_start_waits_for_placement_then_terminates_known_call(
     tmp_path: Path,
 ) -> None:
+    class BlockingPlacementProvider(FakeCallProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def place_call(
+            self,
+            event_id: str,
+            request: ContactHumanRequest,
+        ) -> CallAttempt:
+            self.calls.append((event_id, request))
+            self.started.set()
+            await self.release.wait()
+            return CallAttempt(
+                attempt_id=f"fake-attempt-{event_id}",
+                provider="fake",
+            )
+
     settings = Settings(
         _env_file=None,
         hotline_env="test",
-        hotline_database_path=tmp_path / "headerless-demo.sqlite3",
+        hotline_database_path=tmp_path / "cancelled-start.sqlite3",
         hotline_transport="fake",
-        hotline_public_tools_require_token=False,
-        hotline_tool_token="",
         hotline_local_token=LOCAL_TOKEN,
-        hotline_callback_token=CALLBACK_TOKEN,
-        public_base_url="https://voice.example.test",
+        hotline_action_signing_secret=CALLBACK_TOKEN,
         owner_phone_number="+919876543210",
         owner_confirmation_pin=OWNER_PIN,
-        hotline_allowlisted_callers="+12025550147",
         codex_app_server_enabled=False,
     )
-    assert settings.public_tools_configured is True
-    app = create_app(settings=settings, provider=FakeCallProvider())
-    async with app.router.lifespan_context(app):
-        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-        async with httpx.AsyncClient(
-            transport=transport,
-            base_url="http://testserver",
-        ) as client:
-            missing_event = "evt_does-not-exist"
-            requests = (
-                (
-                    "/v1/sarvam/tools/context",
-                    {"event_id": missing_event},
-                ),
-                (
-                    "/v1/sarvam/tools/record-instruction",
-                    {
-                        "event_id": missing_event,
-                        "outcome": "deny",
-                        "instruction": "Do not continue.",
-                        "confirmation_pin": OWNER_PIN,
-                    },
-                ),
-                (
-                    "/v1/sarvam/tools/prepare-action",
-                    {
-                        "event_id": missing_event,
-                        "action_type": "demo.pause_deployment",
-                        "parameters": {},
-                    },
-                ),
-                (
-                    "/v1/sarvam/tools/confirm-action",
-                    {
-                        "event_id": missing_event,
-                        "action_id": "act_missing",
-                        "confirmation_nonce": "nonce-missing",
-                        "exact_confirmation": "confirm the missing action",
-                        "confirmation_method": "spoken_plus_dtmf",
-                        "confirmation_pin": OWNER_PIN,
-                    },
-                ),
-                (
-                    "/v1/sarvam/tools/execute-action",
-                    {
-                        "event_id": missing_event,
-                        "action_id": "act_missing",
-                        "grant_id": "grant_missing",
-                    },
-                ),
-                (
-                    "/v1/sarvam/tools/threads/list",
-                    {"event_id": missing_event, "limit": 10},
-                ),
-                (
-                    "/v1/sarvam/tools/threads/inspect",
-                    {"event_id": missing_event, "reference": "thread-missing"},
-                ),
-                (
-                    "/v1/sarvam/tools/repository-context",
-                    {
-                        "event_id": missing_event,
-                        "operation": "status",
-                        "confirmation_pin": OWNER_PIN,
-                    },
-                ),
-            )
-            responses = [await client.post(path, json=payload) for path, payload in requests]
-            inbound = await client.post(
-                "/v1/sarvam/tools/begin-inbound",
-                json={
-                    "caller_phone_number": "+12025550148",
-                    "interaction_id": "headerless-unlisted",
-                },
-            )
-            local_api = await client.post(
-                "/v1/escalations/contact",
-                json=_contact_payload(wait_for_decision=False),
-            )
+    store = SQLiteStore(settings.hotline_database_path)
+    await store.initialize()
+    provider = BlockingPlacementProvider()
+    coordinator = HotlineCoordinator(
+        settings=settings,
+        store=store,
+        provider=provider,
+        runbooks=create_default_registry(),
+    )
+    request = ContactHumanRequest(
+        source="demo",
+        kind="clarification",
+        summary="The caller will cancel while Twilio placement is in flight.",
+        question="Should the safely aborted call remain active?",
+        dedupe_key="cancelled-contact-start-test",
+        timeout_seconds=60,
+    )
+    task = asyncio.create_task(coordinator.start_contact_human(request))
+    try:
+        await asyncio.wait_for(provider.started.wait(), timeout=1)
+        event_id = provider.calls[0][0]
+        task.cancel()
+        provider.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
-    assert all(response.status_code == 404 for response in responses)
-    assert inbound.status_code == 200
-    assert inbound.json()["accepted"] is False
-    assert local_api.status_code == 401
+        event = await store.require_event(event_id)
+        sessions = await store.list_sessions(event_id=event_id, limit=5)
+        assert event.state is EventState.FAILED
+        assert len(sessions) == 1
+        assert sessions[0].state is SessionState.FAILED
+        assert sessions[0].attempt_id == f"fake-attempt-{event_id}"
+        assert provider.terminated_attempts == [f"fake-attempt-{event_id}"]
+        assert await store.get_decision(event_id) is None
+    finally:
+        provider.release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await store.close()
 
 
-def test_production_rejects_headerless_sarvam_tool_configuration() -> None:
-    with pytest.raises(
-        ValueError,
-        match="HOTLINE_PUBLIC_TOOLS_REQUIRE_TOKEN cannot be disabled in production",
-    ):
-        Settings(
-            _env_file=None,
-            hotline_env="production",
-            hotline_public_tools_require_token=False,
-        )
-
-
-def test_production_rejects_demo_action_auto_execution() -> None:
-    with pytest.raises(
-        ValueError,
-        match="HOTLINE_DEMO_AUTO_EXECUTE_ACTIONS cannot be enabled in production",
-    ):
-        Settings(
-            _env_file=None,
-            hotline_env="production",
-            hotline_public_tools_require_token=True,
-            hotline_demo_auto_execute_actions=True,
-        )
-
-
-def test_demo_action_auto_execution_rejects_real_runbooks() -> None:
-    with pytest.raises(
-        ValueError,
-        match="HOTLINE_DEMO_AUTO_EXECUTE_ACTIONS cannot be combined",
-    ):
-        Settings(
-            _env_file=None,
-            hotline_env="development",
-            hotline_demo_auto_execute_actions=True,
-            hotline_allow_real_actions=True,
-        )
-
-
+@pytest.mark.asyncio
 async def test_contact_waiter_is_woken_by_authoritative_mid_call_decision(
     api: APIHarness,
 ) -> None:
@@ -502,68 +464,123 @@ async def test_contact_waiter_is_woken_by_authoritative_mid_call_decision(
         )
     )
     event_id, _request = await _wait_for_provider_call(api.provider)
-
-    recorded = await api.client.post(
-        "/v1/sarvam/tools/record-instruction",
-        json={
-            "event_id": event_id,
-            "outcome": "instruct",
-            "instruction": "Pause retries, preserve the logs, and wait for me.",
-            "constraints": ["Do not change database capacity."],
-            "confirmation_pin": OWNER_PIN,
-        },
-        headers=_tool_headers(),
+    recorded = await api.coordinator.record_instruction(
+        RecordInstructionRequest(
+            event_id=event_id,
+            outcome="instruct",
+            instruction="Pause retries, preserve the logs, and wait for me.",
+            constraints=["Do not change database capacity."],
+            confirmation_pin=OWNER_PIN,
+        )
     )
     response = await asyncio.wait_for(pending_contact, timeout=2)
 
-    assert recorded.status_code == 200
-    assert recorded.json()["accepted"] is True
+    assert recorded.accepted is True
     assert response.status_code == 200
-    assert response.json() == {
-        "event_id": event_id,
-        "status": "resolved",
-        "outcome": "instruct",
-        "instruction": "Pause retries, preserve the logs, and wait for me.",
-        "constraints": ["Do not change database capacity."],
-        "approved_action_ids": [],
-        "identity_verified": True,
-        "decision_id": recorded.json()["decision_id"],
-        "attempt_id": f"fake-attempt-{event_id}",
-        "channel": "voice",
-        "failure_reason": None,
-        "created_at": response.json()["created_at"],
-        "decision_recorded_at": response.json()["decision_recorded_at"],
-    }
+    assert response.json()["event_id"] == event_id
+    assert response.json()["status"] == "resolved"
+    assert response.json()["outcome"] == "instruct"
+    assert response.json()["identity_verified"] is True
+    assert response.json()["decision_id"] == recorded.decision_id
     assert (await api.store.require_event(event_id)).state is EventState.RESOLVED
 
-    conflicting_wrong_pin = await api.client.post(
-        "/v1/sarvam/tools/record-instruction",
-        json={
-            "event_id": event_id,
-            "outcome": "deny",
-            "instruction": "Ignore the instruction and continue retrying.",
-            "confirmation_pin": "135790",
-        },
-        headers=_tool_headers(),
-    )
-    conflicting_replay = await api.client.post(
-        "/v1/sarvam/tools/record-instruction",
-        json={
-            "event_id": event_id,
-            "outcome": "deny",
-            "instruction": "Ignore the instruction and continue retrying.",
-            "confirmation_pin": OWNER_PIN,
-        },
-        headers=_tool_headers(),
-    )
-    assert conflicting_wrong_pin.status_code == 409
-    assert conflicting_replay.status_code == 409
+    for pin in ("135790", OWNER_PIN):
+        with pytest.raises(DecisionAlreadyExistsError):
+            await api.coordinator.record_instruction(
+                RecordInstructionRequest(
+                    event_id=event_id,
+                    outcome="deny",
+                    instruction="Ignore the instruction and continue retrying.",
+                    confirmation_pin=pin,
+                )
+            )
     durable = await api.store.get_decision(event_id)
     assert durable is not None
     assert durable.instruction == "Pause retries, preserve the logs, and wait for me."
 
 
-async def test_approval_identity_is_derived_only_from_the_configured_pin(
+@pytest.mark.asyncio
+async def test_hard_decision_deadline_terminates_call_and_rejects_late_instruction(
+    api: APIHarness,
+) -> None:
+    payload = _contact_payload(dedupe_key="api-test-hard-decision-deadline")
+    payload["deadline"] = (utc_now() + timedelta(seconds=1)).isoformat()
+    pending_contact = asyncio.create_task(
+        api.client.post(
+            "/v1/escalations/contact",
+            json=payload,
+            headers=_local_headers(),
+        )
+    )
+    event_id, _request = await _wait_for_provider_call(api.provider)
+
+    response = await asyncio.wait_for(pending_contact, timeout=3)
+    assert response.status_code == 200
+    assert response.json()["status"] == "timed_out"
+    assert response.json()["outcome"] == "none"
+    assert response.json()["identity_verified"] is False
+    assert "no later voice response" in response.json()["failure_reason"]
+    assert (await api.store.require_event(event_id)).state is EventState.EXPIRED
+    assert api.provider.terminated_attempts == [f"fake-attempt-{event_id}"]
+
+    polled = await api.client.get(
+        f"/v1/events/{event_id}/result",
+        headers=_local_headers(),
+    )
+    assert polled.status_code == 200
+    assert polled.json()["status"] == "timed_out"
+    assert polled.json()["decision_id"] is None
+
+    with pytest.raises(PermissionError, match="deadline"):
+        await api.coordinator.record_instruction(
+            RecordInstructionRequest(
+                event_id=event_id,
+                outcome="approve",
+                instruction="This arrived after the hard deadline and must be ignored.",
+                confirmation_pin=OWNER_PIN,
+            )
+        )
+    assert await api.store.get_decision(event_id) is None
+
+
+@pytest.mark.asyncio
+async def test_background_deadline_expiry_is_durable_and_idempotently_terminates_call(
+    api: APIHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = await api.client.post(
+        "/v1/escalations/start",
+        json=_contact_payload(dedupe_key="api-test-background-deadline-expiry"),
+        headers=_local_headers(),
+    )
+    assert response.status_code == 200
+    event_id = response.json()["event_id"]
+    event = await api.store.require_event(event_id)
+    assert event.deadline_at is not None
+    after_deadline = event.deadline_at + timedelta(seconds=1)
+    monkeypatch.setattr(storage_module, "utc_now", lambda: after_deadline)
+
+    first = await api.coordinator.expire_decision_deadlines()
+    second = await api.coordinator.expire_decision_deadlines()
+
+    assert first == 1
+    assert second == 0
+    assert (await api.store.require_event(event_id)).state is EventState.EXPIRED
+    sessions = await api.store.list_sessions(event_id=event_id, limit=5)
+    assert len(sessions) == 1
+    assert sessions[0].state is SessionState.CANCELLED
+    assert api.provider.terminated_attempts == [f"fake-attempt-{event_id}"]
+    polled = await api.client.get(
+        f"/v1/events/{event_id}/result",
+        headers=_local_headers(),
+    )
+    assert polled.status_code == 200
+    assert polled.json()["status"] == "timed_out"
+    assert polled.json()["decision_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_approval_identity_is_derived_only_from_server_verified_pin(
     api: APIHarness,
 ) -> None:
     pending_contact = asyncio.create_task(
@@ -574,49 +591,49 @@ async def test_approval_identity_is_derived_only_from_the_configured_pin(
         )
     )
     event_id, _request = await _wait_for_provider_call(api.provider)
-    request = {
-        "event_id": event_id,
-        "outcome": "approve",
-        "instruction": "Approve this one request only.",
-        "confirmation_method": "spoken_plus_dtmf",
-    }
-
-    forged_identity = await api.client.post(
-        "/v1/sarvam/tools/record-instruction",
-        json={**request, "identity_verified": True, "confirmation_pin": OWNER_PIN},
-        headers=_tool_headers(),
-    )
-    wrong_pin = await api.client.post(
-        "/v1/sarvam/tools/record-instruction",
-        json={**request, "confirmation_pin": "135790"},
-        headers=_tool_headers(),
-    )
-    assert forged_identity.status_code == 422
-    assert wrong_pin.status_code == 403
+    with pytest.raises(ValidationError):
+        RecordInstructionRequest(
+            event_id=event_id,
+            outcome="approve",
+            instruction="Approve this one request only.",
+            identity_verified=True,
+            confirmation_pin=OWNER_PIN,
+        )
+    with pytest.raises(PermissionError, match="second-factor"):
+        await api.coordinator.record_instruction(
+            RecordInstructionRequest(
+                event_id=event_id,
+                outcome="approve",
+                instruction="Approve this one request only.",
+                confirmation_pin="135790",
+            )
+        )
     assert not pending_contact.done()
 
-    approved = await api.client.post(
-        "/v1/sarvam/tools/record-instruction",
-        json={**request, "confirmation_pin": OWNER_PIN},
-        headers=_tool_headers(),
+    approved = await api.coordinator.record_instruction(
+        RecordInstructionRequest(
+            event_id=event_id,
+            outcome="approve",
+            instruction="Approve this one request only.",
+            confirmation_pin=OWNER_PIN,
+        )
     )
     result = await asyncio.wait_for(pending_contact, timeout=2)
 
-    assert approved.status_code == 200
-    assert result.status_code == 200
-    assert result.json()["status"] == "resolved"
+    assert approved.accepted is True
     assert result.json()["outcome"] == "approve"
     assert result.json()["identity_verified"] is True
-    assert OWNER_PIN not in approved.text + result.text
+    assert OWNER_PIN not in approved.model_dump_json() + result.text
     for durable_path in (
         api.store.path,
         Path(f"{api.store.path}-wal"),
         Path(f"{api.store.path}-shm"),
     ):
         if durable_path.exists():
-            assert OWNER_PIN.encode("utf-8") not in durable_path.read_bytes()
+            assert OWNER_PIN.encode() not in durable_path.read_bytes()
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "outcome",
     ["approve", "deny", "instruct", "defer", "auth_completed"],
@@ -625,44 +642,29 @@ async def test_every_decision_outcome_requires_the_configured_pin(
     api: APIHarness,
     outcome: str,
 ) -> None:
-    created = await api.client.post(
-        "/v1/escalations/contact",
-        json=_contact_payload(wait_for_decision=False),
-        headers=_local_headers(),
-    )
-    event_id = created.json()["event_id"]
+    event_id = await _create_nonblocking_event(api, suffix=f"outcome-{outcome}")
     request = {
         "event_id": event_id,
         "outcome": outcome,
         "instruction": "Record only this confirmed disposition.",
-        "confirmation_method": "spoken_plus_dtmf",
     }
 
-    missing = await api.client.post(
-        "/v1/sarvam/tools/record-instruction",
-        json=request,
-        headers=_tool_headers(),
-    )
-    wrong = await api.client.post(
-        "/v1/sarvam/tools/record-instruction",
-        json={**request, "confirmation_pin": "135790"},
-        headers=_tool_headers(),
-    )
-    accepted = await api.client.post(
-        "/v1/sarvam/tools/record-instruction",
-        json={**request, "confirmation_pin": OWNER_PIN},
-        headers=_tool_headers(),
+    with pytest.raises(PermissionError, match="second-factor"):
+        await api.coordinator.record_instruction(
+            RecordInstructionRequest(**request, confirmation_pin="135790")
+        )
+    accepted = await api.coordinator.record_instruction(
+        RecordInstructionRequest(**request, confirmation_pin=OWNER_PIN)
     )
 
-    assert missing.status_code == 422
-    assert wrong.status_code == 403
-    assert accepted.status_code == 200
+    assert accepted.accepted is True
     decision = await api.store.get_decision(event_id)
     assert decision is not None
     assert decision.outcome.value == outcome
     assert decision.identity_verified is True
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("direction", "state", "attempt_id", "interaction_id"),
     [
@@ -702,78 +704,52 @@ async def test_invalid_decision_session_is_rejected_before_pin_comparison(
             interaction_id=interaction_id,
         )
     )
-    request = {
-        "event_id": event.event_id,
-        "outcome": "instruct",
-        "instruction": "Continue.",
-    }
 
-    wrong = await api.client.post(
-        "/v1/sarvam/tools/record-instruction",
-        json={**request, "confirmation_pin": "135790"},
-        headers=_tool_headers(),
-    )
-    correct = await api.client.post(
-        "/v1/sarvam/tools/record-instruction",
-        json={**request, "confirmation_pin": OWNER_PIN},
-        headers=_tool_headers(),
-    )
-
-    assert wrong.status_code == 403
-    assert correct.status_code == 403
+    for pin in ("135790", OWNER_PIN):
+        with pytest.raises(PermissionError):
+            await api.coordinator.record_instruction(
+                RecordInstructionRequest(
+                    event_id=event.event_id,
+                    outcome="instruct",
+                    instruction="Continue.",
+                    confirmation_pin=pin,
+                )
+            )
     assert await api.store.get_decision(event.event_id) is None
 
 
+@pytest.mark.asyncio
 async def test_identical_decision_retry_remains_idempotent_after_call_completion(
     api: APIHarness,
 ) -> None:
-    created = await api.client.post(
-        "/v1/escalations/contact",
-        json=_contact_payload(wait_for_decision=False),
-        headers=_local_headers(),
+    event_id = await _create_nonblocking_event(api, suffix="decision-retry")
+    request = RecordInstructionRequest(
+        event_id=event_id,
+        outcome="instruct",
+        instruction="Pause and preserve the logs.",
+        confirmation_pin=OWNER_PIN,
     )
-    event_id = created.json()["event_id"]
-    request = {
-        "event_id": event_id,
-        "outcome": "instruct",
-        "instruction": "Pause and preserve the logs.",
-        "confirmation_pin": OWNER_PIN,
-    }
-    first = await api.client.post(
-        "/v1/sarvam/tools/record-instruction",
-        json=request,
-        headers=_tool_headers(),
+    first = await api.coordinator.record_instruction(request)
+    await api.coordinator.reconcile_provider_completion(
+        ProviderWebhookPayload(
+            attempt_id=f"fake-attempt-{event_id}",
+            interaction_id="interaction-completed-decision",
+            status="connected",
+            provider="fake",
+            duration_seconds=15,
+        )
     )
-    completed = await api.client.post(
-        f"/v1/sarvam/webhooks/instant-outbound/{CALLBACK_TOKEN}",
-        json={
-            "attempt_id": f"fake-attempt-{event_id}",
-            "interaction_id": "interaction-completed-decision",
-            "status": "connected",
-            "channel_info": {"direction": "outbound"},
-            "duration": 15,
-        },
-    )
-    replay = await api.client.post(
-        "/v1/sarvam/tools/record-instruction",
-        json=request,
-        headers=_tool_headers(),
-    )
-    wrong_pin_replay = await api.client.post(
-        "/v1/sarvam/tools/record-instruction",
-        json={**request, "confirmation_pin": "135790"},
-        headers=_tool_headers(),
+    replay = await api.coordinator.record_instruction(request)
+    wrong_pin_replay = await api.coordinator.record_instruction(
+        request.model_copy(update={"confirmation_pin": "135790"})
     )
 
-    assert first.status_code == 200
-    assert completed.status_code == 200
-    assert replay.status_code == 200
-    assert wrong_pin_replay.status_code == 200
-    assert replay.json()["decision_id"] == first.json()["decision_id"]
-    assert wrong_pin_replay.json()["decision_id"] == first.json()["decision_id"]
+    assert replay.decision_id == first.decision_id
+    assert wrong_pin_replay.decision_id == first.decision_id
 
 
-async def test_no_answer_webhook_wakes_waiter_without_creating_approval(
+@pytest.mark.asyncio
+async def test_no_answer_completion_wakes_waiter_without_creating_approval(
     api: APIHarness,
 ) -> None:
     pending_contact = asyncio.create_task(
@@ -784,385 +760,368 @@ async def test_no_answer_webhook_wakes_waiter_without_creating_approval(
         )
     )
     event_id, _request = await _wait_for_provider_call(api.provider)
-    webhook_payload = {
-        "attempt_id": f"fake-attempt-{event_id}",
-        "status": "no_answer",
-        "channel_info": {"direction": "outbound"},
-        "failure_reason": "The owner did not answer.",
-    }
-    prepared = await api.client.post(
-        "/v1/sarvam/tools/prepare-action",
-        json={
-            "event_id": event_id,
-            "action_type": "demo.pause_deployment",
-            "parameters": {},
-        },
-        headers=_tool_headers(),
+    prepared = await api.coordinator.prepare_action(
+        PrepareActionRequest(
+            event_id=event_id,
+            action_type="demo.pause_deployment",
+            parameters={},
+        )
     )
-    assert prepared.status_code == 200
-    prepared_payload = prepared.json()
-    assert prepared_payload["executed"] is False
-    assert prepared_payload["already_executed"] is False
-    assert prepared_payload["grant_id"] is None
-    exact_phrase = prepared_payload["exact_readback"].rsplit("say exactly: ", 1)[1]
-
-    webhook = await api.client.post(
-        f"/v1/sarvam/webhooks/instant-outbound/{CALLBACK_TOKEN}",
-        json=webhook_payload,
+    completed = await api.coordinator.reconcile_provider_completion(
+        ProviderWebhookPayload(
+            attempt_id=f"fake-attempt-{event_id}",
+            status="no_answer",
+            provider="fake",
+            failure_reason="The owner did not answer.",
+        )
     )
     response = await asyncio.wait_for(pending_contact, timeout=2)
 
-    assert webhook.status_code == 200
-    assert response.status_code == 200
+    assert completed["created"] is True
     assert response.json()["status"] == "no_answer"
     assert response.json()["outcome"] == "none"
     assert response.json()["identity_verified"] is False
     assert await api.store.get_decision(event_id) is None
     assert (await api.store.require_event(event_id)).state is EventState.FAILED
 
-    late_confirmation = await api.client.post(
-        "/v1/sarvam/tools/confirm-action",
-        json={
-            "event_id": event_id,
-            "action_id": prepared_payload["action_id"],
-            "confirmation_nonce": prepared_payload["confirmation_nonce"],
-            "exact_confirmation": exact_phrase,
-            "confirmation_method": "spoken_plus_dtmf",
-            "confirmation_pin": OWNER_PIN,
-        },
-        headers=_tool_headers(),
-    )
-    late_approval = await api.client.post(
-        "/v1/sarvam/tools/record-instruction",
-        json={
-            "event_id": event_id,
-            "outcome": "approve",
-            "instruction": "Approve it.",
-            "confirmation_method": "spoken_plus_dtmf",
-            "confirmation_pin": OWNER_PIN,
-        },
-        headers=_tool_headers(),
-    )
-    assert late_confirmation.status_code == 403
-    assert late_approval.status_code == 403
-    assert await api.store.get_decision(event_id) is None
+    with pytest.raises(PermissionError):
+        await api.coordinator.confirm_action(
+            ConfirmActionRequest(
+                event_id=event_id,
+                action_id=prepared.action_id,
+                confirmation_nonce=prepared.confirmation_nonce,
+                exact_confirmation=prepared.exact_readback.rsplit("say exactly: ", 1)[1],
+                confirmation_method="spoken_plus_dtmf",
+                confirmation_pin=OWNER_PIN,
+            )
+        )
+    with pytest.raises(PermissionError):
+        await api.coordinator.record_instruction(
+            RecordInstructionRequest(
+                event_id=event_id,
+                outcome="approve",
+                instruction="Approve it.",
+                confirmation_pin=OWNER_PIN,
+            )
+        )
 
 
-async def test_completion_webhook_retries_are_idempotent(api: APIHarness) -> None:
-    created = await api.client.post(
-        "/v1/escalations/contact",
-        json=_contact_payload(wait_for_decision=False),
-        headers=_local_headers(),
-    )
-    assert created.status_code == 200
-    event_id = created.json()["event_id"]
-    payload = {
-        "attempt_id": f"fake-attempt-{event_id}",
-        "status": "busy",
-        "channel_info": {"direction": "outbound"},
-        "failure_reason": "Line busy.",
-    }
-
-    first = await api.client.post(
-        f"/v1/sarvam/webhooks/instant-outbound/{CALLBACK_TOKEN}",
-        json=payload,
-    )
-    replay = await api.client.post(
-        f"/v1/sarvam/webhooks/instant-outbound/{CALLBACK_TOKEN}",
-        json=payload,
+@pytest.mark.asyncio
+async def test_provider_completion_retries_are_idempotent(api: APIHarness) -> None:
+    event_id = await _create_nonblocking_event(api, suffix="completion-retry")
+    payload = ProviderWebhookPayload(
+        attempt_id=f"fake-attempt-{event_id}",
+        status="busy",
+        provider="fake",
+        failure_reason="Line busy.",
     )
 
-    assert first.status_code == 200
-    assert first.json()["created"] is True
-    assert replay.status_code == 200
-    assert replay.json()["created"] is False
-    assert replay.json()["event_id"] == event_id
+    first = await api.coordinator.reconcile_provider_completion(payload)
+    replay = await api.coordinator.reconcile_provider_completion(payload)
+
+    assert first["created"] is True
+    assert replay["created"] is False
+    assert replay["event_id"] == event_id
     timeline = await api.store.list_timeline(event_id=event_id, limit=100)
     assert sum(entry.kind.value == "webhook_received" for entry in timeline) == 1
 
 
+@pytest.mark.asyncio
 async def test_prepare_confirm_execute_runbook_is_exact_and_one_time(
     api: APIHarness,
 ) -> None:
-    created = await api.client.post(
-        "/v1/escalations/contact",
-        json=_contact_payload(wait_for_decision=False),
-        headers=_local_headers(),
+    event_id = await _create_nonblocking_event(api, suffix="runbook")
+    prepared = await api.coordinator.prepare_action(
+        PrepareActionRequest(
+            event_id=event_id,
+            action_type="demo.increase_db_ru_limit",
+            parameters={"target_ru": 800},
+            workspace_ref="workspace-demo",
+            thread_id="thread-demo",
+        )
     )
-    event_id = created.json()["event_id"]
+    exact_phrase = prepared.exact_readback.rsplit("say exactly: ", 1)[1]
+    rescoped = await api.coordinator.prepare_action(
+        PrepareActionRequest(
+            event_id=event_id,
+            action_type="demo.increase_db_ru_limit",
+            parameters={"target_ru": 800},
+            workspace_ref="different-workspace",
+            thread_id="thread-demo",
+        )
+    )
+    assert rescoped.action_hash != prepared.action_hash
+    assert rescoped.action_id != prepared.action_id
 
-    prepared = await api.client.post(
-        "/v1/sarvam/tools/prepare-action",
-        json={
-            "event_id": event_id,
+    unverified = await api.coordinator.confirm_action(
+        ConfirmActionRequest(
+            event_id=event_id,
+            action_id=prepared.action_id,
+            confirmation_nonce=prepared.confirmation_nonce,
+            exact_confirmation=exact_phrase,
+            confirmation_method="spoken_plus_dtmf",
+            confirmation_pin="135790",
+        )
+    )
+    assert unverified.confirmed is False
+    with pytest.raises(ActionHashMismatchError):
+        await api.coordinator.confirm_action(
+            ConfirmActionRequest(
+                event_id=event_id,
+                action_id=prepared.action_id,
+                confirmation_nonce=prepared.confirmation_nonce,
+                exact_confirmation="CONFIRM SOME OTHER ACTION",
+                confirmation_method="spoken_plus_dtmf",
+                confirmation_pin=OWNER_PIN,
+            )
+        )
+    confirmed = await api.coordinator.confirm_action(
+        ConfirmActionRequest(
+            event_id=event_id,
+            action_id=prepared.action_id,
+            confirmation_nonce=prepared.confirmation_nonce,
+            exact_confirmation=exact_phrase,
+            confirmation_method="spoken_plus_dtmf",
+            confirmation_pin=OWNER_PIN,
+        )
+    )
+    assert confirmed.confirmed is True
+    assert confirmed.grant_id is not None
+    execution_request = ExecuteActionRequest(
+        event_id=event_id,
+        action_id=prepared.action_id,
+        grant_id=confirmed.grant_id,
+    )
+    executed = await api.coordinator.execute_action(execution_request)
+    assert executed.executed is True
+    assert executed.result["status"] == "mock_succeeded"
+    assert executed.result["verified"] is True
+    replayed = await api.coordinator.execute_action(execution_request)
+    assert replayed == executed
+
+
+@pytest.mark.asyncio
+async def test_outbound_voice_action_and_final_decision_wake_waiter_with_result(
+    api: APIHarness,
+) -> None:
+    pending_contact = asyncio.create_task(
+        api.client.post(
+            "/v1/escalations/contact",
+            json=_contact_payload(
+                dedupe_key="api-test-complete-outbound-action-flow",
+            ),
+            headers=_local_headers(),
+        )
+    )
+    event_id, _request = await _wait_for_provider_call(api.provider)
+    session = (await api.store.list_sessions(event_id=event_id, limit=1))[0]
+    dispatcher = RealtimeToolDispatcher(
+        settings=api.coordinator.settings,
+        coordinator=api.coordinator,
+        event_id=event_id,
+        session_id=session.session_id,
+        direction="outbound_escalation",
+    )
+
+    async def verify_prepared_readback(
+        prepared: dict[str, Any],
+        *,
+        response_id: str,
+    ) -> None:
+        readback = prepared.get("response_text") or prepared.get("exact_readback")
+        assert isinstance(readback, str)
+        dispatcher.note_readback_transcript(response_id, readback)
+        dispatcher.note_response_done(response_id)
+        dispatcher.note_output_audio_stopped(response_id)
+        dispatcher.note_owner_speech_started()
+        dispatcher.note_owner_speech_stopped()
+        armed = await dispatcher.dispatch("arm_owner_verification", {})
+        assert armed.payload["armed"] is True
+        statuses = [
+            status
+            for digit in f"{OWNER_PIN}#"
+            if (status := dispatcher.receive_dtmf(digit)) is not None
+        ]
+        assert statuses == [
+            {
+                "verified": True,
+                "scope": prepared["scope"],
+                "subject_id": prepared["subject_id"],
+                "message": (
+                    "Trusted server signal: keypad verification succeeded for the current "
+                    "prepared request. Continue only with that exact request."
+                ),
+            }
+        ]
+
+    prepared_action = await dispatcher.dispatch(
+        "prepare_action",
+        {
             "action_type": "demo.increase_db_ru_limit",
             "parameters": {"target_ru": 800},
             "workspace_ref": "workspace-demo",
             "thread_id": "thread-demo",
-            "commit_or_state_hash": "state-before-increase",
         },
-        headers=_tool_headers(),
     )
-    assert prepared.status_code == 200
-    prepared_payload = prepared.json()
-    exact_phrase = prepared_payload["exact_readback"].rsplit("say exactly: ", 1)[1]
-    rescoped = await api.client.post(
-        "/v1/sarvam/tools/prepare-action",
-        json={
-            "event_id": event_id,
-            "action_type": "demo.increase_db_ru_limit",
-            "parameters": {"target_ru": 800},
-            "workspace_ref": "different-workspace",
-            "thread_id": "thread-demo",
-            "commit_or_state_hash": "different-state",
-        },
-        headers=_tool_headers(),
+    action_id = prepared_action.payload["action_id"]
+    action_scope = {
+        **prepared_action.payload,
+        "scope": "action",
+        "subject_id": action_id,
+    }
+    await verify_prepared_readback(
+        action_scope,
+        response_id="resp_complete_action_readback",
     )
-    assert rescoped.status_code == 200
-    assert rescoped.json()["action_hash"] != prepared_payload["action_hash"]
-    assert rescoped.json()["action_id"] != prepared_payload["action_id"]
-
-    unverified = await api.client.post(
-        "/v1/sarvam/tools/confirm-action",
-        json={
-            "event_id": event_id,
-            "action_id": prepared_payload["action_id"],
-            "confirmation_nonce": prepared_payload["confirmation_nonce"],
+    exact_phrase = prepared_action.payload["exact_readback"].rsplit(
+        "say exactly: ",
+        1,
+    )[1]
+    confirmed = await dispatcher.dispatch(
+        "confirm_action",
+        {
+            "action_id": action_id,
             "exact_confirmation": exact_phrase,
-            "confirmation_method": "spoken_plus_dtmf",
-            "confirmation_pin": "135790",
         },
-        headers=_tool_headers(),
     )
-    wrong_readback = await api.client.post(
-        "/v1/sarvam/tools/confirm-action",
-        json={
-            "event_id": event_id,
-            "action_id": prepared_payload["action_id"],
-            "confirmation_nonce": prepared_payload["confirmation_nonce"],
-            "exact_confirmation": "CONFIRM SOME OTHER ACTION",
-            "confirmation_method": "spoken_plus_dtmf",
-            "confirmation_pin": OWNER_PIN,
+    assert confirmed.payload["confirmed"] is True
+
+    executed = await dispatcher.dispatch(
+        "execute_action",
+        {"action_id": action_id},
+    )
+    assert executed.payload["executed"] is True
+    assert executed.payload["result"]["status"] == "mock_succeeded"
+
+    prepared_decision = await dispatcher.dispatch(
+        "prepare_decision",
+        {
+            "outcome": "instruct",
+            "instruction": "Keep the database at 800 RUs and resume requests.",
+            "constraints": ["Do not exceed 800 RUs."],
+            "approved_action_ids": [action_id],
         },
-        headers=_tool_headers(),
     )
-    confirmed = await api.client.post(
-        "/v1/sarvam/tools/confirm-action",
-        json={
-            "event_id": event_id,
-            "action_id": prepared_payload["action_id"],
-            "confirmation_nonce": prepared_payload["confirmation_nonce"],
-            "exact_confirmation": exact_phrase,
-            "confirmation_method": "spoken_plus_dtmf",
-            "confirmation_pin": OWNER_PIN,
-        },
-        headers=_tool_headers(),
-    )
-
-    assert unverified.status_code == 200
-    assert unverified.json()["confirmed"] is False
-    assert wrong_readback.status_code == 409
-    assert confirmed.status_code == 200
-    assert confirmed.json()["confirmed"] is True
-
-    execution_request = {
-        "event_id": event_id,
-        "action_id": prepared_payload["action_id"],
-        "grant_id": confirmed.json()["grant_id"],
+    decision_scope = {
+        **prepared_decision.payload,
+        "scope": "decision",
+        "subject_id": prepared_decision.payload["confirmation_id"],
     }
-    executed = await api.client.post(
-        "/v1/sarvam/tools/execute-action",
-        json=execution_request,
-        headers=_tool_headers(),
+    await verify_prepared_readback(
+        decision_scope,
+        response_id="resp_complete_decision_readback",
     )
-    replay = await api.client.post(
-        "/v1/sarvam/tools/execute-action",
-        json=execution_request,
-        headers=_tool_headers(),
+    recorded = await dispatcher.dispatch(
+        "record_decision",
+        {"confirmation_id": prepared_decision.payload["confirmation_id"]},
     )
+    assert recorded.payload["accepted"] is True
 
-    assert executed.status_code == 200
-    assert executed.json()["executed"] is True
-    assert executed.json()["result"]["status"] == "mock_succeeded"
-    assert executed.json()["result"]["verified"] is True
-    assert replay.status_code == 409
-
-
-async def test_demo_prepare_auto_executes_spawn_once_and_dedupes_retry(
-    auto_execute_api: APIHarness,
-) -> None:
-    created = await auto_execute_api.client.post(
-        "/v1/escalations/contact",
-        json=_contact_payload(wait_for_decision=False),
-        headers=_local_headers(),
-    )
-    event_id = created.json()["event_id"]
-    request = {
-        "event_id": event_id,
-        "action_type": "thread.spawn_root",
-        "action_task": "Investigate the database incident.",
-        "action_cwd": ".",
-    }
-
-    first = await auto_execute_api.client.post(
-        "/v1/sarvam/tools/prepare-action",
-        json=request,
-        headers=_tool_headers(),
-    )
-    retry = await auto_execute_api.client.post(
-        "/v1/sarvam/tools/prepare-action",
-        json=request,
-        headers=_tool_headers(),
-    )
-
-    assert first.status_code == 200
-    assert first.json()["executed"] is True
-    assert first.json()["already_executed"] is False
-    assert first.json()["result"] == {
-        "action": "spawned",
-        "thread_id": "thread-demo-spawned",
-        "turn_id": "turn-demo-spawned",
-    }
-    assert retry.status_code == 200
-    assert retry.json()["executed"] is True
-    assert retry.json()["already_executed"] is True
-    assert retry.json()["action_id"] == first.json()["action_id"]
-    assert retry.json()["action_hash"] == first.json()["action_hash"]
-    assert auto_execute_api.controller.spawn_calls == [("Investigate the database incident.", ".")]
-    timeline = await auto_execute_api.store.list_timeline(event_id=event_id, limit=100)
-    assert [entry.kind.value for entry in timeline].count("action_prepared") == 1
-    assert [entry.kind.value for entry in timeline].count("action_confirmed") == 1
-    assert [entry.kind.value for entry in timeline].count("action_consumed") == 1
+    response = await asyncio.wait_for(pending_contact, timeout=2)
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["status"] == "resolved"
+    assert payload["outcome"] == "instruct"
+    assert payload["approved_action_ids"] == [action_id]
+    assert payload["action_results"] == [
+        {
+            "action_id": action_id,
+            "status": "succeeded",
+            "message_to_user": executed.payload["message_to_user"],
+            "result": executed.payload["result"],
+            "retryable": False,
+            "operation_id": executed.payload["operation_id"],
+        }
+    ]
 
 
+@pytest.mark.asyncio
 async def test_inbound_control_discloses_nothing_to_unallowlisted_callers(
     api: APIHarness,
 ) -> None:
-    rejected = await api.client.post(
-        "/v1/sarvam/tools/begin-inbound",
-        json={
-            "caller_phone_number": "+12025550148",
-            "interaction_id": "interaction-unlisted",
-        },
-        headers=_tool_headers(),
+    rejected = await api.coordinator.begin_inbound_session(
+        BeginInboundSessionRequest(
+            caller_phone_number="+12025550148",
+            interaction_id="interaction-unlisted",
+        )
     )
-    malformed = await api.client.post(
-        "/v1/sarvam/tools/begin-inbound",
-        json={
-            "caller_phone_number": "not-a-phone",
-            "interaction_id": "interaction-malformed",
-        },
-        headers=_tool_headers(),
+    malformed = await api.coordinator.begin_inbound_session(
+        BeginInboundSessionRequest(
+            caller_phone_number="not-a-phone",
+            interaction_id="interaction-malformed",
+        )
     )
-    accepted = await api.client.post(
-        "/v1/sarvam/tools/begin-inbound",
-        json={
-            "caller_phone_number": "0012025550147",
-            "interaction_id": "interaction-owner",
-        },
-        headers=_tool_headers(),
+    accepted = await api.coordinator.begin_inbound_session(
+        BeginInboundSessionRequest(
+            caller_phone_number="0012025550147",
+            interaction_id="interaction-owner",
+        )
     )
-    replay = await api.client.post(
-        "/v1/sarvam/tools/begin-inbound",
-        json={
-            "caller_phone_number": "+12025550147",
-            "interaction_id": "interaction-owner",
-        },
-        headers=_tool_headers(),
+    replay = await api.coordinator.begin_inbound_session(
+        BeginInboundSessionRequest(
+            caller_phone_number="+12025550147",
+            interaction_id="interaction-owner",
+        )
     )
 
-    assert rejected.status_code == 200
-    assert rejected.json()["accepted"] is False
-    assert rejected.json()["event_id"] is None
-    assert rejected.json()["identity_verified"] is False
-    assert malformed.status_code == 200
-    assert malformed.json()["accepted"] is False
-    assert accepted.status_code == 200
-    assert accepted.json()["accepted"] is True
-    assert accepted.json()["identity_verified"] is False
-    assert accepted.json()["event_id"].startswith("evt_")
-    assert replay.status_code == 200
-    assert replay.json()["accepted"] is True
-    assert replay.json()["identity_verified"] is False
-    assert replay.json()["event_id"] == accepted.json()["event_id"]
-    listed = await api.client.post(
-        "/v1/sarvam/tools/threads/list",
-        json={"event_id": accepted.json()["event_id"], "limit": 10},
-        headers=_tool_headers(),
+    assert rejected.accepted is False
+    assert rejected.event_id is None
+    assert rejected.identity_verified is False
+    assert malformed.accepted is False
+    assert accepted.accepted is True
+    assert accepted.identity_verified is False
+    assert accepted.event_id is not None
+    assert replay.event_id == accepted.event_id
+    listed = await api.coordinator.list_threads(ThreadListRequest(event_id=accepted.event_id))
+    inspected = await api.coordinator.inspect_thread(
+        ThreadInspectRequest(
+            event_id=accepted.event_id,
+            reference="thread-running",
+        )
     )
-    inspected = await api.client.post(
-        "/v1/sarvam/tools/threads/inspect",
-        json={"event_id": accepted.json()["event_id"], "reference": "thread-running"},
-        headers=_tool_headers(),
-    )
-    assert listed.status_code == 200
-    assert inspected.status_code == 200
+    assert listed["threads"]
+    assert inspected["thread_id"] == "thread-running"
     events = await api.store.list_events(limit=10)
-    assert [event.event_id for event in events] == [accepted.json()["event_id"]]
+    assert [event.event_id for event in events] == [accepted.event_id]
 
 
-async def test_thread_reads_accept_only_a_provider_correlated_live_outbound_call(
+@pytest.mark.asyncio
+async def test_thread_reads_accept_only_provider_correlated_live_calls(
     api: APIHarness,
 ) -> None:
-    created = await api.client.post(
-        "/v1/escalations/contact",
-        json=_contact_payload(wait_for_decision=False),
-        headers=_local_headers(),
+    event_id = await _create_nonblocking_event(api, suffix="thread-reads")
+    listed = await api.coordinator.list_threads(ThreadListRequest(event_id=event_id))
+    inspected = await api.coordinator.inspect_thread(
+        ThreadInspectRequest(event_id=event_id, reference="thread-running")
     )
-    assert created.status_code == 200
-    event_id = created.json()["event_id"]
+    context = await api.coordinator.escalation_context(EscalationContextRequest(event_id=event_id))
 
-    listed = await api.client.post(
-        "/v1/sarvam/tools/threads/list",
-        json={"event_id": event_id, "limit": 10},
-        headers=_tool_headers(),
-    )
-    inspected = await api.client.post(
-        "/v1/sarvam/tools/threads/inspect",
-        json={"event_id": event_id, "reference": "thread-running"},
-        headers=_tool_headers(),
-    )
+    assert [item["thread_id"] for item in listed["threads"]] == ["thread-running"]
+    assert inspected["thread_id"] == "thread-running"
+    assert context.event_id == event_id
 
-    assert listed.status_code == 200
-    assert [item["thread_id"] for item in listed.json()["threads"]] == ["thread-running"]
-    assert inspected.status_code == 200
-    assert inspected.json()["thread_id"] == "thread-running"
-
-    completed = await api.client.post(
-        f"/v1/sarvam/webhooks/instant-outbound/{CALLBACK_TOKEN}",
-        json={
-            "attempt_id": f"fake-attempt-{event_id}",
-            "status": "connected",
-            "duration": 5.0,
-            "channel_info": {"direction": "outbound"},
-        },
+    await api.coordinator.reconcile_provider_completion(
+        ProviderWebhookPayload(
+            attempt_id=f"fake-attempt-{event_id}",
+            status="connected",
+            provider="fake",
+            duration_seconds=5,
+        )
     )
-    stale = await api.client.post(
-        "/v1/sarvam/tools/threads/list",
-        json={"event_id": event_id, "limit": 10},
-        headers=_tool_headers(),
-    )
-    stale_inspection = await api.client.post(
-        "/v1/sarvam/tools/threads/inspect",
-        json={"event_id": event_id, "reference": "thread-running"},
-        headers=_tool_headers(),
-    )
-
-    assert completed.status_code == 200
-    assert stale.status_code == 403
-    assert stale_inspection.status_code == 403
+    with pytest.raises(PermissionError):
+        await api.coordinator.list_threads(ThreadListRequest(event_id=event_id))
+    with pytest.raises(PermissionError):
+        await api.coordinator.inspect_thread(
+            ThreadInspectRequest(event_id=event_id, reference="thread-running")
+        )
 
 
+@pytest.mark.asyncio
 async def test_thread_list_uses_warm_cache_for_exact_running_status_queries(
     api: APIHarness,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    created = await api.client.post(
-        "/v1/escalations/contact",
-        json=_contact_payload(wait_for_decision=False),
-        headers=_local_headers(),
-    )
-    event_id = created.json()["event_id"]
+    event_id = await _create_nonblocking_event(api, suffix="warm-cache")
     decoys = tuple(
         ThreadCandidate(
             thread_id=f"thread-decoy-{index}",
@@ -1195,35 +1154,31 @@ async def test_thread_list_uses_warm_cache_for_exact_running_status_queries(
     )
     caplog.set_level(logging.INFO, logger="agent_hotline.coordinator")
 
-    active = await api.client.post(
-        "/v1/sarvam/tools/threads/list",
-        json={"event_id": event_id, "query": "active", "limit": 10},
-        headers=_tool_headers(),
+    active = await api.coordinator.list_threads(
+        ThreadListRequest(event_id=event_id, query="active")
     )
-    running = await api.client.post(
-        "/v1/sarvam/tools/threads/list",
-        json={"event_id": event_id, "query": "running", "limit": 25},
-        headers=_tool_headers(),
+    running = await api.coordinator.list_threads(
+        ThreadListRequest(event_id=event_id, query="running", limit=25)
     )
-    in_progress = await api.client.post(
-        "/v1/sarvam/tools/threads/list",
-        json={"event_id": event_id, "query": "in progress", "limit": 10},
-        headers=_tool_headers(),
+    in_progress = await api.coordinator.list_threads(
+        ThreadListRequest(event_id=event_id, query="in progress")
     )
-    absent = await api.client.post(
-        "/v1/sarvam/tools/threads/list",
-        json={"event_id": event_id, "query": "definitely-absent", "limit": 10},
-        headers=_tool_headers(),
+    absent = await api.coordinator.list_threads(
+        ThreadListRequest(event_id=event_id, query="definitely-absent")
     )
 
-    assert [item["thread_id"] for item in active.json()["threads"]] == [
+    assert [item["thread_id"] for item in active["threads"]] == [
         "thread-running",
         "thread-active-beyond-cache",
     ]
-    assert [item["thread_id"] for item in running.json()["threads"]] == ["thread-running"]
-    assert [item["thread_id"] for item in in_progress.json()["threads"]] == ["thread-running"]
-    assert absent.json()["threads"] == []
-    assert api.controller.list_limits[-4:] == [100, 10, 10, 100]
+    assert [item["thread_id"] for item in running["threads"]] == ["thread-running"]
+    assert [item["thread_id"] for item in in_progress["threads"]] == ["thread-running"]
+    assert absent["threads"] == []
+    assert api.controller.list_limits[-2:] == [10, 10]
+    assert api.controller.searches[-2:] == [
+        ("active", 10),
+        ("definitely-absent", 10),
+    ]
     duration_messages = [
         record.getMessage()
         for record in caplog.records
@@ -1236,7 +1191,10 @@ async def test_thread_list_uses_warm_cache_for_exact_running_status_queries(
     assert all("running" not in message for message in duration_messages)
 
 
-async def test_thread_reads_reject_an_uncorrelated_outbound_session(api: APIHarness) -> None:
+@pytest.mark.asyncio
+async def test_voice_tools_reject_an_uncorrelated_outbound_session(
+    api: APIHarness,
+) -> None:
     event = EscalationEvent(kind="status", summary="Uncorrelated outbound call.")
     await api.store.create_event(event)
     await api.store.transition_event(event.event_id, EventState.QUEUED)
@@ -1249,37 +1207,31 @@ async def test_thread_reads_reject_an_uncorrelated_outbound_session(api: APIHarn
         )
     )
 
-    rejected = await api.client.post(
-        "/v1/sarvam/tools/threads/list",
-        json={"event_id": event.event_id, "limit": 10},
-        headers=_tool_headers(),
-    )
-    rejected_inspection = await api.client.post(
-        "/v1/sarvam/tools/threads/inspect",
-        json={"event_id": event.event_id, "reference": "thread-running"},
-        headers=_tool_headers(),
-    )
-    rejected_context = await api.client.post(
-        "/v1/sarvam/tools/context",
-        json={"event_id": event.event_id},
-        headers=_tool_headers(),
-    )
-    rejected_action = await api.client.post(
-        "/v1/sarvam/tools/prepare-action",
-        json={
-            "event_id": event.event_id,
-            "action_type": "demo.pause_deployment",
-            "parameters": {},
-        },
-        headers=_tool_headers(),
-    )
+    async def operations() -> None:
+        await api.coordinator.list_threads(ThreadListRequest(event_id=event.event_id))
 
-    assert rejected.status_code == 403
-    assert rejected_inspection.status_code == 403
-    assert rejected_context.status_code == 403
-    assert rejected_action.status_code == 403
+    with pytest.raises(PermissionError):
+        await operations()
+    with pytest.raises(PermissionError):
+        await api.coordinator.inspect_thread(
+            ThreadInspectRequest(
+                event_id=event.event_id,
+                reference="thread-running",
+            )
+        )
+    with pytest.raises(PermissionError):
+        await api.coordinator.escalation_context(EscalationContextRequest(event_id=event.event_id))
+    with pytest.raises(PermissionError):
+        await api.coordinator.prepare_action(
+            PrepareActionRequest(
+                event_id=event.event_id,
+                action_type="demo.pause_deployment",
+                parameters={},
+            )
+        )
 
 
+@pytest.mark.asyncio
 async def test_missing_owner_pin_configuration_denies_grants_and_approvals(
     tmp_path: Path,
 ) -> None:
@@ -1289,8 +1241,7 @@ async def test_missing_owner_pin_configuration_denies_grants_and_approvals(
         hotline_database_path=tmp_path / "missing-pin.sqlite3",
         hotline_transport="fake",
         hotline_local_token=LOCAL_TOKEN,
-        hotline_tool_token=TOOL_TOKEN,
-        hotline_callback_token=CALLBACK_TOKEN,
+        hotline_action_signing_secret=CALLBACK_TOKEN,
         owner_phone_number="+919876543210",
         owner_confirmation_pin="",
         codex_app_server_enabled=False,
@@ -1303,49 +1254,41 @@ async def test_missing_owner_pin_configuration_denies_grants_and_approvals(
             base_url="http://testserver",
         ) as client:
             created = await client.post(
-                "/v1/escalations/contact",
+                "/v1/escalations/notify",
                 json=_contact_payload(wait_for_decision=False),
                 headers=_local_headers(),
             )
             event_id = created.json()["event_id"]
-            rejected_approval = await client.post(
-                "/v1/sarvam/tools/record-instruction",
-                json={
-                    "event_id": event_id,
-                    "outcome": "approve",
-                    "instruction": "Approve this operation.",
-                    "confirmation_method": "spoken_plus_dtmf",
-                    "confirmation_pin": OWNER_PIN,
-                },
-                headers=_tool_headers(),
+            coordinator: HotlineCoordinator = app.state.coordinator
+            with pytest.raises(PermissionError, match="second-factor"):
+                await coordinator.record_instruction(
+                    RecordInstructionRequest(
+                        event_id=event_id,
+                        outcome="approve",
+                        instruction="Approve this operation.",
+                        confirmation_pin=OWNER_PIN,
+                    )
+                )
+            prepared = await coordinator.prepare_action(
+                PrepareActionRequest(
+                    event_id=event_id,
+                    action_type="demo.pause_deployment",
+                    parameters={},
+                )
             )
-            prepared = await client.post(
-                "/v1/sarvam/tools/prepare-action",
-                json={
-                    "event_id": event_id,
-                    "action_type": "demo.pause_deployment",
-                    "parameters": {},
-                },
-                headers=_tool_headers(),
-            )
-            prepared_payload = prepared.json()
-            rejected_grant = await client.post(
-                "/v1/sarvam/tools/confirm-action",
-                json={
-                    "event_id": event_id,
-                    "action_id": prepared_payload["action_id"],
-                    "confirmation_nonce": prepared_payload["confirmation_nonce"],
-                    "exact_confirmation": prepared_payload["exact_readback"].rsplit(
+            rejected_grant = await coordinator.confirm_action(
+                ConfirmActionRequest(
+                    event_id=event_id,
+                    action_id=prepared.action_id,
+                    confirmation_nonce=prepared.confirmation_nonce,
+                    exact_confirmation=prepared.exact_readback.rsplit(
                         "say exactly: ",
                         1,
                     )[1],
-                    "confirmation_method": "spoken_plus_dtmf",
-                    "confirmation_pin": OWNER_PIN,
-                },
-                headers=_tool_headers(),
+                    confirmation_method="spoken_plus_dtmf",
+                    confirmation_pin=OWNER_PIN,
+                )
             )
 
-    assert rejected_approval.status_code == 403
-    assert rejected_grant.status_code == 200
-    assert rejected_grant.json()["confirmed"] is False
-    assert OWNER_PIN not in rejected_approval.text + rejected_grant.text
+    assert rejected_grant.confirmed is False
+    assert OWNER_PIN not in rejected_grant.model_dump_json()

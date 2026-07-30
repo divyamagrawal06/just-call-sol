@@ -1,4 +1,4 @@
-"""Provider seam kept intentionally narrow until the native slice is proven."""
+"""Outbound carrier seam; conversation runtimes are owned separately by the daemon."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from .contracts import ContactHumanRequest
-from .sarvam import SarvamClient
 from .settings import Settings
+from .twilio import TwilioAPIError, TwilioClient
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,36 +16,42 @@ class CallAttempt:
     provider: str
 
 
+class CallPlacementOutcomeUnknownError(RuntimeError):
+    """Raised when the carrier may have created a call but returned no usable ID."""
+
+
 class CallProvider(Protocol):
     async def place_call(self, event_id: str, request: ContactHumanRequest) -> CallAttempt: ...
+
+    async def terminate_call(self, attempt_id: str) -> None: ...
 
     async def close(self) -> None: ...
 
 
-class SarvamCallProvider:
-    def __init__(self, settings: Settings, client: SarvamClient | None = None) -> None:
+class OpenAIRealtimeCallProvider:
+    """Originate PSTN through Twilio; OpenAI Realtime handles the SIP conversation."""
+
+    def __init__(self, settings: Settings, client: TwilioClient | None = None) -> None:
         self.settings = settings
-        self.client = client or SarvamClient(settings)
+        self.client = client or TwilioClient(settings)
         self._owns_client = client is None
 
     async def place_call(self, event_id: str, request: ContactHumanRequest) -> CallAttempt:
-        owner_phone = self.settings.owner_phone_number.get_secret_value()
-        outbound = self.client.build_outbound_request(
-            event_id=event_id,
-            owner_phone_number=owner_phone,
-            trigger=request.kind,
-            urgency=request.severity,
-            summary=request.summary,
-            thread_id=request.context.thread_id,
-            initial_bot_message=_initial_message(request),
-            initial_language_name="English",
-            metadata={
-                "source": request.source,
-                "dedupe_key": request.dedupe_key,
-            },
+        try:
+            result = await self.client.place_call(event_id, request)
+        except TwilioAPIError as exc:
+            if exc.outcome_unknown:
+                raise CallPlacementOutcomeUnknownError(
+                    "carrier call creation has an unknown outcome"
+                ) from exc
+            raise
+        return CallAttempt(
+            attempt_id=result.attempt_id,
+            provider="openai_realtime",
         )
-        result = await self.client.create_outbound_call(outbound)
-        return CallAttempt(attempt_id=result.attempt_id, provider="sarvam")
+
+    async def terminate_call(self, attempt_id: str) -> None:
+        await self.client.end_call(attempt_id)
 
     async def close(self) -> None:
         if self._owns_client:
@@ -57,10 +63,14 @@ class FakeCallProvider:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, ContactHumanRequest]] = []
+        self.terminated_attempts: list[str] = []
 
     async def place_call(self, event_id: str, request: ContactHumanRequest) -> CallAttempt:
         self.calls.append((event_id, request))
         return CallAttempt(attempt_id=f"fake-attempt-{event_id}", provider="fake")
+
+    async def terminate_call(self, attempt_id: str) -> None:
+        self.terminated_attempts.append(attempt_id)
 
     async def close(self) -> None:
         return None
@@ -71,20 +81,16 @@ class DisabledCallProvider:
         del event_id, request
         raise RuntimeError("Call transport is disabled")
 
+    async def terminate_call(self, attempt_id: str) -> None:
+        del attempt_id
+
     async def close(self) -> None:
         return None
 
 
 def create_call_provider(settings: Settings) -> CallProvider:
-    if settings.hotline_transport == "sarvam":
-        return SarvamCallProvider(settings)
+    if settings.hotline_transport == "openai_realtime":
+        return OpenAIRealtimeCallProvider(settings)
     if settings.hotline_transport == "fake":
         return FakeCallProvider()
     return DisabledCallProvider()
-
-
-def _initial_message(request: ContactHumanRequest) -> str:
-    return (
-        "Wassup Divyam — it's your agent on the line. "
-        f"{request.summary} I need your call on one thing: {request.question}"
-    )[:1200]

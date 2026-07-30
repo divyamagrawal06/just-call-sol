@@ -14,8 +14,8 @@ from agent_hotline.models import (
     Decision,
     EscalationEvent,
     PreparedAction,
+    ProviderWebhookPayload,
     RiskLevel,
-    SarvamWebhookPayload,
     Severity,
     utc_now,
 )
@@ -69,7 +69,7 @@ def test_raw_phone_and_secret_material_are_rejected() -> None:
         )
 
     with pytest.raises(ValidationError, match="raw phone"):
-        SarvamWebhookPayload(
+        ProviderWebhookPayload(
             attempt_id="attempt_123",
             status="failed",
             metadata={"callback": "+12025550123"},

@@ -11,9 +11,12 @@ import asyncio
 import hashlib
 import hmac
 import json
+import re
+import secrets
 import sqlite3
 from collections.abc import Iterable
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +30,9 @@ from agent_hotline.models import (
     TERMINAL_SESSION_STATES,
     ActionGrant,
     ActionState,
+    CallTerminationJob,
+    CallTerminationLeg,
+    CallTerminationState,
     ConfirmationMethod,
     ContactSession,
     ContextSnapshot,
@@ -38,7 +44,7 @@ from agent_hotline.models import (
     FallbackState,
     GrantState,
     PreparedAction,
-    SarvamWebhookPayload,
+    ProviderWebhookPayload,
     SessionState,
     TimelineEntry,
     TimelineKind,
@@ -68,6 +74,10 @@ class ConflictError(StorageError):
 
 class InvalidStateTransitionError(StorageError):
     """Raised when a state machine transition is not allowed."""
+
+
+class EventDeadlineExpiredError(InvalidStateTransitionError):
+    """Raised when an authority-bearing write arrives after its event deadline."""
 
 
 class ActiveSessionError(ConflictError):
@@ -102,7 +112,7 @@ class FallbackAlreadyConsumedError(ConflictError):
     """Raised when a one-time fallback submission is replayed."""
 
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 6
 _ACTIVE_EVENT_VALUES = (
     EventState.DETECTED.value,
     EventState.QUEUED.value,
@@ -170,6 +180,30 @@ WHERE state IN ({",".join(repr(value) for value in _ACTIVE_SESSION_VALUES)});
 CREATE INDEX IF NOT EXISTS ix_sessions_event
 ON contact_sessions(event_id, started_at DESC);
 
+CREATE TABLE IF NOT EXISTS call_termination_jobs (
+    job_id TEXT PRIMARY KEY,
+    session_id TEXT REFERENCES contact_sessions(session_id) ON DELETE SET NULL,
+    event_id TEXT REFERENCES events(event_id) ON DELETE SET NULL,
+    provider_leg TEXT NOT NULL CHECK (provider_leg IN ('openai', 'carrier')),
+    target_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'confirmed')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    next_attempt_at TEXT NOT NULL,
+    last_attempt_at TEXT,
+    last_error_type TEXT,
+    confirmed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (provider_leg, target_id),
+    UNIQUE (session_id, provider_leg)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS ix_call_termination_jobs_due
+ON call_termination_jobs(state, next_attempt_at, created_at);
+
+CREATE INDEX IF NOT EXISTS ix_call_termination_jobs_session
+ON call_termination_jobs(session_id, provider_leg);
+
 CREATE TABLE IF NOT EXISTS decisions (
     decision_id TEXT PRIMARY KEY,
     event_id TEXT NOT NULL UNIQUE REFERENCES events(event_id) ON DELETE RESTRICT,
@@ -192,6 +226,43 @@ CREATE TABLE IF NOT EXISTS provider_webhooks (
 
 CREATE INDEX IF NOT EXISTS ix_webhooks_attempt
 ON provider_webhooks(attempt_id, received_at DESC);
+
+CREATE TABLE IF NOT EXISTS ingress_receipts (
+    receipt_key TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    state TEXT NOT NULL,
+    attempts INTEGER NOT NULL,
+    received_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS ix_ingress_receipts_subject
+ON ingress_receipts(kind, subject_id, received_at DESC);
+
+CREATE TABLE IF NOT EXISTS carrier_admissions (
+    call_sid TEXT PRIMARY KEY,
+    caller_phone TEXT NOT NULL,
+    admission_nonce TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    consumed_by_call_id TEXT,
+    created_at TEXT NOT NULL,
+    consumed_at TEXT
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS realtime_tool_receipts (
+    provider_call_id TEXT NOT NULL,
+    tool_call_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    arguments_hash TEXT NOT NULL,
+    output_json TEXT NOT NULL,
+    request_response INTEGER NOT NULL DEFAULT 1 CHECK (request_response IN (0, 1)),
+    delivery_state TEXT NOT NULL DEFAULT 'pending'
+        CHECK (delivery_state IN ('pending', 'output_sent', 'delivered')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (provider_call_id, tool_call_id)
+) STRICT;
 
 CREATE TABLE IF NOT EXISTS prepared_actions (
     action_id TEXT PRIMARY KEY,
@@ -266,6 +337,94 @@ ON timeline(session_id, occurred_at, timeline_id);
 """
 
 
+@dataclass(frozen=True, slots=True)
+class IngressReceiptClaim:
+    """Durable result of claiming one externally delivered webhook."""
+
+    created: bool
+    processed: bool
+    attempts: int
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeToolDeliveryReceipt:
+    """Durable function result plus its sideband delivery phase."""
+
+    tool_name: str
+    arguments_hash: str
+    output_json: str
+    request_response: bool
+    delivery_state: str
+
+
+@dataclass(frozen=True, slots=True)
+class CarrierAdmission:
+    """One short-lived, one-use bridge from a verified carrier webhook to SIP."""
+
+    call_sid: str
+    caller_phone: str
+    admission_nonce: str
+    expires_at: datetime
+    consumed_by_call_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ConsumedCarrierLeg:
+    """Secret-free correlation for a consumed Twilio-to-OpenAI admission."""
+
+    call_sid: str
+    provider_call_id: str
+
+
+def _termination_job_from_row(row: aiosqlite.Row) -> CallTerminationJob:
+    """Load one termination job without retaining provider response bodies."""
+
+    return CallTerminationJob(
+        job_id=row["job_id"],
+        session_id=row["session_id"],
+        event_id=row["event_id"],
+        leg=row["provider_leg"],
+        target_id=row["target_id"],
+        state=row["state"],
+        attempts=int(row["attempts"]),
+        next_attempt_at=datetime.fromisoformat(row["next_attempt_at"]),
+        last_attempt_at=(
+            datetime.fromisoformat(row["last_attempt_at"])
+            if row["last_attempt_at"] is not None
+            else None
+        ),
+        last_error_type=row["last_error_type"],
+        confirmed_at=(
+            datetime.fromisoformat(row["confirmed_at"]) if row["confirmed_at"] is not None else None
+        ),
+        created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
+
+
+async def _migrate_realtime_tool_receipts(connection: aiosqlite.Connection) -> None:
+    """Add delivery-phase columns without replaying legacy, already-sent results."""
+
+    cursor = await connection.execute("PRAGMA table_info(realtime_tool_receipts)")
+    columns = {row["name"] for row in await cursor.fetchall()}
+    if "request_response" not in columns:
+        await connection.execute(
+            """
+            ALTER TABLE realtime_tool_receipts
+            ADD COLUMN request_response INTEGER NOT NULL DEFAULT 1
+                CHECK (request_response IN (0, 1))
+            """
+        )
+    if "delivery_state" not in columns:
+        await connection.execute(
+            """
+            ALTER TABLE realtime_tool_receipts
+            ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'delivered'
+                CHECK (delivery_state IN ('pending', 'output_sent', 'delivered'))
+            """
+        )
+
+
 def _as_utc(value: datetime | None) -> datetime:
     if value is None:
         return utc_now()
@@ -302,7 +461,7 @@ class SQLiteStore:
         return self._connection
 
     async def initialize(self) -> None:
-        """Open the database, enable WAL/foreign keys, and install the schema."""
+        """Open the database, migrate additively, and enable durable WAL semantics."""
 
         if self._connection is not None:
             return
@@ -319,7 +478,24 @@ class SQLiteStore:
             await connection.execute("PRAGMA busy_timeout = 5000")
             await connection.execute("PRAGMA synchronous = FULL")
             await connection.execute("PRAGMA journal_mode = WAL")
+            cursor = await connection.execute("PRAGMA user_version")
+            row = await cursor.fetchone()
+            current_version = 0 if row is None else int(row[0])
+            if current_version > _SCHEMA_VERSION:
+                raise StorageError(
+                    f"database schema {current_version} is newer than supported "
+                    f"schema {_SCHEMA_VERSION}"
+                )
+            if 0 < current_version < _SCHEMA_VERSION and str(self.path) != ":memory:":
+                backup_path = self.path.with_name(f"{self.path.name}.pre-v{_SCHEMA_VERSION}.bak")
+                if not backup_path.exists():
+                    backup = sqlite3.connect(str(backup_path))
+                    try:
+                        await connection.backup(backup)
+                    finally:
+                        backup.close()
             await connection.executescript(_DDL)
+            await _migrate_realtime_tool_receipts(connection)
             await connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         except BaseException:
             await connection.close()
@@ -374,6 +550,33 @@ class SQLiteStore:
         row = await cursor.fetchone()
         return None if row is None else _load(ContactSession, row["payload_json"])
 
+    async def _require_active_session_event_locked(
+        self,
+        session: ContactSession,
+        *,
+        timestamp: datetime,
+    ) -> None:
+        if session.state.value not in _ACTIVE_SESSION_VALUES or session.event_id is None:
+            raise InvalidStateTransitionError("provider correlation session is no longer active")
+        event = await self._fetch_event_locked(session.event_id)
+        if (
+            event is None
+            or event.state.value not in _ACTIVE_EVENT_VALUES
+            or (event.deadline_at is not None and timestamp >= event.deadline_at)
+        ):
+            raise InvalidStateTransitionError("provider correlation event is no longer active")
+
+    async def _fetch_call_termination_job_locked(
+        self,
+        job_id: str,
+    ) -> CallTerminationJob | None:
+        cursor = await self.connection.execute(
+            "SELECT * FROM call_termination_jobs WHERE job_id = ?",
+            (job_id,),
+        )
+        row = await cursor.fetchone()
+        return None if row is None else _termination_job_from_row(row)
+
     async def _fetch_action_locked(self, action_id: str) -> PreparedAction | None:
         cursor = await self.connection.execute(
             "SELECT payload_json FROM prepared_actions WHERE action_id = ?",
@@ -381,6 +584,645 @@ class SQLiteStore:
         )
         row = await cursor.fetchone()
         return None if row is None else _load(PreparedAction, row["payload_json"])
+
+    async def claim_ingress_receipt(
+        self,
+        receipt_key: str,
+        *,
+        kind: str,
+        subject_id: str,
+        fingerprint: str,
+        received_at: datetime | None = None,
+    ) -> IngressReceiptClaim:
+        """Claim a signed webhook without persisting its sensitive raw payload.
+
+        A matching unfinished receipt may be reclaimed after a process restart.
+        Conflicting reuse of an external receipt ID fails closed.
+        """
+
+        timestamp = _as_utc(received_at)
+        if not receipt_key or len(receipt_key) > 300:
+            raise ValueError("receipt_key must contain 1 to 300 characters")
+        if not kind or len(kind) > 100:
+            raise ValueError("kind must contain 1 to 100 characters")
+        if not subject_id or len(subject_id) > 300:
+            raise ValueError("subject_id must contain 1 to 300 characters")
+        if len(fingerprint) != 64 or any(char not in "0123456789abcdef" for char in fingerprint):
+            raise ValueError("fingerprint must be a lowercase SHA-256 digest")
+
+        async with self._write_lock:
+            await self._begin()
+            try:
+                cursor = await self.connection.execute(
+                    """
+                    SELECT kind, subject_id, fingerprint, state, attempts
+                    FROM ingress_receipts
+                    WHERE receipt_key = ?
+                    """,
+                    (receipt_key,),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    attempts = 1
+                    await self.connection.execute(
+                        """
+                        INSERT INTO ingress_receipts (
+                            receipt_key, kind, subject_id, fingerprint, state,
+                            attempts, received_at, updated_at
+                        ) VALUES (?, ?, ?, ?, 'processing', ?, ?, ?)
+                        """,
+                        (
+                            receipt_key,
+                            kind,
+                            subject_id,
+                            fingerprint,
+                            attempts,
+                            _iso(timestamp),
+                            _iso(timestamp),
+                        ),
+                    )
+                    created = True
+                    processed = False
+                else:
+                    if (
+                        row["kind"] != kind
+                        or row["subject_id"] != subject_id
+                        or not hmac.compare_digest(row["fingerprint"], fingerprint)
+                    ):
+                        raise ConflictError("ingress receipt ID was reused with different content")
+                    processed = row["state"] == "processed"
+                    attempts = int(row["attempts"])
+                    created = False
+                    if not processed:
+                        attempts += 1
+                        await self.connection.execute(
+                            """
+                            UPDATE ingress_receipts
+                            SET state = 'processing', attempts = ?, updated_at = ?
+                            WHERE receipt_key = ?
+                            """,
+                            (attempts, _iso(timestamp), receipt_key),
+                        )
+            except BaseException:
+                await self._rollback()
+                raise
+            await self._commit()
+        return IngressReceiptClaim(
+            created=created,
+            processed=processed,
+            attempts=attempts,
+        )
+
+    async def complete_ingress_receipt(
+        self,
+        receipt_key: str,
+        *,
+        completed_at: datetime | None = None,
+    ) -> None:
+        timestamp = _as_utc(completed_at)
+        async with self._write_lock:
+            cursor = await self.connection.execute(
+                """
+                UPDATE ingress_receipts
+                SET state = 'processed', updated_at = ?
+                WHERE receipt_key = ?
+                """,
+                (_iso(timestamp), receipt_key),
+            )
+            if cursor.rowcount != 1:
+                raise NotFoundError(f"ingress receipt {receipt_key!r} does not exist")
+            await self.connection.commit()
+
+    async def release_ingress_receipt(
+        self,
+        receipt_key: str,
+        *,
+        released_at: datetime | None = None,
+    ) -> None:
+        """Leave a failed delivery retryable without erasing its dedupe identity."""
+
+        timestamp = _as_utc(released_at)
+        async with self._write_lock:
+            cursor = await self.connection.execute(
+                """
+                UPDATE ingress_receipts
+                SET state = 'pending', updated_at = ?
+                WHERE receipt_key = ? AND state != 'processed'
+                """,
+                (_iso(timestamp), receipt_key),
+            )
+            if cursor.rowcount not in {0, 1}:
+                raise StorageError("unexpected ingress receipt update count")
+            await self.connection.commit()
+
+    async def issue_carrier_admission(
+        self,
+        call_sid: str,
+        *,
+        caller_phone: str,
+        ttl_seconds: int,
+        issued_at: datetime | None = None,
+    ) -> CarrierAdmission:
+        """Issue the sole short-lived SIP admission capability for one Twilio CallSid."""
+
+        if not call_sid or len(call_sid) > 100:
+            raise ValueError("call_sid must contain 1 to 100 characters")
+        if not caller_phone or len(caller_phone) > 32:
+            raise ValueError("caller_phone must contain 1 to 32 characters")
+        if not 60 <= ttl_seconds <= 900:
+            raise ValueError("carrier admission TTL must be between 60 and 900 seconds")
+        timestamp = _as_utc(issued_at)
+        expires_at = timestamp + timedelta(seconds=ttl_seconds)
+        async with self._write_lock:
+            await self._begin()
+            try:
+                cursor = await self.connection.execute(
+                    """
+                    SELECT caller_phone, admission_nonce, expires_at, consumed_by_call_id
+                    FROM carrier_admissions
+                    WHERE call_sid = ?
+                    """,
+                    (call_sid,),
+                )
+                row = await cursor.fetchone()
+                if row is not None:
+                    if not hmac.compare_digest(row["caller_phone"], caller_phone):
+                        raise ConflictError("carrier CallSid was reused with a different caller")
+                    existing_expiry = datetime.fromisoformat(row["expires_at"]).astimezone(UTC)
+                    if timestamp >= existing_expiry:
+                        raise ConflictError("carrier admission has expired")
+                    admission = CarrierAdmission(
+                        call_sid=call_sid,
+                        caller_phone=caller_phone,
+                        admission_nonce=row["admission_nonce"],
+                        expires_at=existing_expiry,
+                        consumed_by_call_id=row["consumed_by_call_id"],
+                    )
+                    await self._commit()
+                    return admission
+                admission = CarrierAdmission(
+                    call_sid=call_sid,
+                    caller_phone=caller_phone,
+                    # Prefix the URL-safe random body so the canonical SIP
+                    # identifier always begins with an alphanumeric character.
+                    admission_nonce=f"adm_{secrets.token_urlsafe(32)}",
+                    expires_at=expires_at,
+                )
+                await self.connection.execute(
+                    """
+                    INSERT INTO carrier_admissions (
+                        call_sid, caller_phone, admission_nonce, expires_at,
+                        consumed_by_call_id, created_at, consumed_at
+                    ) VALUES (?, ?, ?, ?, NULL, ?, NULL)
+                    """,
+                    (
+                        admission.call_sid,
+                        admission.caller_phone,
+                        admission.admission_nonce,
+                        _iso(admission.expires_at),
+                        _iso(timestamp),
+                    ),
+                )
+            except BaseException:
+                await self._rollback()
+                raise
+            await self._commit()
+        return admission
+
+    async def consume_carrier_admission(
+        self,
+        call_sid: str,
+        *,
+        caller_phone: str,
+        admission_nonce: str,
+        expires_at_epoch: int,
+        provider_call_id: str,
+        consumed_at: datetime | None = None,
+    ) -> CarrierAdmission:
+        """Atomically bind a carrier admission to exactly one OpenAI provider call."""
+
+        if not provider_call_id or len(provider_call_id) > 300:
+            raise ValueError("provider_call_id must contain 1 to 300 characters")
+        timestamp = _as_utc(consumed_at)
+        async with self._write_lock:
+            await self._begin()
+            try:
+                cursor = await self.connection.execute(
+                    """
+                    SELECT caller_phone, admission_nonce, expires_at, consumed_by_call_id
+                    FROM carrier_admissions
+                    WHERE call_sid = ?
+                    """,
+                    (call_sid,),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    raise NotFoundError("carrier admission does not exist")
+                expires_at = datetime.fromisoformat(row["expires_at"]).astimezone(UTC)
+                if (
+                    not hmac.compare_digest(row["caller_phone"], caller_phone)
+                    or not hmac.compare_digest(row["admission_nonce"], admission_nonce)
+                    or int(expires_at.timestamp()) != expires_at_epoch
+                ):
+                    raise CorrelationError("carrier admission does not match the SIP leg")
+                if timestamp >= expires_at:
+                    raise ActionExpiredError("carrier admission has expired")
+                consumed_by = row["consumed_by_call_id"]
+                if consumed_by is not None and not hmac.compare_digest(
+                    consumed_by,
+                    provider_call_id,
+                ):
+                    raise ConflictError("carrier admission was already consumed")
+                if consumed_by is None:
+                    await self.connection.execute(
+                        """
+                        UPDATE carrier_admissions
+                        SET consumed_by_call_id = ?, consumed_at = ?
+                        WHERE call_sid = ? AND consumed_by_call_id IS NULL
+                        """,
+                        (provider_call_id, _iso(timestamp), call_sid),
+                    )
+                admission = CarrierAdmission(
+                    call_sid=call_sid,
+                    caller_phone=caller_phone,
+                    admission_nonce=admission_nonce,
+                    expires_at=expires_at,
+                    consumed_by_call_id=provider_call_id,
+                )
+            except BaseException:
+                await self._rollback()
+                raise
+            await self._commit()
+        return admission
+
+    async def revoke_unconsumed_carrier_admissions(
+        self,
+        *,
+        limit: int = 50,
+        revoked_at: datetime | None = None,
+    ) -> list[CallTerminationJob]:
+        """Expire and durably enqueue carrier termination in one transaction."""
+
+        if not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        timestamp = _as_utc(revoked_at)
+        async with self._write_lock:
+            await self._begin()
+            try:
+                cursor = await self.connection.execute(
+                    """
+                    SELECT call_sid
+                    FROM carrier_admissions AS admission
+                    WHERE admission.consumed_by_call_id IS NULL
+                      AND (
+                        admission.expires_at > ?
+                        OR NOT EXISTS (
+                            SELECT 1
+                            FROM call_termination_jobs AS carrier_job
+                            WHERE carrier_job.provider_leg = 'carrier'
+                              AND carrier_job.target_id = admission.call_sid
+                        )
+                      )
+                    ORDER BY created_at ASC, call_sid ASC
+                    LIMIT ?
+                    """,
+                    (_iso(timestamp), limit),
+                )
+                rows = await cursor.fetchall()
+                jobs: list[CallTerminationJob] = []
+                for row in rows:
+                    call_sid = row["call_sid"]
+                    cursor = await self.connection.execute(
+                        """
+                        SELECT *
+                        FROM call_termination_jobs
+                        WHERE provider_leg = 'carrier' AND target_id = ?
+                        """,
+                        (call_sid,),
+                    )
+                    existing_row = await cursor.fetchone()
+                    if existing_row is None:
+                        job = CallTerminationJob(
+                            leg=CallTerminationLeg.CARRIER,
+                            target_id=call_sid,
+                            next_attempt_at=timestamp,
+                            created_at=timestamp,
+                            updated_at=timestamp,
+                        )
+                        await self.connection.execute(
+                            """
+                            INSERT INTO call_termination_jobs (
+                                job_id, session_id, event_id, provider_leg, target_id,
+                                state, attempts, next_attempt_at, last_attempt_at,
+                                last_error_type, confirmed_at, created_at, updated_at
+                            ) VALUES (?, NULL, NULL, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
+                            """,
+                            (
+                                job.job_id,
+                                job.leg.value,
+                                job.target_id,
+                                job.state.value,
+                                job.attempts,
+                                _iso(job.next_attempt_at),
+                                _iso(job.created_at),
+                                _iso(job.updated_at),
+                            ),
+                        )
+                    else:
+                        job = _termination_job_from_row(existing_row)
+                    update = await self.connection.execute(
+                        """
+                        UPDATE carrier_admissions
+                        SET expires_at = MIN(expires_at, ?)
+                        WHERE call_sid = ?
+                          AND consumed_by_call_id IS NULL
+                        """,
+                        (_iso(timestamp), call_sid),
+                    )
+                    if update.rowcount != 1:
+                        raise StorageError("unconsumed carrier admission changed during revocation")
+                    jobs.append(job)
+            except sqlite3.IntegrityError as exc:
+                await self._rollback()
+                raise CorrelationError(
+                    "carrier admission termination could not be queued uniquely"
+                ) from exc
+            except BaseException:
+                await self._rollback()
+                raise
+            await self._commit()
+        return jobs
+
+    async def get_consumed_carrier_leg(
+        self,
+        provider_call_id: str,
+    ) -> ConsumedCarrierLeg | None:
+        """Resolve provider IDs without exposing caller identity or admission secrets."""
+
+        async with self._write_lock:
+            cursor = await self.connection.execute(
+                """
+                SELECT call_sid, consumed_by_call_id
+                FROM carrier_admissions
+                WHERE consumed_by_call_id = ?
+                """,
+                (provider_call_id,),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return ConsumedCarrierLeg(
+            call_sid=row["call_sid"],
+            provider_call_id=row["consumed_by_call_id"],
+        )
+
+    async def list_orphaned_consumed_carrier_legs(
+        self,
+        *,
+        limit: int = 50,
+    ) -> list[ConsumedCarrierLeg]:
+        """Return unqueued consumed SIP admissions with no durable session.
+
+        Once both provider-leg termination jobs exist, the durable reconciler
+        owns the orphan and this scan no longer returns it. That makes repeated
+        bounded scans deletion-safe without retaining admission secrets in the
+        termination queue.
+        """
+
+        if not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        async with self._write_lock:
+            cursor = await self.connection.execute(
+                """
+                SELECT a.call_sid, a.consumed_by_call_id
+                FROM carrier_admissions AS a
+                LEFT JOIN contact_sessions AS s
+                  ON s.interaction_id = a.consumed_by_call_id
+                WHERE a.consumed_by_call_id IS NOT NULL
+                  AND s.session_id IS NULL
+                  AND (
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM call_termination_jobs AS openai_job
+                        WHERE openai_job.provider_leg = 'openai'
+                          AND openai_job.target_id = a.consumed_by_call_id
+                    )
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM call_termination_jobs AS carrier_job
+                        WHERE carrier_job.provider_leg = 'carrier'
+                          AND carrier_job.target_id = a.call_sid
+                    )
+                  )
+                ORDER BY a.consumed_at ASC, a.call_sid ASC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            rows = await cursor.fetchall()
+        return [
+            ConsumedCarrierLeg(
+                call_sid=row["call_sid"],
+                provider_call_id=row["consumed_by_call_id"],
+            )
+            for row in rows
+        ]
+
+    async def get_realtime_tool_receipt(
+        self,
+        provider_call_id: str,
+        tool_call_id: str,
+    ) -> tuple[str, str, str] | None:
+        async with self._write_lock:
+            cursor = await self.connection.execute(
+                """
+                SELECT tool_name, arguments_hash, output_json
+                FROM realtime_tool_receipts
+                WHERE provider_call_id = ? AND tool_call_id = ?
+                """,
+                (provider_call_id, tool_call_id),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return row["tool_name"], row["arguments_hash"], row["output_json"]
+
+    async def get_realtime_tool_delivery(
+        self,
+        provider_call_id: str,
+        tool_call_id: str,
+    ) -> RealtimeToolDeliveryReceipt | None:
+        async with self._write_lock:
+            cursor = await self.connection.execute(
+                """
+                SELECT tool_name, arguments_hash, output_json,
+                       request_response, delivery_state
+                FROM realtime_tool_receipts
+                WHERE provider_call_id = ? AND tool_call_id = ?
+                """,
+                (provider_call_id, tool_call_id),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return RealtimeToolDeliveryReceipt(
+            tool_name=row["tool_name"],
+            arguments_hash=row["arguments_hash"],
+            output_json=row["output_json"],
+            request_response=bool(row["request_response"]),
+            delivery_state=row["delivery_state"],
+        )
+
+    async def list_pending_realtime_tool_deliveries(
+        self,
+        provider_call_id: str,
+    ) -> list[tuple[str, RealtimeToolDeliveryReceipt]]:
+        """Return tool results whose output/response delivery is not yet complete."""
+
+        async with self._write_lock:
+            cursor = await self.connection.execute(
+                """
+                SELECT tool_call_id, tool_name, arguments_hash, output_json,
+                       request_response, delivery_state
+                FROM realtime_tool_receipts
+                WHERE provider_call_id = ? AND delivery_state != 'delivered'
+                ORDER BY created_at ASC, tool_call_id ASC
+                """,
+                (provider_call_id,),
+            )
+            rows = await cursor.fetchall()
+        return [
+            (
+                row["tool_call_id"],
+                RealtimeToolDeliveryReceipt(
+                    tool_name=row["tool_name"],
+                    arguments_hash=row["arguments_hash"],
+                    output_json=row["output_json"],
+                    request_response=bool(row["request_response"]),
+                    delivery_state=row["delivery_state"],
+                ),
+            )
+            for row in rows
+        ]
+
+    async def record_realtime_tool_receipt(
+        self,
+        provider_call_id: str,
+        tool_call_id: str,
+        *,
+        tool_name: str,
+        arguments_hash: str,
+        output_json: str,
+        request_response: bool = True,
+        created_at: datetime | None = None,
+    ) -> str:
+        """Persist a bounded result before its one permitted sideband delivery attempt."""
+
+        if not provider_call_id or len(provider_call_id) > 300:
+            raise ValueError("provider_call_id must contain 1 to 300 characters")
+        if not tool_call_id or len(tool_call_id) > 300:
+            raise ValueError("tool_call_id must contain 1 to 300 characters")
+        if not tool_name or len(tool_name) > 100:
+            raise ValueError("tool_name must contain 1 to 100 characters")
+        if len(arguments_hash) != 64:
+            raise ValueError("arguments_hash must be a SHA-256 digest")
+        if len(output_json.encode("utf-8")) > 64 * 1024:
+            raise ValueError("tool output exceeds the durable receipt limit")
+        timestamp = _as_utc(created_at)
+        async with self._write_lock:
+            await self._begin()
+            try:
+                cursor = await self.connection.execute(
+                    """
+                    SELECT tool_name, arguments_hash, output_json, request_response
+                    FROM realtime_tool_receipts
+                    WHERE provider_call_id = ? AND tool_call_id = ?
+                    """,
+                    (provider_call_id, tool_call_id),
+                )
+                row = await cursor.fetchone()
+                if row is not None:
+                    if (
+                        row["tool_name"] != tool_name
+                        or not hmac.compare_digest(row["arguments_hash"], arguments_hash)
+                        or not hmac.compare_digest(row["output_json"], output_json)
+                        or bool(row["request_response"]) is not request_response
+                    ):
+                        raise ConflictError(
+                            "Realtime tool call ID was reused with different content"
+                        )
+                    await self._commit()
+                    return row["output_json"]
+                await self.connection.execute(
+                    """
+                    INSERT INTO realtime_tool_receipts (
+                        provider_call_id, tool_call_id, tool_name,
+                        arguments_hash, output_json, request_response,
+                        delivery_state, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+                    """,
+                    (
+                        provider_call_id,
+                        tool_call_id,
+                        tool_name,
+                        arguments_hash,
+                        output_json,
+                        int(request_response),
+                        _iso(timestamp),
+                    ),
+                )
+            except BaseException:
+                await self._rollback()
+                raise
+            await self._commit()
+        return output_json
+
+    async def mark_realtime_tool_delivery(
+        self,
+        provider_call_id: str,
+        tool_call_id: str,
+        *,
+        delivery_state: str,
+    ) -> None:
+        """Advance a tool receipt monotonically through pending/output_sent/delivered."""
+
+        order = {"pending": 0, "output_sent": 1, "delivered": 2}
+        if delivery_state not in order:
+            raise ValueError("unsupported Realtime tool delivery state")
+        async with self._write_lock:
+            await self._begin()
+            try:
+                cursor = await self.connection.execute(
+                    """
+                    SELECT delivery_state
+                    FROM realtime_tool_receipts
+                    WHERE provider_call_id = ? AND tool_call_id = ?
+                    """,
+                    (provider_call_id, tool_call_id),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    raise NotFoundError("Realtime tool receipt does not exist")
+                current = row["delivery_state"]
+                if current not in order:
+                    raise StorageError("Realtime tool receipt has an invalid delivery state")
+                if order[delivery_state] < order[current]:
+                    raise InvalidStateTransitionError(
+                        "Realtime tool delivery state cannot move backwards"
+                    )
+                if current != delivery_state:
+                    await self.connection.execute(
+                        """
+                        UPDATE realtime_tool_receipts
+                        SET delivery_state = ?
+                        WHERE provider_call_id = ? AND tool_call_id = ?
+                        """,
+                        (delivery_state, provider_call_id, tool_call_id),
+                    )
+            except BaseException:
+                await self._rollback()
+                raise
+            await self._commit()
 
     async def _fetch_grant_locked(self, grant_id: str) -> ActionGrant | None:
         cursor = await self.connection.execute(
@@ -642,6 +1484,106 @@ class SQLiteStore:
             await self._commit()
         return updated
 
+    async def _expire_event_locked(
+        self,
+        event: EscalationEvent,
+        *,
+        timestamp: datetime,
+        reason: str,
+    ) -> bool:
+        """Expire one nonterminal event inside the caller's active transaction."""
+
+        if event.state in TERMINAL_EVENT_STATES:
+            return False
+        expired = event.model_copy(update={"state": EventState.EXPIRED})
+        await self.connection.execute(
+            """
+            UPDATE events
+            SET state = ?, payload_json = ?, updated_at = ?
+            WHERE event_id = ?
+            """,
+            (
+                expired.state.value,
+                canonical_model_json(expired),
+                _iso(timestamp),
+                event.event_id,
+            ),
+        )
+        await self._insert_timeline_locked(
+            TimelineEntry(
+                event_id=event.event_id,
+                kind=TimelineKind.EVENT_STATE_CHANGED,
+                from_state=event.state.value,
+                to_state=EventState.EXPIRED.value,
+                details={"reason": reason},
+                occurred_at=timestamp,
+            )
+        )
+        return True
+
+    async def expire_due_events(self, *, now: datetime | None = None) -> list[str]:
+        """Atomically expire every active event whose hard deadline elapsed."""
+
+        timestamp = _as_utc(now)
+        placeholders = ",".join("?" for _ in _ACTIVE_EVENT_VALUES)
+        event_ids: list[str] = []
+        async with self._write_lock:
+            await self._begin()
+            try:
+                cursor = await self.connection.execute(
+                    f"""
+                    SELECT payload_json
+                    FROM events
+                    WHERE state IN ({placeholders})
+                      AND deadline_at IS NOT NULL
+                      AND deadline_at <= ?
+                    ORDER BY deadline_at ASC, event_id ASC
+                    """,
+                    (*_ACTIVE_EVENT_VALUES, _iso(timestamp)),
+                )
+                for row in await cursor.fetchall():
+                    event = _load(EscalationEvent, row["payload_json"])
+                    if await self._expire_event_locked(
+                        event,
+                        timestamp=timestamp,
+                        reason="decision_deadline_elapsed",
+                    ):
+                        event_ids.append(event.event_id)
+            except BaseException:
+                await self._rollback()
+                raise
+            await self._commit()
+        return event_ids
+
+    async def expire_event_if_due(
+        self,
+        event_id: str,
+        *,
+        now: datetime | None = None,
+        reason: str = "decision_deadline_elapsed",
+    ) -> bool:
+        """Expire one due event atomically, returning whether this call changed it."""
+
+        timestamp = _as_utc(now)
+        expired = False
+        async with self._write_lock:
+            await self._begin()
+            try:
+                event = await self._fetch_event_locked(event_id)
+                if event is None:
+                    raise NotFoundError(f"event {event_id!r} does not exist")
+                if event.deadline_at is not None and timestamp >= event.deadline_at:
+                    expired = await self._expire_event_locked(
+                        event,
+                        timestamp=timestamp,
+                        reason=reason,
+                    )
+            except BaseException:
+                await self._rollback()
+                raise
+            await self._commit()
+        return expired
+
     async def save_snapshot(self, snapshot: ContextSnapshot) -> ContextSnapshot:
         payload = canonical_model_json(snapshot)
         now = utc_now()
@@ -800,6 +1742,72 @@ class SQLiteStore:
             rows = await cursor.fetchall()
         return [_load(ContactSession, row["payload_json"]) for row in rows]
 
+    async def list_recoverable_realtime_sessions(
+        self,
+        *,
+        limit: int = 50,
+    ) -> list[ContactSession]:
+        """Return interrupted Realtime sessions that must be terminated fail closed."""
+
+        if not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        placeholders = ",".join("?" for _ in _ACTIVE_SESSION_VALUES)
+        query = f"""
+            SELECT payload_json
+            FROM contact_sessions
+            WHERE json_extract(payload_json, '$.provider') = ?
+              AND state IN ({placeholders})
+              AND event_id IS NOT NULL
+            ORDER BY started_at ASC, session_id ASC
+            LIMIT ?
+        """
+        parameters: list[Any] = [
+            "openai_realtime",
+            *_ACTIVE_SESSION_VALUES,
+            limit,
+        ]
+        async with self._write_lock:
+            cursor = await self.connection.execute(query, parameters)
+            rows = await cursor.fetchall()
+        return [_load(ContactSession, row["payload_json"]) for row in rows]
+
+    async def list_overdue_realtime_sessions(
+        self,
+        *,
+        max_age_seconds: int,
+        due_at: datetime | None = None,
+        limit: int = 50,
+    ) -> list[ContactSession]:
+        """Return active calls whose transport-independent lifetime has elapsed."""
+
+        if not 60 <= max_age_seconds <= 7200:
+            raise ValueError("max_age_seconds must be between 60 and 7200")
+        if not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        cutoff = _as_utc(due_at) - timedelta(seconds=max_age_seconds)
+        placeholders = ",".join("?" for _ in _ACTIVE_SESSION_VALUES)
+        query = f"""
+            SELECT payload_json
+            FROM contact_sessions
+            WHERE json_extract(payload_json, '$.provider') = ?
+              AND state IN ({placeholders})
+              AND started_at <= ?
+            ORDER BY started_at ASC, session_id ASC
+            LIMIT ?
+        """
+        async with self._write_lock:
+            cursor = await self.connection.execute(
+                query,
+                (
+                    "openai_realtime",
+                    *_ACTIVE_SESSION_VALUES,
+                    _iso(cutoff),
+                    limit,
+                ),
+            )
+            rows = await cursor.fetchall()
+        return [_load(ContactSession, row["payload_json"]) for row in rows]
+
     async def get_session_by_attempt(self, attempt_id: str) -> ContactSession | None:
         async with self._write_lock:
             cursor = await self.connection.execute(
@@ -819,6 +1827,389 @@ class SQLiteStore:
             )
             row = await cursor.fetchone()
         return None if row is None else _load(ContactSession, row["payload_json"])
+
+    async def ensure_call_termination_jobs(
+        self,
+        *,
+        openai_call_id: str | None,
+        carrier_call_sid: str | None,
+        session_id: str | None,
+        event_id: str | None,
+        created_at: datetime | None = None,
+    ) -> list[CallTerminationJob]:
+        """Persist every known provider leg before any termination request is sent.
+
+        Repeated requests return the same jobs. A provider target can only ever
+        be bound to one durable session, and a session can only have one target
+        per leg.
+        """
+
+        timestamp = _as_utc(created_at)
+        specs: list[tuple[CallTerminationLeg, str]] = []
+        if openai_call_id is not None:
+            specs.append((CallTerminationLeg.OPENAI, openai_call_id))
+        if carrier_call_sid is not None:
+            specs.append((CallTerminationLeg.CARRIER, carrier_call_sid))
+        if not specs:
+            raise ValueError("at least one call termination target is required")
+        candidates = [
+            CallTerminationJob(
+                session_id=session_id,
+                event_id=event_id,
+                leg=leg,
+                target_id=target_id,
+                next_attempt_at=timestamp,
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+            for leg, target_id in specs
+        ]
+
+        async with self._write_lock:
+            await self._begin()
+            try:
+                session = None
+                if session_id is not None:
+                    session = await self._fetch_session_locked(session_id)
+                    if session is None:
+                        raise NotFoundError(f"session {session_id!r} does not exist")
+                    if event_id != session.event_id:
+                        raise CorrelationError(
+                            "termination event does not match the durable session"
+                        )
+                    if (
+                        openai_call_id is not None
+                        and session.interaction_id is not None
+                        and not hmac.compare_digest(
+                            session.interaction_id,
+                            openai_call_id,
+                        )
+                    ):
+                        raise CorrelationError(
+                            "OpenAI termination target does not match the durable session"
+                        )
+                    if (
+                        carrier_call_sid is not None
+                        and session.attempt_id is not None
+                        and not hmac.compare_digest(
+                            session.attempt_id,
+                            carrier_call_sid,
+                        )
+                    ):
+                        raise CorrelationError(
+                            "carrier termination target does not match the durable session"
+                        )
+
+                jobs: list[CallTerminationJob] = []
+                for candidate in candidates:
+                    cursor = await self.connection.execute(
+                        """
+                        SELECT *
+                        FROM call_termination_jobs
+                        WHERE provider_leg = ? AND target_id = ?
+                        """,
+                        (candidate.leg.value, candidate.target_id),
+                    )
+                    target_row = await cursor.fetchone()
+                    session_row = None
+                    if session_id is not None:
+                        cursor = await self.connection.execute(
+                            """
+                            SELECT *
+                            FROM call_termination_jobs
+                            WHERE session_id = ? AND provider_leg = ?
+                            """,
+                            (session_id, candidate.leg.value),
+                        )
+                        session_row = await cursor.fetchone()
+                    if (
+                        target_row is not None
+                        and session_row is not None
+                        and target_row["job_id"] != session_row["job_id"]
+                    ):
+                        raise CorrelationError(
+                            "termination leg is already bound to a different target"
+                        )
+                    row = target_row or session_row
+                    if row is not None:
+                        existing = _termination_job_from_row(row)
+                        if not hmac.compare_digest(existing.target_id, candidate.target_id):
+                            raise CorrelationError(
+                                "termination leg is already bound to a different target"
+                            )
+                        if (
+                            session_id is not None
+                            and existing.session_id is not None
+                            and not hmac.compare_digest(existing.session_id, session_id)
+                        ):
+                            raise CorrelationError(
+                                "termination target is already bound to a different session"
+                            )
+                        if (
+                            event_id is not None
+                            and existing.event_id is not None
+                            and not hmac.compare_digest(existing.event_id, event_id)
+                        ):
+                            raise CorrelationError(
+                                "termination target is already bound to a different event"
+                            )
+                        if (existing.session_id is None and session_id is not None) or (
+                            existing.event_id is None and event_id is not None
+                        ):
+                            await self.connection.execute(
+                                """
+                                UPDATE call_termination_jobs
+                                SET session_id = COALESCE(session_id, ?),
+                                    event_id = COALESCE(event_id, ?),
+                                    updated_at = ?
+                                WHERE job_id = ?
+                                """,
+                                (
+                                    session_id,
+                                    event_id,
+                                    _iso(timestamp),
+                                    existing.job_id,
+                                ),
+                            )
+                            refreshed = await self._fetch_call_termination_job_locked(
+                                existing.job_id
+                            )
+                            assert refreshed is not None
+                            existing = refreshed
+                        jobs.append(existing)
+                        continue
+                    await self.connection.execute(
+                        """
+                        INSERT INTO call_termination_jobs (
+                            job_id, session_id, event_id, provider_leg, target_id,
+                            state, attempts, next_attempt_at, last_attempt_at,
+                            last_error_type, confirmed_at, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            candidate.job_id,
+                            candidate.session_id,
+                            candidate.event_id,
+                            candidate.leg.value,
+                            candidate.target_id,
+                            candidate.state.value,
+                            candidate.attempts,
+                            _iso(candidate.next_attempt_at),
+                            None,
+                            None,
+                            None,
+                            _iso(candidate.created_at),
+                            _iso(candidate.updated_at),
+                        ),
+                    )
+                    jobs.append(candidate)
+            except sqlite3.IntegrityError as exc:
+                await self._rollback()
+                raise CorrelationError("termination target could not be bound uniquely") from exc
+            except BaseException:
+                await self._rollback()
+                raise
+            await self._commit()
+        return jobs
+
+    async def get_call_termination_job(
+        self,
+        job_id: str,
+    ) -> CallTerminationJob | None:
+        async with self._write_lock:
+            return await self._fetch_call_termination_job_locked(job_id)
+
+    async def list_call_termination_jobs(
+        self,
+        *,
+        session_id: str | None = None,
+        state: CallTerminationState | None = None,
+        limit: int = 100,
+    ) -> list[CallTerminationJob]:
+        if not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            parameters.append(session_id)
+        if state is not None:
+            clauses.append("state = ?")
+            parameters.append(state.value)
+        query = "SELECT * FROM call_termination_jobs"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at ASC, job_id ASC LIMIT ?"
+        parameters.append(limit)
+        async with self._write_lock:
+            cursor = await self.connection.execute(query, parameters)
+            rows = await cursor.fetchall()
+        return [_termination_job_from_row(row) for row in rows]
+
+    async def list_due_call_termination_jobs(
+        self,
+        *,
+        due_at: datetime | None = None,
+        limit: int = 20,
+    ) -> list[CallTerminationJob]:
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        timestamp = _as_utc(due_at)
+        async with self._write_lock:
+            cursor = await self.connection.execute(
+                """
+                SELECT *
+                FROM call_termination_jobs
+                WHERE state = ? AND next_attempt_at <= ?
+                ORDER BY next_attempt_at ASC, created_at ASC, job_id ASC
+                LIMIT ?
+                """,
+                (
+                    CallTerminationState.PENDING.value,
+                    _iso(timestamp),
+                    limit,
+                ),
+            )
+            rows = await cursor.fetchall()
+        return [_termination_job_from_row(row) for row in rows]
+
+    async def claim_call_termination_attempt(
+        self,
+        job_id: str,
+        *,
+        attempted_at: datetime | None = None,
+        base_delay_seconds: int = 1,
+        max_delay_seconds: int = 300,
+    ) -> CallTerminationJob | None:
+        """Persist attempt intent and its retry time before external I/O."""
+
+        if not 1 <= base_delay_seconds <= max_delay_seconds <= 3600:
+            raise ValueError("termination retry delays are invalid")
+        timestamp = _as_utc(attempted_at)
+        async with self._write_lock:
+            await self._begin()
+            try:
+                job = await self._fetch_call_termination_job_locked(job_id)
+                if (
+                    job is None
+                    or job.state is CallTerminationState.CONFIRMED
+                    or job.next_attempt_at > timestamp
+                ):
+                    await self._commit()
+                    return None
+                attempts = job.attempts + 1
+                exponent = min(job.attempts, 20)
+                delay = min(
+                    base_delay_seconds * (2**exponent),
+                    max_delay_seconds,
+                )
+                next_attempt_at = timestamp + timedelta(seconds=delay)
+                cursor = await self.connection.execute(
+                    """
+                    UPDATE call_termination_jobs
+                    SET attempts = ?, next_attempt_at = ?, last_attempt_at = ?,
+                        updated_at = ?
+                    WHERE job_id = ? AND state = ? AND attempts = ?
+                    """,
+                    (
+                        attempts,
+                        _iso(next_attempt_at),
+                        _iso(timestamp),
+                        _iso(timestamp),
+                        job_id,
+                        CallTerminationState.PENDING.value,
+                        job.attempts,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    await self._rollback()
+                    return None
+                claimed = await self._fetch_call_termination_job_locked(job_id)
+                assert claimed is not None
+            except BaseException:
+                await self._rollback()
+                raise
+            await self._commit()
+        return claimed
+
+    async def record_call_termination_failure(
+        self,
+        job_id: str,
+        *,
+        attempt_number: int,
+        error_type: str,
+        failed_at: datetime | None = None,
+    ) -> CallTerminationJob:
+        """Record a sanitized failed attempt while leaving the job retryable."""
+
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,159}", error_type) is None:
+            raise ValueError("error_type must be a sanitized exception class name")
+        timestamp = _as_utc(failed_at)
+        async with self._write_lock:
+            await self._begin()
+            try:
+                cursor = await self.connection.execute(
+                    """
+                    UPDATE call_termination_jobs
+                    SET last_error_type = ?, updated_at = ?
+                    WHERE job_id = ? AND state = ? AND attempts = ?
+                    """,
+                    (
+                        error_type,
+                        _iso(timestamp),
+                        job_id,
+                        CallTerminationState.PENDING.value,
+                        attempt_number,
+                    ),
+                )
+                job = await self._fetch_call_termination_job_locked(job_id)
+                if job is None:
+                    raise NotFoundError(f"termination job {job_id!r} does not exist")
+                if cursor.rowcount != 1 and job.state is not CallTerminationState.CONFIRMED:
+                    raise ConflictError("termination attempt is no longer current")
+            except BaseException:
+                await self._rollback()
+                raise
+            await self._commit()
+        return job
+
+    async def confirm_call_termination(
+        self,
+        job_id: str,
+        *,
+        attempt_number: int,
+        confirmed_at: datetime | None = None,
+    ) -> CallTerminationJob:
+        timestamp = _as_utc(confirmed_at)
+        async with self._write_lock:
+            await self._begin()
+            try:
+                cursor = await self.connection.execute(
+                    """
+                    UPDATE call_termination_jobs
+                    SET state = ?, confirmed_at = ?, last_error_type = NULL,
+                        updated_at = ?
+                    WHERE job_id = ? AND state = ? AND attempts = ?
+                    """,
+                    (
+                        CallTerminationState.CONFIRMED.value,
+                        _iso(timestamp),
+                        _iso(timestamp),
+                        job_id,
+                        CallTerminationState.PENDING.value,
+                        attempt_number,
+                    ),
+                )
+                job = await self._fetch_call_termination_job_locked(job_id)
+                if job is None:
+                    raise NotFoundError(f"termination job {job_id!r} does not exist")
+                if cursor.rowcount != 1 and job.state is not CallTerminationState.CONFIRMED:
+                    raise ConflictError("termination attempt is no longer current")
+            except BaseException:
+                await self._rollback()
+                raise
+            await self._commit()
+        return job
 
     async def get_event_by_attempt(self, attempt_id: str) -> EscalationEvent | None:
         async with self._write_lock:
@@ -880,6 +2271,7 @@ class SQLiteStore:
         attempt_id: str,
         *,
         occurred_at: datetime | None = None,
+        require_active: bool = False,
     ) -> ContactSession:
         timestamp = _as_utc(occurred_at)
         async with self._write_lock:
@@ -888,6 +2280,11 @@ class SQLiteStore:
                 session = await self._fetch_session_locked(session_id)
                 if session is None:
                     raise NotFoundError(f"session {session_id!r} does not exist")
+                if require_active:
+                    await self._require_active_session_event_locked(
+                        session,
+                        timestamp=timestamp,
+                    )
                 if session.attempt_id == attempt_id:
                     await self._commit()
                     return session
@@ -923,6 +2320,7 @@ class SQLiteStore:
         interaction_id: str,
         *,
         occurred_at: datetime | None = None,
+        require_active: bool = False,
     ) -> ContactSession:
         timestamp = _as_utc(occurred_at)
         async with self._write_lock:
@@ -931,6 +2329,11 @@ class SQLiteStore:
                 session = await self._fetch_session_locked(session_id)
                 if session is None:
                     raise NotFoundError(f"session {session_id!r} does not exist")
+                if require_active:
+                    await self._require_active_session_event_locked(
+                        session,
+                        timestamp=timestamp,
+                    )
                 if session.interaction_id == interaction_id:
                     await self._commit()
                     return session
@@ -1022,6 +2425,7 @@ class SQLiteStore:
 
         payload = canonical_model_json(decision)
         timestamp = decision.decided_at
+        deadline_expired = False
         async with self._write_lock:
             await self._begin()
             try:
@@ -1052,68 +2456,81 @@ class SQLiteStore:
                         f"event {decision.event_id!r} already has decision "
                         f"{existing_row['decision_id']!r}"
                     )
-                await self._require_no_repository_context_locked(decision.event_id)
                 if event.state in {EventState.EXPIRED, EventState.FAILED}:
                     raise InvalidStateTransitionError(
                         f"cannot record a decision for {event.state.value} event"
                     )
-                await self.connection.execute(
-                    """
-                    INSERT INTO decisions (
-                        decision_id, event_id, session_id, payload_json, decided_at, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        decision.decision_id,
-                        decision.event_id,
-                        decision.session_id,
-                        payload,
-                        _iso(decision.decided_at),
-                        _iso(utc_now()),
-                    ),
-                )
-                if event.state is not EventState.RESOLVED:
-                    resolved = event.model_copy(update={"state": EventState.RESOLVED})
+                await self._require_no_repository_context_locked(decision.event_id)
+                authority_checked_at = utc_now()
+                if event.deadline_at is not None and authority_checked_at >= event.deadline_at:
+                    deadline_expired = True
+                    await self._expire_event_locked(
+                        event,
+                        timestamp=authority_checked_at,
+                        reason="decision_arrived_after_deadline",
+                    )
+                else:
                     await self.connection.execute(
                         """
-                        UPDATE events
-                        SET state = ?, payload_json = ?, updated_at = ?
-                        WHERE event_id = ?
+                        INSERT INTO decisions (
+                            decision_id, event_id, session_id, payload_json, decided_at, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
                         """,
                         (
-                            EventState.RESOLVED.value,
-                            canonical_model_json(resolved),
-                            _iso(timestamp),
+                            decision.decision_id,
                             decision.event_id,
+                            decision.session_id,
+                            payload,
+                            _iso(decision.decided_at),
+                            _iso(authority_checked_at),
                         ),
                     )
+                    if event.state is not EventState.RESOLVED:
+                        resolved = event.model_copy(update={"state": EventState.RESOLVED})
+                        await self.connection.execute(
+                            """
+                            UPDATE events
+                            SET state = ?, payload_json = ?, updated_at = ?
+                            WHERE event_id = ?
+                            """,
+                            (
+                                EventState.RESOLVED.value,
+                                canonical_model_json(resolved),
+                                _iso(timestamp),
+                                decision.event_id,
+                            ),
+                        )
+                        await self._insert_timeline_locked(
+                            TimelineEntry(
+                                event_id=decision.event_id,
+                                session_id=decision.session_id,
+                                kind=TimelineKind.EVENT_STATE_CHANGED,
+                                from_state=event.state.value,
+                                to_state=EventState.RESOLVED.value,
+                                details={"reason": "decision_recorded"},
+                                occurred_at=timestamp,
+                            )
+                        )
                     await self._insert_timeline_locked(
                         TimelineEntry(
                             event_id=decision.event_id,
                             session_id=decision.session_id,
-                            kind=TimelineKind.EVENT_STATE_CHANGED,
-                            from_state=event.state.value,
-                            to_state=EventState.RESOLVED.value,
-                            details={"reason": "decision_recorded"},
+                            kind=TimelineKind.DECISION_RECORDED,
+                            details={
+                                "decision_id": decision.decision_id,
+                                "outcome": decision.outcome.value,
+                            },
                             occurred_at=timestamp,
                         )
                     )
-                await self._insert_timeline_locked(
-                    TimelineEntry(
-                        event_id=decision.event_id,
-                        session_id=decision.session_id,
-                        kind=TimelineKind.DECISION_RECORDED,
-                        details={
-                            "decision_id": decision.decision_id,
-                            "outcome": decision.outcome.value,
-                        },
-                        occurred_at=timestamp,
-                    )
-                )
             except BaseException:
                 await self._rollback()
                 raise
             await self._commit()
+        if deadline_expired:
+            raise EventDeadlineExpiredError(
+                "the event deadline elapsed before the decision could be recorded"
+            )
         return decision
 
     async def get_decision(self, event_id: str) -> Decision | None:
@@ -1136,7 +2553,7 @@ class SQLiteStore:
 
     async def record_webhook(
         self,
-        payload: SarvamWebhookPayload,
+        payload: ProviderWebhookPayload,
         *,
         received_at: datetime | None = None,
     ) -> WebhookReceipt:
@@ -1330,14 +2747,14 @@ class SQLiteStore:
 
     register_webhook_once = record_webhook
 
-    async def get_webhook(self, webhook_key: str) -> SarvamWebhookPayload | None:
+    async def get_webhook(self, webhook_key: str) -> ProviderWebhookPayload | None:
         async with self._write_lock:
             cursor = await self.connection.execute(
                 "SELECT payload_json FROM provider_webhooks WHERE webhook_key = ?",
                 (webhook_key,),
             )
             row = await cursor.fetchone()
-        return None if row is None else _load(SarvamWebhookPayload, row["payload_json"])
+        return None if row is None else _load(ProviderWebhookPayload, row["payload_json"])
 
     async def create_fallback(self, fallback: FallbackLink) -> FallbackLink:
         """Persist one fallback capability per event without storing its bearer token."""
@@ -1687,7 +3104,6 @@ class SQLiteStore:
     ) -> Decision:
         """Atomically consume a verified fallback and record its sole decision."""
 
-        timestamp = _as_utc(now or decision.decided_at)
         payload = canonical_model_json(decision)
         async with self._write_lock:
             await self._begin()
@@ -1699,8 +3115,6 @@ class SQLiteStore:
                     raise FallbackAlreadyConsumedError("fallback link was already consumed")
                 if fallback.state is not FallbackState.VERIFIED:
                     raise FallbackLinkError("fallback link is not verified")
-                if fallback.expires_at <= timestamp:
-                    raise FallbackLinkError("fallback link expired")
                 if decision.session_id != fallback.session_id:
                     raise CorrelationError("fallback decision session does not match")
                 event = await self._fetch_event_locked(decision.event_id)
@@ -1717,6 +3131,11 @@ class SQLiteStore:
                     raise DecisionAlreadyExistsError(
                         f"event {decision.event_id!r} already has a decision"
                     )
+                timestamp = _as_utc(now)
+                if fallback.expires_at <= timestamp:
+                    raise FallbackLinkError("fallback link expired")
+                if event.deadline_at is not None and timestamp >= event.deadline_at:
+                    raise FallbackLinkError("the event decision deadline has elapsed")
                 await self.connection.execute(
                     """
                     INSERT INTO decisions (
@@ -1902,18 +3321,17 @@ class SQLiteStore:
             )
         )
 
-    async def prepare_action(
-        self,
-        action: PreparedAction,
-        *,
-        dedupe_consumed: bool = False,
-    ) -> PreparedAction:
-        """Atomically register an action and optionally dedupe a demo execution."""
+    async def prepare_action(self, action: PreparedAction) -> PreparedAction:
+        """Atomically register a newly prepared action."""
 
         if action.state is not ActionState.PREPARED:
             raise ValueError("new actions must start in the prepared state")
-        if action.expires_at <= utc_now():
+        timestamp = utc_now()
+        if action.expires_at <= timestamp:
             raise ActionExpiredError("cannot prepare an already expired action")
+        # Clear due active-hash rows before looking up an idempotent prior
+        # action, otherwise an expired prepared action can shadow every retry.
+        await self.expire_actions(now=timestamp)
         payload = canonical_model_json(action)
         async with self._write_lock:
             await self._begin()
@@ -1929,32 +3347,27 @@ class SQLiteStore:
                         raise CorrelationError(
                             "prepared action session does not belong to its event"
                         )
-                if dedupe_consumed:
-                    cursor = await self.connection.execute(
-                        """
-                        SELECT payload_json
-                        FROM prepared_actions
-                        WHERE event_id = ?
-                          AND session_id IS ?
-                          AND action_hash = ?
-                          AND state IN (?, ?, ?)
-                        ORDER BY CASE WHEN state = ? THEN 0 ELSE 1 END, updated_at DESC
-                        LIMIT 1
-                        """,
-                        (
-                            action.event_id,
-                            action.session_id,
-                            action.action_hash,
-                            ActionState.PREPARED.value,
-                            ActionState.CONFIRMED.value,
-                            ActionState.CONSUMED.value,
-                            ActionState.CONSUMED.value,
-                        ),
-                    )
-                    row = await cursor.fetchone()
-                    if row is not None:
+                cursor = await self.connection.execute(
+                    """
+                    SELECT state, payload_json
+                    FROM prepared_actions
+                    WHERE action_hash = ?
+                    ORDER BY created_at DESC, action_id DESC
+                    LIMIT 1
+                    """,
+                    (action.action_hash,),
+                )
+                prior_row = await cursor.fetchone()
+                if prior_row is not None:
+                    prior = _load(PreparedAction, prior_row["payload_json"])
+                    if prior.state in {ActionState.PREPARED, ActionState.CONFIRMED}:
                         await self._commit()
-                        return _load(PreparedAction, row["payload_json"])
+                        return prior
+                    if prior.state is ActionState.CONSUMED:
+                        raise ConflictError(
+                            "an identical action was already consumed; its outcome must be "
+                            "reconciled instead of retried"
+                        )
                 try:
                     await self.connection.execute(
                         """
@@ -2026,14 +3439,14 @@ class SQLiteStore:
             return await self._fetch_action_locked(action_id)
 
     async def get_action_execution(self, action_id: str) -> TimelineEntry | None:
-        """Return the latest durable demo execution outcome for one action."""
+        """Return the latest durable terminal execution outcome for one action."""
 
         async with self._write_lock:
             cursor = await self.connection.execute(
                 """
                 SELECT payload_json
                 FROM timeline
-                WHERE action_id = ? AND kind IN (?, ?)
+                WHERE action_id = ? AND kind IN (?, ?, ?)
                 ORDER BY occurred_at DESC, timeline_id DESC
                 LIMIT 1
                 """,
@@ -2041,6 +3454,7 @@ class SQLiteStore:
                     action_id,
                     TimelineKind.ACTION_EXECUTION_SUCCEEDED.value,
                     TimelineKind.ACTION_EXECUTION_FAILED.value,
+                    TimelineKind.ACTION_EXECUTION_UNKNOWN.value,
                 ),
             )
             row = await cursor.fetchone()
@@ -2050,13 +3464,13 @@ class SQLiteStore:
         self,
         action_id: str,
         *,
-        succeeded: bool,
+        succeeded: bool | None,
         message_to_user: str,
         operation_id: str | None = None,
         result: dict[str, Any] | None = None,
         retryable: bool = False,
     ) -> TimelineEntry:
-        """Persist a redacted auto-execution receipt for idempotent retries."""
+        """Persist a redacted terminal execution receipt for idempotent retries."""
 
         timestamp = utc_now()
         async with self._write_lock:
@@ -2066,21 +3480,49 @@ class SQLiteStore:
                 if action is None:
                     raise NotFoundError(f"action {action_id!r} does not exist")
                 details: dict[str, Any] = {
-                    "status": "succeeded" if succeeded else "failed",
+                    "status": (
+                        "succeeded"
+                        if succeeded is True
+                        else "failed"
+                        if succeeded is False
+                        else "unknown"
+                    ),
                     "message_to_user": message_to_user,
                     "result": result or {},
                     "retryable": retryable,
                 }
                 if operation_id is not None:
                     details["operation_id"] = operation_id
+                cursor = await self.connection.execute(
+                    """
+                    SELECT payload_json
+                    FROM timeline
+                    WHERE action_id = ? AND kind IN (?, ?, ?)
+                    ORDER BY occurred_at DESC, timeline_id DESC
+                    LIMIT 1
+                    """,
+                    (
+                        action.action_id,
+                        TimelineKind.ACTION_EXECUTION_SUCCEEDED.value,
+                        TimelineKind.ACTION_EXECUTION_FAILED.value,
+                        TimelineKind.ACTION_EXECUTION_UNKNOWN.value,
+                    ),
+                )
+                row = await cursor.fetchone()
+                if row is not None:
+                    existing = _load(TimelineEntry, row["payload_json"])
+                    await self._commit()
+                    return existing
                 receipt = TimelineEntry(
                     event_id=action.event_id,
                     session_id=action.session_id,
                     action_id=action.action_id,
                     kind=(
                         TimelineKind.ACTION_EXECUTION_SUCCEEDED
-                        if succeeded
+                        if succeeded is True
                         else TimelineKind.ACTION_EXECUTION_FAILED
+                        if succeeded is False
+                        else TimelineKind.ACTION_EXECUTION_UNKNOWN
                     ),
                     details=details,
                     occurred_at=timestamp,
@@ -2145,7 +3587,6 @@ class SQLiteStore:
         """Confirm an exact prepared action and mint its single durable grant."""
 
         confirmation_method = ConfirmationMethod(confirmation_method)
-        timestamp = _as_utc(now)
         validate_owner_ref(owner_ref)
         expired = False
         async with self._write_lock:
@@ -2154,6 +3595,9 @@ class SQLiteStore:
                 action = await self._fetch_action_locked(action_id)
                 if action is None:
                     raise NotFoundError(f"action {action_id!r} does not exist")
+                event = await self._fetch_event_locked(action.event_id)
+                if event is None:
+                    raise CorrelationError("prepared action references a missing event")
                 await self._require_no_repository_context_locked(action.event_id)
                 if action.state in {ActionState.EXPIRED, ActionState.CANCELLED}:
                     raise ActionExpiredError(
@@ -2161,7 +3605,13 @@ class SQLiteStore:
                     )
                 if action.state is ActionState.CONSUMED:
                     raise ActionAlreadyConsumedError("action grant has already been consumed")
-                if timestamp >= action.expires_at:
+                timestamp = _as_utc(now)
+                effective_expires_at = (
+                    min(action.expires_at, event.deadline_at)
+                    if event.deadline_at is not None
+                    else action.expires_at
+                )
+                if event.state in TERMINAL_EVENT_STATES or timestamp >= effective_expires_at:
                     expired_action = action.model_copy(update={"state": ActionState.EXPIRED})
                     await self._replace_action_locked(expired_action, timestamp=timestamp)
                     await self._insert_timeline_locked(
@@ -2292,7 +3742,6 @@ class SQLiteStore:
     ) -> ActionGrant:
         """Atomically consume a hash-bound grant exactly once."""
 
-        timestamp = _as_utc(now)
         expired = False
         async with self._write_lock:
             await self._begin()
@@ -2305,6 +3754,9 @@ class SQLiteStore:
                 action = await self._fetch_action_locked(grant.action_id)
                 if action is None:
                     raise CorrelationError("grant references a missing prepared action")
+                event = await self._fetch_event_locked(action.event_id)
+                if event is None:
+                    raise CorrelationError("prepared action references a missing event")
                 await self._require_no_repository_context_locked(action.event_id)
                 if not hmac.compare_digest(action.action_hash, action_hash):
                     raise ActionHashMismatchError(
@@ -2314,7 +3766,11 @@ class SQLiteStore:
                     raise ActionAlreadyConsumedError("action grant has already been consumed")
                 if grant.state in {GrantState.EXPIRED, GrantState.REVOKED}:
                     raise ActionExpiredError(f"grant is no longer usable ({grant.state.value})")
-                if timestamp >= min(grant.expires_at, action.expires_at):
+                timestamp = _as_utc(now)
+                effective_expires_at = min(grant.expires_at, action.expires_at)
+                if event.deadline_at is not None:
+                    effective_expires_at = min(effective_expires_at, event.deadline_at)
+                if event.state in TERMINAL_EVENT_STATES or timestamp >= effective_expires_at:
                     expired_grant = grant.model_copy(update={"state": GrantState.EXPIRED})
                     expired_action = action.model_copy(update={"state": ActionState.EXPIRED})
                     await self._replace_grant_locked(expired_grant, timestamp=timestamp)
@@ -2371,6 +3827,19 @@ class SQLiteStore:
                             from_state=ActionState.CONFIRMED.value,
                             to_state=ActionState.CONSUMED.value,
                             details={"grant_id": grant.grant_id},
+                            occurred_at=timestamp,
+                        )
+                    )
+                    await self._insert_timeline_locked(
+                        TimelineEntry(
+                            event_id=action.event_id,
+                            session_id=action.session_id,
+                            action_id=action.action_id,
+                            kind=TimelineKind.ACTION_EXECUTION_STARTED,
+                            details={
+                                "grant_id": grant.grant_id,
+                                "operation_id": f"action-{action.action_id}",
+                            },
                             occurred_at=timestamp,
                         )
                     )
@@ -2527,6 +3996,7 @@ __all__ = [
     "ConflictError",
     "CorrelationError",
     "DecisionAlreadyExistsError",
+    "EventDeadlineExpiredError",
     "FallbackAlreadyConsumedError",
     "FallbackLinkError",
     "InvalidStateTransitionError",

@@ -108,6 +108,15 @@ FallbackId = Annotated[
         pattern=r"^fbk_[A-Za-z0-9][A-Za-z0-9._:-]*$",
     ),
 ]
+TerminationJobId = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=7,
+        max_length=128,
+        pattern=r"^trm_[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    ),
+]
 TimelineId = Annotated[
     str,
     StringConstraints(
@@ -375,9 +384,16 @@ SESSION_STATE_TRANSITIONS: dict[SessionState, frozenset[SessionState]] = {
         }
     ),
     SessionState.CONNECTED: frozenset(
-        {SessionState.DISCUSSING, SessionState.COMPLETED, SessionState.FAILED}
+        {
+            SessionState.DISCUSSING,
+            SessionState.COMPLETED,
+            SessionState.FAILED,
+            SessionState.CANCELLED,
+        }
     ),
-    SessionState.DISCUSSING: frozenset({SessionState.COMPLETED, SessionState.FAILED}),
+    SessionState.DISCUSSING: frozenset(
+        {SessionState.COMPLETED, SessionState.FAILED, SessionState.CANCELLED}
+    ),
     SessionState.COMPLETED: frozenset(),
     SessionState.NO_ANSWER: frozenset(),
     SessionState.BUSY: frozenset(),
@@ -407,7 +423,6 @@ class DecisionSource(StrEnum):
     INBOUND_TOOL = "inbound_tool"
     SECURE_FALLBACK = "secure_fallback"
     LOCAL_OPERATOR = "local_operator"
-    AUTH_WATCHER = "auth_watcher"
 
 
 class RiskLevel(StrEnum):
@@ -482,6 +497,16 @@ class WebhookStatus(StrEnum):
     FAILED = "failed"
 
 
+class CallTerminationLeg(StrEnum):
+    OPENAI = "openai"
+    CARRIER = "carrier"
+
+
+class CallTerminationState(StrEnum):
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+
+
 class TranscriptRole(StrEnum):
     OWNER = "owner"
     AGENT = "agent"
@@ -497,13 +522,18 @@ class TimelineKind(StrEnum):
     SESSION_STATE_CHANGED = "session_state_changed"
     ATTEMPT_LINKED = "attempt_linked"
     INTERACTION_LINKED = "interaction_linked"
+    CALL_TERMINATION_REQUESTED = "call_termination_requested"
+    CALL_TERMINATION_CONFIRMED = "call_termination_confirmed"
+    CALL_TERMINATION_UNKNOWN = "call_termination_unknown"
     DECISION_RECORDED = "decision_recorded"
     WEBHOOK_RECEIVED = "webhook_received"
     ACTION_PREPARED = "action_prepared"
     ACTION_CONFIRMED = "action_confirmed"
     ACTION_CONSUMED = "action_consumed"
+    ACTION_EXECUTION_STARTED = "action_execution_started"
     ACTION_EXECUTION_SUCCEEDED = "action_execution_succeeded"
     ACTION_EXECUTION_FAILED = "action_execution_failed"
+    ACTION_EXECUTION_UNKNOWN = "action_execution_unknown"
     ACTION_EXPIRED = "action_expired"
     ACTION_CANCELLED = "action_cancelled"
     REPOSITORY_CONTEXT_EXPOSED = "repository_context_exposed"
@@ -744,7 +774,7 @@ class ContactSession(StrictModel):
     state: SessionState = SessionState.PENDING
     attempt_id: OpaqueId | None = None
     interaction_id: OpaqueId | None = None
-    provider: ShortText = "sarvam"
+    provider: ShortText = "openai_realtime"
     started_at: AwareDatetime = Field(default_factory=utc_now)
     answered_at: AwareDatetime | None = None
     ended_at: AwareDatetime | None = None
@@ -769,6 +799,54 @@ class ContactSession(StrictModel):
             and self.ended_at < self.answered_at
         ):
             raise ValueError("ended_at must not precede answered_at")
+        return self
+
+
+class CallTerminationJob(StrictModel):
+    """Durable, provider-specific work required to end one call leg."""
+
+    job_id: TerminationJobId = Field(default_factory=lambda: new_id("trm"))
+    session_id: SessionId | None = None
+    event_id: EventId | None = None
+    leg: CallTerminationLeg
+    target_id: Annotated[
+        str,
+        StringConstraints(
+            strip_whitespace=True,
+            min_length=3,
+            max_length=300,
+            pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$",
+        ),
+    ]
+    state: CallTerminationState = CallTerminationState.PENDING
+    attempts: Annotated[int, Field(ge=0)] = 0
+    next_attempt_at: AwareDatetime = Field(default_factory=utc_now)
+    last_attempt_at: AwareDatetime | None = None
+    last_error_type: Annotated[
+        str | None,
+        StringConstraints(
+            strip_whitespace=True,
+            min_length=1,
+            max_length=160,
+            pattern=r"^[A-Za-z_][A-Za-z0-9_.]*$",
+        ),
+    ] = None
+    confirmed_at: AwareDatetime | None = None
+    created_at: AwareDatetime = Field(default_factory=utc_now)
+    updated_at: AwareDatetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def valid_attempt_history(self) -> Self:
+        if self.attempts == 0 and self.last_attempt_at is not None:
+            raise ValueError("an unattempted termination job cannot have last_attempt_at")
+        if self.attempts > 0 and self.last_attempt_at is None:
+            raise ValueError("an attempted termination job requires last_attempt_at")
+        if self.state is CallTerminationState.CONFIRMED and self.confirmed_at is None:
+            raise ValueError("a confirmed termination job requires confirmed_at")
+        if self.state is CallTerminationState.PENDING and self.confirmed_at is not None:
+            raise ValueError("a pending termination job cannot have confirmed_at")
+        if self.updated_at < self.created_at:
+            raise ValueError("updated_at must not precede created_at")
         return self
 
 
@@ -966,14 +1044,14 @@ class TranscriptTurn(StrictModel):
     occurred_at: AwareDatetime | None = None
 
 
-class SarvamWebhookPayload(StrictModel):
-    """Normalized completion payload accepted from the Sarvam HTTP adapter."""
+class ProviderWebhookPayload(StrictModel):
+    """Provider-neutral terminal call payload accepted by the durable coordinator."""
 
     webhook_id: OpaqueId | None = None
     attempt_id: OpaqueId
     interaction_id: OpaqueId | None = None
     status: WebhookStatus
-    provider: ShortText = "sarvam"
+    provider: ShortText = "openai_realtime"
     channel: ContactChannel = ContactChannel.VOICE
     duration_seconds: float | None = Field(default=None, ge=0, le=86_400)
     failure_reason: Annotated[
@@ -1047,6 +1125,9 @@ __all__ = [
     "AgentType",
     "ApprovedAction",
     "AwareDatetime",
+    "CallTerminationJob",
+    "CallTerminationLeg",
+    "CallTerminationState",
     "ConfirmationMethod",
     "ContactChannel",
     "ContactDirection",
@@ -1072,10 +1153,11 @@ __all__ = [
     "PendingActionSnapshot",
     "PreparedAction",
     "ProposedAction",
+    "ProviderWebhookPayload",
     "RiskLevel",
-    "SarvamWebhookPayload",
     "SessionState",
     "Severity",
+    "TerminationJobId",
     "TestSnapshot",
     "ThreadSnapshot",
     "TimelineEntry",

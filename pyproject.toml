@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-hotline"
-version = "0.1.0"
+version = "0.2.0"
 description = "A bidirectional voice control plane for Codex and Claude agents."
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 license = { text = "MIT" }
 authors = [{ name = "Agent Hotline contributors" }]
-keywords = ["codex", "claude", "mcp", "voice-agent", "sarvam", "samvaad"]
+keywords = ["codex", "claude", "mcp", "voice-agent", "openai", "realtime", "sip"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "License :: OSI Approved :: MIT License",
@@ -22,11 +22,13 @@ dependencies = [
   "fastapi>=0.115,<1",
   "httpx>=0.28,<1",
   "mcp>=1.12,<2",
+  "openai>=2.17,<3",
   "pydantic>=2.10,<3",
   "pydantic-settings>=2.7,<3",
   "rich>=13.9,<15",
   "typer>=0.15,<1",
   "uvicorn[standard]>=0.34,<1",
+  "websockets>=15,<17",
 ]
 
 [project.optional-dependencies]
@@ -41,10 +43,22 @@ dev = [
 agent-hotline = "agent_hotline.cli:app"
 agent-hotline-claude-hook = "agent_hotline.claude_hooks:main"
 agent-hotline-mcp = "agent_hotline.mcp_server:main"
-agent-hotline-sarvam = "agent_hotline.sarvam_setup:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_hotline"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"plugins/agent-hotline" = "agent_hotline/_distribution/plugins/agent-hotline"
+".agents/plugins/marketplace.json" = "agent_hotline/_distribution/.agents/plugins/marketplace.json"
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+  "/app",
+  "/.claude",
+  "/.hotline",
+  "/dist",
+  "/node_modules",
+]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"

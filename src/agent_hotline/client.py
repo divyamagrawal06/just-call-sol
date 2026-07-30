@@ -27,8 +27,10 @@ class HealthResponse(BaseModel):
     version: str
     database: str
     transport: str
-    sarvam_configured: bool
-    public_tools_configured: bool
+    openai_realtime_configured: bool = False
+    openai_realtime_runtime_ready: bool = False
+    twilio_configured: bool = False
+    active_realtime_calls: int = 0
     secure_fallback_configured: bool = False
     codex_app_server: dict[str, Any] | None = None
 
@@ -75,6 +77,15 @@ class HotlineClient:
         )
         return ContactHumanResult.model_validate(result)
 
+    async def start_contact_human(self, request: ContactHumanRequest) -> ContactHumanResult:
+        result = await self._request(
+            "POST",
+            "/v1/escalations/start",
+            json=request.model_dump(mode="json", exclude_none=True),
+            request_timeout=30.0,
+        )
+        return ContactHumanResult.model_validate(result)
+
     async def notify_human(self, request: NotifyHumanRequest) -> ContactHumanResult:
         result = await self._request(
             "POST",
@@ -86,6 +97,10 @@ class HotlineClient:
 
     async def get_event(self, event_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/v1/events/{event_id}")
+
+    async def get_result(self, event_id: str) -> ContactHumanResult:
+        payload = await self._request("GET", f"/v1/events/{event_id}/result")
+        return ContactHumanResult.model_validate(payload)
 
     async def list_events(self, limit: int = 20) -> list[EventSummary]:
         payload = await self._request("GET", "/v1/events", params={"limit": limit})
