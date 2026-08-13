@@ -647,7 +647,7 @@ def test_session_config_is_complete_and_direction_specific(
     assert config["model"] == "gpt-realtime-2.1"
     assert config["reasoning"] == {"effort": "low"}
     assert config["output_modalities"] == ["audio"]
-    assert config["audio"]["output"] == {"voice": "marin", "speed": 1.03}
+    assert config["audio"]["output"] == {"voice": "marin"}
     assert config["audio"]["input"]["turn_detection"] == {
         "type": "semantic_vad",
         "eagerness": "low",

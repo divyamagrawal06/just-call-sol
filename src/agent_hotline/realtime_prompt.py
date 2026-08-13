@@ -36,7 +36,6 @@ def build_realtime_session_config(
             },
             "output": {
                 "voice": settings.openai_realtime_voice,
-                "speed": 1.03,
             },
         },
         "tools": realtime_tool_definitions(),
