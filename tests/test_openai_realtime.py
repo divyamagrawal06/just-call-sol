@@ -14,6 +14,8 @@ import pytest_asyncio
 from openai import InvalidWebhookSignatureError
 from openai.types.realtime import RealtimeSessionCreateRequestParam
 from pydantic import SecretStr, TypeAdapter
+from websockets.exceptions import ConnectionClosedOK
+from websockets.frames import Close
 
 import agent_hotline.openai_realtime as realtime
 import agent_hotline.storage as storage_module
@@ -1850,21 +1852,150 @@ async def test_sideband_connects_with_call_auth_and_requests_one_greeting(
             },
         )
     ]
-    assert sockets.socket.sent == [
-        {
-            "type": "response.create",
-            "response": {
-                "instructions": (
-                    "Begin the call now using the configured opening and conversation flow."
-                )
-            },
-        }
-    ]
+    assert len(sockets.socket.sent) == 1
+    greeting = sockets.socket.sent[0]
+    assert greeting["type"] == "response.create"
+    assert greeting["event_id"].startswith("evt_hotline_")
+    assert greeting["response"] == {
+        "instructions": "Begin the call now using the configured opening and conversation flow."
+    }
     assert OPENAI_API_KEY not in "".join(sockets.socket.sent_raw)
 
     await conversation.stop()
     with pytest.raises(SocketEnded):
         await task
+
+
+@pytest.mark.asyncio
+async def test_uncorrelated_realtime_error_fails_closed_on_both_call_legs(
+    store: SQLiteStore,
+) -> None:
+    settings = configured_settings()
+    client = FakeControlClient()
+    provider = FakeCallProvider()
+    sockets = FakeSocketFactory()
+    manager = OpenAIRealtimeManager(
+        settings=settings,
+        store=store,
+        coordinator=real_coordinator(settings, store, provider=provider),
+        client=cast(Any, client),
+        socket_factory=sockets,
+    )
+    conversation = build_conversation(
+        settings=settings,
+        store=store,
+        client=client,
+        socket_factory=sockets,
+        coordinator=RecordingToolCoordinator(),
+        call_id="call_uncorrelated_error",
+    )
+
+    worker = asyncio.create_task(manager._run_conversation(conversation))
+    await wait_until(lambda: len(sockets.socket.sent) == 1)
+    sockets.socket.push(
+        {
+            "type": "error",
+            "error": {"type": "server_error", "message": "provider detail"},
+        }
+    )
+    await asyncio.wait_for(worker, timeout=2)
+
+    assert client.hung_up == ["call_uncorrelated_error"]
+    assert provider.terminated_attempts == [TWILIO_CALL_SID]
+    await manager.close()
+
+
+@pytest.mark.parametrize("response_status", ["failed", "incomplete"])
+@pytest.mark.asyncio
+async def test_non_successful_response_terminal_fails_closed_on_both_call_legs(
+    store: SQLiteStore,
+    response_status: str,
+) -> None:
+    settings = configured_settings()
+    client = FakeControlClient()
+    provider = FakeCallProvider()
+    sockets = FakeSocketFactory()
+    manager = OpenAIRealtimeManager(
+        settings=settings,
+        store=store,
+        coordinator=real_coordinator(settings, store, provider=provider),
+        client=cast(Any, client),
+        socket_factory=sockets,
+    )
+    call_id = f"call_response_{response_status}"
+    conversation = build_conversation(
+        settings=settings,
+        store=store,
+        client=client,
+        socket_factory=sockets,
+        coordinator=RecordingToolCoordinator(),
+        call_id=call_id,
+    )
+
+    worker = asyncio.create_task(manager._run_conversation(conversation))
+    await wait_until(lambda: len(sockets.socket.sent) == 1)
+    sockets.socket.push(
+        {
+            "type": "response.done",
+            "response": {
+                "id": f"resp_{response_status}",
+                "status": response_status,
+                "status_details": {"reason": "test_failure"},
+                "output": [],
+            },
+        }
+    )
+    await asyncio.wait_for(worker, timeout=2)
+
+    assert client.hung_up == [call_id]
+    assert provider.terminated_attempts == [TWILIO_CALL_SID]
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_normal_sideband_close_reconciles_as_completed(
+    store: SQLiteStore,
+) -> None:
+    call_id = "call_normal_peer_close"
+    event, session = await persist_recoverable_realtime_call(store, call_id=call_id)
+    settings = configured_settings()
+    client = FakeControlClient()
+    provider = FakeCallProvider()
+    socket = FakeRealtimeSocket()
+    socket.incoming.put_nowait(
+        ConnectionClosedOK(Close(1000, "caller hung up"), None)
+    )
+    sockets = FakeSocketFactory(socket)
+    coordinator = real_coordinator(settings, store, provider=provider)
+    manager = OpenAIRealtimeManager(
+        settings=settings,
+        store=store,
+        coordinator=coordinator,
+        client=cast(Any, client),
+        socket_factory=sockets,
+    )
+    conversation = RealtimeConversation(
+        settings=settings,
+        store=store,
+        client=cast(Any, client),
+        socket_factory=sockets,
+        call_id=call_id,
+        attempt_id=TWILIO_CALL_SID,
+        event_id=event.event_id,
+        session_id=session.session_id,
+        direction="inbound_control",
+        coordinator=coordinator,
+    )
+
+    await manager._run_conversation(conversation)
+
+    persisted = await store.get_session(session.session_id)
+    assert persisted is not None
+    assert persisted.state is SessionState.COMPLETED
+    assert persisted.failure_reason is None
+    assert client.hung_up == [call_id]
+    assert provider.terminated_attempts == [TWILIO_CALL_SID]
+    await manager.close()
 
 
 @pytest.mark.parametrize(
@@ -2247,7 +2378,8 @@ async def test_tool_call_id_reuse_with_different_arguments_fails_closed(
         "error": "The tool call identifier was reused with different content.",
         "retryable": False,
     }
-    assert sockets.socket.sent[-1] == {"type": "response.create"}
+    assert sockets.socket.sent[-1]["type"] == "response.create"
+    assert sockets.socket.sent[-1]["event_id"].startswith("evt_hotline_")
 
 
 @pytest.mark.parametrize(
@@ -3015,7 +3147,8 @@ async def test_sideband_dtmf_event_emits_only_a_digit_free_trusted_signal(
     assert "keypad verification succeeded" in trusted_text
     assert OWNER_PIN not in trusted_text
     assert OWNER_PIN not in "".join(sockets.socket.sent_raw)
-    assert sockets.socket.sent[1] == {"type": "response.create"}
+    assert sockets.socket.sent[1]["type"] == "response.create"
+    assert sockets.socket.sent[1]["event_id"].startswith("evt_hotline_")
 
     await sockets.socket.close()
     with pytest.raises(SocketEnded):

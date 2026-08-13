@@ -57,12 +57,12 @@ def test_openai_realtime_defaults_are_the_production_profile(
 def test_settings_honor_environment_values_set_inside_a_test(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("OPENAI_REALTIME_MODEL", "gpt-realtime-env-test")
+    monkeypatch.setenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-explicit-test-value")
 
     settings = _settings()
 
-    assert settings.openai_realtime_model == "gpt-realtime-env-test"
+    assert settings.openai_realtime_model == "gpt-realtime-2"
     assert settings.openai_api_key.get_secret_value() == "sk-explicit-test-value"
 
 
@@ -184,6 +184,7 @@ def test_openai_project_id_rejects_values_that_cannot_form_a_safe_sip_uri(
     "overrides",
     [
         {"openai_realtime_model": "gpt-4.1"},
+        {"openai_realtime_model": "gpt-realtime-1.5"},
         {"openai_realtime_voice": "unknown-voice"},
         {"openai_realtime_reasoning_effort": "unbounded"},
     ],

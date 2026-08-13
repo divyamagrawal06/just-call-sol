@@ -20,6 +20,7 @@ import httpx
 import websockets
 from openai import InvalidWebhookSignatureError, OpenAI
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
+from websockets.exceptions import ConnectionClosedOK
 
 from .contracts import (
     BeginInboundSessionRequest,
@@ -1081,6 +1082,8 @@ class RealtimeConversation:
                     },
                 )
                 await reader
+        except ConnectionClosedOK:
+            logger.info("Realtime sideband closed normally call_id=%s", self.call_id)
         finally:
             if reader is not None and not reader.done():
                 reader.cancel()
@@ -1150,7 +1153,12 @@ class RealtimeConversation:
                     waiter.set_exception(
                         OpenAIRealtimeError("OpenAI Realtime rejected a correlated Hotline event")
                     )
-                continue
+                    continue
+                terminal_error = OpenAIRealtimeError(
+                    "OpenAI Realtime returned a server error outside an active delivery"
+                )
+                self._fail_client_event_waiters(terminal_error)
+                raise terminal_error
             if event_type in {
                 "conversation.item.created",
                 "conversation.item.added",
@@ -1256,6 +1264,16 @@ class RealtimeConversation:
                 )
 
             if event_type == "response.done":
+                response = event.get("response")
+                response_status = (
+                    response.get("status") if isinstance(response, Mapping) else None
+                )
+                if response_status in {"failed", "incomplete"}:
+                    terminal_error = OpenAIRealtimeError(
+                        f"OpenAI Realtime response ended with status {response_status}"
+                    )
+                    self._fail_client_event_waiters(terminal_error)
+                    raise terminal_error
                 response_completed = _response_is_completed(event)
                 if response_completed:
                     response_id, transcript = _completed_response_transcript(event)
@@ -1702,14 +1720,26 @@ class RealtimeConversation:
         await self._send(socket, {"type": "response.create"})
 
     async def _send(self, socket: RealtimeSocket, event: Mapping[str, Any]) -> None:
+        outbound = dict(event)
+        client_event_id = outbound.get("event_id")
+        if client_event_id is None:
+            client_event_id = new_id("evt_hotline")
+            outbound["event_id"] = client_event_id
+        elif not isinstance(client_event_id, str) or not client_event_id:
+            raise OpenAIRealtimeError("Realtime client event_id must be a non-empty string")
         payload = json.dumps(
-            event,
+            outbound,
             ensure_ascii=False,
             allow_nan=False,
             separators=(",", ":"),
         )
         async with self._send_lock:
             await socket.send(payload)
+
+    def _fail_client_event_waiters(self, error: Exception) -> None:
+        for waiter in tuple(self._client_event_waiters.values()):
+            if not waiter.done():
+                waiter.set_exception(error)
 
 
 class OpenAIRealtimeManager:

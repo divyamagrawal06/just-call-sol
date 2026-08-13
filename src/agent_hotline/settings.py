@@ -244,8 +244,10 @@ class Settings(BaseSettings):
     @classmethod
     def validate_realtime_model(cls, value: str) -> str:
         value = value.strip()
-        if not value.startswith("gpt-realtime"):
-            raise ValueError("OPENAI_REALTIME_MODEL must be a gpt-realtime model")
+        if value not in {"gpt-realtime-2", "gpt-realtime-2.1"}:
+            raise ValueError(
+                "OPENAI_REALTIME_MODEL must be gpt-realtime-2 or gpt-realtime-2.1"
+            )
         return value
 
     @field_validator("hotline_owner_name")
