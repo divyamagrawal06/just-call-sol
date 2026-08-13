@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -12,7 +13,11 @@ import httpx
 import pytest
 import pytest_asyncio
 from openai import InvalidWebhookSignatureError
-from openai.types.realtime import RealtimeSessionCreateRequestParam
+from openai.types.realtime import (
+    ConversationItemTruncateEventParam,
+    RealtimeSessionCreateRequestParam,
+    SessionUpdateEventParam,
+)
 from pydantic import SecretStr, TypeAdapter
 from websockets.exceptions import ConnectionClosedOK
 from websockets.frames import Close
@@ -61,6 +66,7 @@ from agent_hotline.storage import (
     StorageError,
 )
 from agent_hotline.telephony_security import build_correlation_signature
+from agent_hotline.twilio_media import TwilioMediaEvent, TwilioMediaStart
 
 OPENAI_API_KEY = "sk-openai-realtime-test-secret"
 OPENAI_WEBHOOK_SECRET = "whsec-openai-realtime-test-secret"
@@ -215,6 +221,38 @@ class FakeSocketFactory:
                 await self.socket.close()
 
         return connection()
+
+
+class QuietCloseRealtimeSocket(FakeRealtimeSocket):
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        self.closed = True
+        self.close_code = code
+        self.close_reason = reason
+
+
+class FakeMediaStream:
+    def __init__(self, *, start: TwilioMediaStart | None = None) -> None:
+        self.start = start
+        self.incoming: asyncio.Queue[TwilioMediaEvent] = asyncio.Queue()
+        self.audio: list[str] = []
+        self.marks: list[str] = []
+        self.clear_calls = 0
+        self.closed = False
+
+    async def receive(self) -> TwilioMediaEvent:
+        return await self.incoming.get()
+
+    async def send_audio(self, payload: str) -> None:
+        self.audio.append(payload)
+
+    async def send_mark(self, name: str) -> None:
+        self.marks.append(name)
+
+    async def clear_audio(self) -> None:
+        self.clear_calls += 1
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 class FakeControlClient:
@@ -610,6 +648,7 @@ def build_conversation(
     socket_factory: FakeSocketFactory,
     coordinator: object,
     call_id: str = "call_realtime_test",
+    media_stream: object | None = None,
 ) -> RealtimeConversation:
     return RealtimeConversation(
         settings=settings,
@@ -622,7 +661,168 @@ def build_conversation(
         session_id="ses_realtime_test",
         direction="outbound_escalation",
         coordinator=cast(Any, coordinator),
+        media_stream=cast(Any, media_stream),
     )
+
+
+@pytest.mark.asyncio
+async def test_direct_media_conversation_bridges_pcmu_both_directions(
+    store: SQLiteStore,
+) -> None:
+    settings = configured_settings()
+    socket = QuietCloseRealtimeSocket()
+    factory = FakeSocketFactory(socket)
+    media = FakeMediaStream()
+    conversation = build_conversation(
+        settings=settings,
+        store=store,
+        client=FakeControlClient(),
+        socket_factory=factory,
+        coordinator=RecordingToolCoordinator(),
+        call_id=TWILIO_CALL_SID,
+        media_stream=media,
+    )
+    task = asyncio.create_task(conversation.run())
+    await wait_until(lambda: len(socket.sent) >= 2)
+
+    session_update = socket.sent[0]
+    assert session_update["type"] == "session.update"
+    assert session_update["session"]["audio"]["input"]["format"] == {"type": "audio/pcmu"}
+    assert session_update["session"]["audio"]["output"]["format"] == {"type": "audio/pcmu"}
+    assert "model" not in session_update["session"]
+    assert TypeAdapter(SessionUpdateEventParam).validate_python(session_update) == session_update
+    assert factory.connections[0][0] == ("wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1")
+
+    caller_audio = base64.b64encode(bytes(range(160))).decode()
+    await media.incoming.put(TwilioMediaEvent("audio", caller_audio))
+    await wait_until(
+        lambda: any(event.get("type") == "input_audio_buffer.append" for event in socket.sent)
+    )
+    audio_event = {
+        "type": "response.output_audio.delta",
+        "response_id": "resp_direct_audio",
+        "item_id": "item_direct_audio",
+        "content_index": 0,
+        "delta": caller_audio,
+    }
+    socket.push(audio_event)
+    await wait_until(lambda: media.audio == [caller_audio])
+    await wait_until(lambda: len(media.marks) == 1)
+    await media.incoming.put(TwilioMediaEvent("mark", media.marks[0]))
+    await wait_until(
+        lambda: conversation._media_audio_states["item_direct_audio"].acknowledged_bytes == 160
+    )
+    socket.push(audio_event)
+    await wait_until(lambda: media.audio == [caller_audio, caller_audio])
+    await wait_until(lambda: len(media.marks) == 2)
+    socket.push({"type": "input_audio_buffer.speech_started"})
+    await wait_until(lambda: media.clear_calls == 1)
+    await wait_until(
+        lambda: any(event.get("type") == "conversation.item.truncate" for event in socket.sent)
+    )
+    truncation = next(
+        event for event in socket.sent if event.get("type") == "conversation.item.truncate"
+    )
+    assert truncation["item_id"] == "item_direct_audio"
+    assert truncation["content_index"] == 0
+    assert truncation["audio_end_ms"] == 20
+    assert TypeAdapter(ConversationItemTruncateEventParam).validate_python(truncation) == truncation
+    socket.push(
+        {
+            "type": "response.output_audio.done",
+            "response_id": "resp_direct_audio",
+            "item_id": "item_direct_audio",
+            "content_index": 0,
+        }
+    )
+    await wait_until(lambda: conversation._media_audio_states["item_direct_audio"].output_done)
+    assert len(media.marks) == 2
+    await media.incoming.put(TwilioMediaEvent("mark", media.marks[1], cleared=True))
+    await wait_until(lambda: media.marks[1] not in conversation._media_markers)
+
+    await media.incoming.put(TwilioMediaEvent("stop"))
+    await task
+    assert socket.closed is True
+    assert media.closed is True
+
+
+@pytest.mark.asyncio
+async def test_direct_media_final_mark_confirms_full_phone_playback(
+    store: SQLiteStore,
+) -> None:
+    socket = QuietCloseRealtimeSocket()
+    media = FakeMediaStream()
+    conversation = build_conversation(
+        settings=configured_settings(),
+        store=store,
+        client=FakeControlClient(),
+        socket_factory=FakeSocketFactory(socket),
+        coordinator=RecordingToolCoordinator(),
+        call_id=TWILIO_CALL_SID,
+        media_stream=media,
+    )
+    task = asyncio.create_task(conversation.run())
+    await wait_until(lambda: len(socket.sent) >= 2)
+    audio = base64.b64encode(bytes(range(160))).decode()
+    identity = {
+        "response_id": "resp_direct_done",
+        "item_id": "item_direct_done",
+        "content_index": 0,
+    }
+    socket.push({"type": "response.output_audio.delta", "delta": audio, **identity})
+    await wait_until(lambda: len(media.marks) == 1)
+    socket.push({"type": "response.output_audio.done", **identity})
+    await wait_until(lambda: len(media.marks) == 2)
+
+    await media.incoming.put(TwilioMediaEvent("mark", media.marks[0]))
+    await media.incoming.put(TwilioMediaEvent("mark", media.marks[1]))
+    await wait_until(lambda: "resp_direct_done" in conversation._played_response_ids)
+
+    await media.incoming.put(TwilioMediaEvent("stop"))
+    await task
+
+
+@pytest.mark.asyncio
+async def test_direct_inbound_media_stream_uses_existing_control_session(
+    store: SQLiteStore,
+) -> None:
+    carrier_admission = await store.issue_carrier_admission(
+        TWILIO_CALL_SID,
+        caller_phone=OWNER_PHONE,
+        ttl_seconds=300,
+    )
+    socket = QuietCloseRealtimeSocket()
+    factory = FakeSocketFactory(socket)
+    media = FakeMediaStream(
+        start=TwilioMediaStart(
+            account_sid=TWILIO_ACCOUNT_SID,
+            call_sid=TWILIO_CALL_SID,
+            stream_sid="MZ" + ("c" * 32),
+            event_id=None,
+            direction="inbound",
+            caller_phone=OWNER_PHONE,
+            admission_nonce=carrier_admission.admission_nonce,
+            expires_at_epoch=int(carrier_admission.expires_at.timestamp()),
+        )
+    )
+    await media.incoming.put(TwilioMediaEvent("stop"))
+    manager = OpenAIRealtimeManager(
+        settings=configured_settings(),
+        store=store,
+        coordinator=real_coordinator(configured_settings(), store),
+        client=cast(Any, FakeControlClient()),
+        socket_factory=factory,
+    )
+
+    await manager.run_media_stream(cast(Any, media))
+
+    assert socket.sent[0]["type"] == "session.update"
+    assert "you're talking directly to your agent" in socket.sent[0]["session"]["instructions"]
+    assert media.closed is True
+    persisted = await store.get_session_by_attempt(TWILIO_CALL_SID)
+    assert persisted is not None
+    assert persisted.state is SessionState.COMPLETED
+    await manager.close()
 
 
 @pytest.mark.parametrize(
@@ -1962,9 +2162,7 @@ async def test_normal_sideband_close_reconciles_as_completed(
     client = FakeControlClient()
     provider = FakeCallProvider()
     socket = FakeRealtimeSocket()
-    socket.incoming.put_nowait(
-        ConnectionClosedOK(Close(1000, "caller hung up"), None)
-    )
+    socket.incoming.put_nowait(ConnectionClosedOK(Close(1000, "caller hung up"), None))
     sockets = FakeSocketFactory(socket)
     coordinator = real_coordinator(settings, store, provider=provider)
     manager = OpenAIRealtimeManager(

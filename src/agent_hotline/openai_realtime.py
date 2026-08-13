@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import hashlib
 import hmac
@@ -57,6 +59,7 @@ from .security import PhoneNumberError, canonical_json, normalize_e164, sanitize
 from .settings import Settings
 from .storage import ActiveSessionError, ConflictError, SQLiteStore, StorageError
 from .telephony_security import verify_correlation_signature
+from .twilio_media import TwilioMediaStream
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +75,7 @@ _DELIVERY_ACK_TIMEOUT_SECONDS = 10.0
 _TERMINATION_RETRY_BASE_SECONDS = 1
 _TERMINATION_RETRY_MAX_SECONDS = 300
 _TERMINATION_RECONCILE_BATCH = 20
+_PCMU_BYTES_PER_MILLISECOND = 8
 
 
 class OpenAIRealtimeError(RuntimeError):
@@ -220,6 +224,25 @@ class PendingToolOutput:
     output_json: str
     request_response: bool
     delivery_state: str = "pending"
+
+
+@dataclass(slots=True)
+class _MediaAudioState:
+    response_id: str
+    item_id: str
+    content_index: int
+    sent_bytes: int = 0
+    acknowledged_bytes: int = 0
+    output_done: bool = False
+    interrupted: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _MediaAudioMarker:
+    item_id: str
+    played_bytes: int
+    response_id: str
+    final: bool = False
 
 
 class OpenAIRealtimeClient:
@@ -1014,6 +1037,7 @@ class RealtimeConversation:
         session_id: str,
         direction: Direction,
         coordinator: HotlineCoordinator,
+        media_stream: TwilioMediaStream | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -1024,6 +1048,7 @@ class RealtimeConversation:
         self.event_id = event_id
         self.session_id = session_id
         self.direction = direction
+        self.media_stream = media_stream
         self.dispatcher = RealtimeToolDispatcher(
             settings=settings,
             coordinator=coordinator,
@@ -1044,6 +1069,11 @@ class RealtimeConversation:
         self._client_event_waiters: dict[str, asyncio.Future[None]] = {}
         self._finish_after_response = False
         self._finish_response_id: str | None = None
+        self._played_response_ids: set[str] = set()
+        self._media_audio_states: dict[str, _MediaAudioState] = {}
+        self._media_markers: dict[str, _MediaAudioMarker] = {}
+        self._active_media_item_id: str | None = None
+        self._media_mark_sequence = 0
         self._stop = asyncio.Event()
         self._stopped_externally = False
         self._socket: RealtimeSocket | None = None
@@ -1055,6 +1085,9 @@ class RealtimeConversation:
         }
         if self.settings.openai_project_id is not None:
             headers["OpenAI-Project"] = self.settings.openai_project_id
+        if self.media_stream is not None:
+            await self._run_direct_media(headers)
+            return
         url = "wss://api.openai.com/v1/realtime?call_id=" + quote(self.call_id, safe="")
         reader: asyncio.Task[None] | None = None
         try:
@@ -1094,6 +1127,81 @@ class RealtimeConversation:
             self.dispatcher.invalidate_verification()
             self._socket = None
 
+    async def _run_direct_media(self, headers: Mapping[str, str]) -> None:
+        media_stream = self.media_stream
+        if media_stream is None:
+            raise OpenAIRealtimeError("direct media transport is missing")
+        model = quote(self.settings.openai_realtime_model, safe="")
+        url = f"wss://api.openai.com/v1/realtime?model={model}"
+        reader: asyncio.Task[None] | None = None
+        media_reader: asyncio.Task[None] | None = None
+        try:
+            async with self.socket_factory(url, headers) as socket:
+                self._socket = socket
+                await self._hydrate_pending_tool_outputs()
+                if self._pending_tool_outputs:
+                    raise AmbiguousToolDeliveryError(
+                        "unfinished Realtime tool delivery cannot be replayed safely"
+                    )
+                reader = asyncio.create_task(
+                    self._read_loop(socket),
+                    name=f"agent-hotline-realtime-reader-{self.call_id}",
+                )
+                media_reader = asyncio.create_task(
+                    self._media_read_loop(socket, media_stream),
+                    name=f"agent-hotline-twilio-media-reader-{self.call_id}",
+                )
+                session_config = build_realtime_session_config(
+                    self.settings,
+                    direction=self.direction,
+                )
+                session_config.pop("model", None)
+                audio = session_config["audio"]
+                assert isinstance(audio, dict)
+                audio_input = audio["input"]
+                audio_output = audio["output"]
+                assert isinstance(audio_input, dict)
+                assert isinstance(audio_output, dict)
+                audio_input["format"] = {"type": "audio/pcmu"}
+                audio_output["format"] = {"type": "audio/pcmu"}
+                await self._send(
+                    socket,
+                    {"type": "session.update", "session": session_config},
+                )
+                await self._send(
+                    socket,
+                    {
+                        "type": "response.create",
+                        "response": {
+                            "instructions": (
+                                "Begin the call now using the configured opening and "
+                                "conversation flow."
+                            )
+                        },
+                    },
+                )
+                done, _pending = await asyncio.wait(
+                    {reader, media_reader},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for completed in done:
+                    await completed
+        except ConnectionClosedOK:
+            logger.info("Realtime direct media closed normally call_id=%s", self.call_id)
+        finally:
+            self._stop.set()
+            tasks = tuple(task for task in (reader, media_reader) if task is not None)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if self._tool_tasks:
+                await asyncio.gather(*tuple(self._tool_tasks), return_exceptions=True)
+            self.dispatcher.invalidate_verification()
+            await media_stream.close()
+            self._socket = None
+
     async def stop(self) -> None:
         self._stopped_externally = True
         self._stop.set()
@@ -1108,6 +1216,8 @@ class RealtimeConversation:
         if socket is not None:
             with contextlib.suppress(Exception):
                 await socket.close(code=1000, reason="call ended")
+        if self.media_stream is not None:
+            await self.media_stream.close()
 
     async def _read_loop(self, socket: RealtimeSocket) -> None:
         while not self._stop.is_set():
@@ -1129,6 +1239,12 @@ class RealtimeConversation:
             if not isinstance(event, dict):
                 continue
             event_type = event.get("type")
+            if event_type == "response.output_audio.delta" and self.media_stream is not None:
+                await self._forward_media_audio_delta(event)
+                continue
+            if event_type == "response.output_audio.done" and self.media_stream is not None:
+                await self._finish_media_audio(event)
+                continue
             if event_type == "error" or (
                 isinstance(event_type, str)
                 and event_type in {"invalid_request_error", "server_error"}
@@ -1220,6 +1336,8 @@ class RealtimeConversation:
                 )
                 if callable(note_owner_speech_started):
                     note_owner_speech_started()
+                if self.media_stream is not None:
+                    await self._interrupt_media_audio(socket)
                 continue
             if event_type == "input_audio_buffer.speech_stopped":
                 note_owner_speech_stopped = getattr(
@@ -1265,9 +1383,7 @@ class RealtimeConversation:
 
             if event_type == "response.done":
                 response = event.get("response")
-                response_status = (
-                    response.get("status") if isinstance(response, Mapping) else None
-                )
+                response_status = response.get("status") if isinstance(response, Mapping) else None
                 if response_status in {"failed", "incomplete"}:
                     terminal_error = OpenAIRealtimeError(
                         f"OpenAI Realtime response ended with status {response_status}"
@@ -1295,6 +1411,187 @@ class RealtimeConversation:
                 response_id, _transcript = _completed_response_transcript(event)
                 if response_id is not None:
                     self._finish_response_id = response_id
+                    if response_id in self._played_response_ids:
+                        self._stop.set()
+                        if self.media_stream is not None:
+                            await self.media_stream.close()
+                        with contextlib.suppress(Exception):
+                            await socket.close(code=1000, reason="session finished")
+                        return
+
+    async def _media_read_loop(
+        self,
+        socket: RealtimeSocket,
+        media_stream: TwilioMediaStream,
+    ) -> None:
+        while not self._stop.is_set():
+            event = await media_stream.receive()
+            if event.kind == "audio":
+                assert event.value is not None
+                await self._send(
+                    socket,
+                    {
+                        "type": "input_audio_buffer.append",
+                        "audio": event.value,
+                    },
+                )
+                continue
+            if event.kind == "dtmf":
+                assert event.value is not None
+                status = self.dispatcher.receive_dtmf(event.value)
+                if status is not None:
+                    await self._send_trusted_signal(socket, status)
+                continue
+            if event.kind == "mark":
+                assert event.value is not None
+                marker = self._media_markers.pop(event.value, None)
+                if marker is None:
+                    raise OpenAIRealtimeError("Twilio acknowledged an unknown audio marker")
+                state = self._media_audio_states.get(marker.item_id)
+                if state is None:
+                    raise OpenAIRealtimeError("Twilio audio marker lost its item state")
+                if not event.cleared and not state.interrupted:
+                    state.acknowledged_bytes = max(
+                        state.acknowledged_bytes,
+                        marker.played_bytes,
+                    )
+                if marker.final and not event.cleared and not state.interrupted:
+                    self._played_response_ids.add(marker.response_id)
+                    note_output_audio_stopped = getattr(
+                        self.dispatcher,
+                        "note_output_audio_stopped",
+                        None,
+                    )
+                    if callable(note_output_audio_stopped):
+                        note_output_audio_stopped(marker.response_id)
+                    if self._active_media_item_id == marker.item_id:
+                        self._active_media_item_id = None
+                    if self._finish_response_id == marker.response_id:
+                        self._stop.set()
+                        await media_stream.close()
+                        with contextlib.suppress(Exception):
+                            await socket.close(code=1000, reason="session finished")
+                        return
+                continue
+            self._stop.set()
+            with contextlib.suppress(Exception):
+                await socket.close(code=1000, reason="carrier media ended")
+            return
+
+    async def _forward_media_audio_delta(self, event: Mapping[str, Any]) -> None:
+        media_stream = self.media_stream
+        if media_stream is None:
+            raise OpenAIRealtimeError("direct media transport is missing")
+        response_id, item_id, content_index = _media_audio_identity(event)
+        delta = event.get("delta")
+        if not isinstance(delta, str):
+            raise OpenAIRealtimeError("Realtime audio delta is malformed")
+        try:
+            decoded = base64.b64decode(delta, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise OpenAIRealtimeError("Realtime audio delta is not Base64") from exc
+        if not decoded:
+            raise OpenAIRealtimeError("Realtime audio delta is empty")
+        state = self._media_audio_states.get(item_id)
+        if state is None:
+            state = _MediaAudioState(
+                response_id=response_id,
+                item_id=item_id,
+                content_index=content_index,
+            )
+            self._media_audio_states[item_id] = state
+        elif (
+            state.response_id != response_id
+            or state.content_index != content_index
+            or state.output_done
+        ):
+            raise OpenAIRealtimeError("Realtime audio item identity changed")
+        if state.interrupted:
+            return
+        active_item_id = self._active_media_item_id
+        if active_item_id is not None and active_item_id != item_id:
+            active = self._media_audio_states.get(active_item_id)
+            if active is not None and not active.interrupted:
+                raise OpenAIRealtimeError("Realtime emitted overlapping audio items")
+        self._active_media_item_id = item_id
+        state.sent_bytes += len(decoded)
+        await media_stream.send_audio(delta)
+        await self._send_media_mark(
+            media_stream,
+            state=state,
+            final=False,
+        )
+
+    async def _finish_media_audio(self, event: Mapping[str, Any]) -> None:
+        media_stream = self.media_stream
+        if media_stream is None:
+            raise OpenAIRealtimeError("direct media transport is missing")
+        response_id, item_id, content_index = _media_audio_identity(event)
+        state = self._media_audio_states.get(item_id)
+        if state is None:
+            state = _MediaAudioState(
+                response_id=response_id,
+                item_id=item_id,
+                content_index=content_index,
+            )
+            self._media_audio_states[item_id] = state
+        elif state.response_id != response_id or state.content_index != content_index:
+            raise OpenAIRealtimeError("Realtime audio completion identity changed")
+        if state.output_done:
+            raise OpenAIRealtimeError("Realtime audio completion was duplicated")
+        state.output_done = True
+        if state.interrupted:
+            return
+        await self._send_media_mark(
+            media_stream,
+            state=state,
+            final=True,
+        )
+
+    async def _send_media_mark(
+        self,
+        media_stream: TwilioMediaStream,
+        *,
+        state: _MediaAudioState,
+        final: bool,
+    ) -> None:
+        self._media_mark_sequence += 1
+        name = f"aud_{self._media_mark_sequence:016x}"
+        self._media_markers[name] = _MediaAudioMarker(
+            item_id=state.item_id,
+            played_bytes=state.sent_bytes,
+            response_id=state.response_id,
+            final=final,
+        )
+        try:
+            await media_stream.send_mark(name)
+        except BaseException:
+            self._media_markers.pop(name, None)
+            raise
+
+    async def _interrupt_media_audio(self, socket: RealtimeSocket) -> None:
+        media_stream = self.media_stream
+        if media_stream is None:
+            return
+        item_id = self._active_media_item_id
+        state = self._media_audio_states.get(item_id) if item_id is not None else None
+        if state is None or state.interrupted:
+            await media_stream.clear_audio()
+            return
+        state.interrupted = True
+        self._active_media_item_id = None
+        await media_stream.clear_audio()
+        if state.acknowledged_bytes >= state.sent_bytes:
+            return
+        await self._send(
+            socket,
+            {
+                "type": "conversation.item.truncate",
+                "item_id": state.item_id,
+                "content_index": state.content_index,
+                "audio_end_ms": state.acknowledged_bytes // _PCMU_BYTES_PER_MILLISECOND,
+            },
+        )
 
     async def _process_tool_call(
         self,
@@ -2038,6 +2335,136 @@ class OpenAIRealtimeManager:
                     )
         return session, should_dial
 
+    async def run_media_stream(self, media_stream: TwilioMediaStream) -> None:
+        """Run one authenticated Twilio stream against a direct Realtime WebSocket."""
+
+        if self._closed:
+            raise OpenAIRealtimeError("Realtime manager is closed")
+        start = media_stream.start
+        lock = self._call_locks.setdefault(start.call_sid, asyncio.Lock())
+        async with lock:
+            if start.call_sid in self._workers:
+                raise IncomingCallError("carrier media stream is already active", sip_status=486)
+            async with self._admission_lock:
+                if self.active_calls >= self.settings.hotline_max_active_calls:
+                    raise IncomingCallError(
+                        "the owner already has the maximum number of active calls",
+                        sip_status=486,
+                    )
+                session = await self.store.get_session_by_attempt(start.call_sid)
+                if start.direction == "inbound":
+                    if session is None:
+                        if (
+                            start.caller_phone is None
+                            or start.admission_nonce is None
+                            or start.expires_at_epoch is None
+                        ):
+                            raise IncomingCallError(
+                                "inbound media admission is incomplete",
+                                sip_status=403,
+                            )
+                        try:
+                            await self.store.consume_carrier_admission(
+                                start.call_sid,
+                                caller_phone=start.caller_phone,
+                                admission_nonce=start.admission_nonce,
+                                expires_at_epoch=start.expires_at_epoch,
+                                provider_call_id=start.call_sid,
+                            )
+                        except StorageError as exc:
+                            raise IncomingCallError(
+                                "carrier admission is expired, consumed, or unknown",
+                                sip_status=403,
+                            ) from exc
+                        admission = await self.coordinator.begin_inbound_session(
+                            BeginInboundSessionRequest(
+                                caller_phone_number=start.caller_phone,
+                                interaction_id=start.call_sid,
+                            ),
+                            provider="twilio_media_stream",
+                        )
+                        if not admission.accepted or admission.event_id is None:
+                            raise IncomingCallError(admission.message_to_user, sip_status=403)
+                        session = await self.store.get_session_by_interaction(start.call_sid)
+                        if session is None or session.event_id != admission.event_id:
+                            raise OpenAIRealtimeError("inbound media session was not persisted")
+                        try:
+                            session = await self.store.link_attempt(
+                                session.session_id,
+                                start.call_sid,
+                                require_active=True,
+                            )
+                        except ConflictError as exc:
+                            raise IncomingCallError(
+                                "inbound media session could not be linked",
+                                sip_status=481,
+                            ) from exc
+                    should_start = bool(
+                        session.direction is ContactDirection.INBOUND_CONTROL
+                        and session.event_id is not None
+                        and session.state not in TERMINAL_SESSION_STATES
+                    )
+                    direction: Direction = "inbound_control"
+                else:
+                    if start.event_id is None:
+                        raise IncomingCallError(
+                            "outbound media correlation is incomplete",
+                            sip_status=403,
+                        )
+                    session, should_start = await self.bind_outbound_carrier_parent(
+                        event_id=start.event_id,
+                        call_sid=start.call_sid,
+                    )
+                    direction = "outbound_escalation"
+                if not should_start or session.event_id is None:
+                    raise IncomingCallError(
+                        "media correlation is no longer active",
+                        sip_status=603,
+                    )
+                current_session = await self.store.get_session(session.session_id)
+                if current_session is not None and current_session.state in {
+                    SessionState.DIALING,
+                    SessionState.RINGING,
+                }:
+                    session = await self.store.transition_session(
+                        current_session.session_id,
+                        SessionState.CONNECTED,
+                    )
+                event = await self.store.require_event(session.event_id)
+                if event.state is EventState.DIALING:
+                    event = await self.store.transition_event(
+                        event.event_id,
+                        EventState.CONNECTED,
+                    )
+                if (
+                    direction == "outbound_escalation"
+                    and event.blocking
+                    and event.state is EventState.CONNECTED
+                ):
+                    await self.store.transition_event(
+                        event.event_id,
+                        EventState.AWAITING_DECISION,
+                    )
+                conversation = RealtimeConversation(
+                    settings=self.settings,
+                    store=self.store,
+                    client=self.client,
+                    socket_factory=self.socket_factory,
+                    call_id=start.call_sid,
+                    attempt_id=start.call_sid,
+                    event_id=session.event_id,
+                    session_id=session.session_id,
+                    direction=direction,
+                    coordinator=self.coordinator,
+                    media_stream=media_stream,
+                )
+                worker = asyncio.current_task()
+                if worker is None:
+                    raise OpenAIRealtimeError("media stream has no owning task")
+                self._conversations[start.call_sid] = conversation
+                self._workers[start.call_sid] = worker
+            await self._run_conversation(conversation)
+
     async def handle_carrier_status(
         self,
         *,
@@ -2168,7 +2595,12 @@ class OpenAIRealtimeManager:
                 if session is not None
                 else None
             )
-            await self._terminate_call_paths(call_id, attempt_id=attempt_id)
+            await self._terminate_call_paths(
+                None
+                if conversation is not None and conversation.media_stream is not None
+                else call_id,
+                attempt_id=attempt_id,
+            )
         if conversation is not None:
             await conversation.stop()
         task = self._workers.get(call_id)
@@ -2798,7 +3230,7 @@ class OpenAIRealtimeManager:
                 failure = OpenAIRealtimeError("Realtime conversation was stopped externally")
             if not conversation._stopped_externally:
                 await self._terminate_call_paths(
-                    conversation.call_id,
+                    None if conversation.media_stream is not None else conversation.call_id,
                     attempt_id=conversation.attempt_id,
                 )
             session = await self.store.get_session(conversation.session_id)
@@ -2819,11 +3251,23 @@ class OpenAIRealtimeManager:
                         ).hexdigest()[:48]
                     ),
                     attempt_id=conversation.attempt_id,
-                    interaction_id=conversation.call_id,
+                    interaction_id=(
+                        None if conversation.media_stream is not None else conversation.call_id
+                    ),
                     status=(WebhookStatus.FAILED if failure else WebhookStatus.COMPLETED),
-                    provider="openai_realtime",
+                    provider=(
+                        "twilio_openai_realtime_media"
+                        if conversation.media_stream is not None
+                        else "openai_realtime"
+                    ),
                     failure_reason=("Realtime sideband ended unexpectedly" if failure else None),
-                    metadata={"source": "openai_realtime_sideband"},
+                    metadata={
+                        "source": (
+                            "twilio_media_stream"
+                            if conversation.media_stream is not None
+                            else "openai_realtime_sideband"
+                        )
+                    },
                 )
                 with contextlib.suppress(Exception):
                     await self.coordinator.reconcile_provider_completion(payload)
@@ -3071,6 +3515,23 @@ def _load_tool_arguments(arguments_json: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("tool arguments must be an object")
     return payload
+
+
+def _media_audio_identity(event: Mapping[str, Any]) -> tuple[str, str, int]:
+    response_id = event.get("response_id")
+    item_id = event.get("item_id")
+    content_index = event.get("content_index")
+    if (
+        not isinstance(response_id, str)
+        or not response_id
+        or not isinstance(item_id, str)
+        or not item_id
+        or not isinstance(content_index, int)
+        or isinstance(content_index, bool)
+        or content_index != 0
+    ):
+        raise OpenAIRealtimeError("Realtime audio item identity is malformed")
+    return response_id, item_id, content_index
 
 
 def _header_value(headers: Mapping[str, str], name: str) -> str | None:

@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 TWILIO_CALLS_BASE_URL = "https://api.twilio.com/2010-04-01/Accounts"
 TWILIO_OUTBOUND_VOICE_PATH = "/v1/twilio/voice/outbound"
 TWILIO_STATUS_CALLBACK_PATH = "/v1/twilio/status"
+TWILIO_MEDIA_STREAM_PATH = "/v1/twilio/media"
 OPENAI_SIP_HOST = "sip.api.openai.com"
 
 _ACCOUNT_SID_PATTERN = re.compile(r"^AC[0-9a-fA-F]{32}$")
@@ -281,6 +282,113 @@ def build_outbound_bridge_twiml(
     )
 
 
+def build_outbound_media_stream_twiml(
+    *,
+    public_base_url: str,
+    event_id: str,
+    correlation_secret: SecretInput,
+    correlation_call_sid: str,
+) -> str:
+    """Build TwiML for a direct bidirectional media bridge."""
+
+    return _build_media_stream_twiml(
+        public_base_url=public_base_url,
+        event_id=event_id,
+        correlation_secret=correlation_secret,
+        correlation_call_sid=correlation_call_sid,
+        direction="outbound",
+    )
+
+
+def build_inbound_media_stream_twiml(
+    *,
+    public_base_url: str,
+    call_sid: str,
+    caller_phone: str,
+    admission_nonce: str,
+    expires_at_epoch: int,
+    correlation_secret: SecretInput,
+) -> str:
+    """Build TwiML for an allowlisted inbound direct media bridge."""
+
+    return _build_media_stream_twiml(
+        public_base_url=public_base_url,
+        event_id=None,
+        correlation_secret=correlation_secret,
+        correlation_call_sid=call_sid,
+        direction="inbound",
+        caller_phone=caller_phone,
+        admission_nonce=admission_nonce,
+        expires_at_epoch=expires_at_epoch,
+    )
+
+
+def _build_media_stream_twiml(
+    *,
+    public_base_url: str,
+    event_id: str | None,
+    correlation_secret: SecretInput,
+    correlation_call_sid: str,
+    direction: Literal["inbound", "outbound"],
+    caller_phone: str | None = None,
+    admission_nonce: str | None = None,
+    expires_at_epoch: int | None = None,
+) -> str:
+    base_url = _validate_public_base_url(public_base_url)
+    normalized_event_id = _validate_event_id(event_id) if event_id is not None else None
+    normalized_caller = normalize_e164(caller_phone) if caller_phone is not None else None
+    signing_secret = _require_secret(
+        correlation_secret,
+        "HOTLINE_SIP_CORRELATION_SECRET",
+        min_length=16,
+    )
+    correlation_id = _validate_call_sid(correlation_call_sid)
+    signature = build_correlation_signature(
+        signing_secret,
+        direction=direction,
+        call_sid=correlation_id,
+        event_id=normalized_event_id,
+        caller_phone=normalized_caller,
+        admission_nonce=admission_nonce,
+        expires_at_epoch=expires_at_epoch,
+    )
+    stream_url = "wss://" + base_url.removeprefix("https://") + TWILIO_MEDIA_STREAM_PATH
+
+    response = ElementTree.Element("Response")
+    connect = ElementTree.SubElement(response, "Connect")
+    stream = ElementTree.SubElement(connect, "Stream", {"url": stream_url})
+    parameters: dict[str, str] = {
+        "HotlineDirection": direction,
+        "HotlineCallSid": correlation_id,
+    }
+    if direction == "outbound":
+        assert normalized_event_id is not None
+        parameters["HotlineEventId"] = normalized_event_id
+    else:
+        assert normalized_caller is not None
+        assert admission_nonce is not None
+        assert expires_at_epoch is not None
+        parameters.update(
+            {
+                "HotlineCaller": normalized_caller,
+                "HotlineAdmission": admission_nonce,
+                "HotlineExpires": str(expires_at_epoch),
+            }
+        )
+    parameters["HotlineSignature"] = signature
+    for name, value in parameters.items():
+        ElementTree.SubElement(stream, "Parameter", {"name": name, "value": value})
+    body = ElementTree.tostring(
+        response,
+        encoding="unicode",
+        short_empty_elements=True,
+    )
+    twiml = f'<?xml version="1.0" encoding="UTF-8"?>{body}'
+    if len(twiml.encode("utf-8")) > 4000:
+        raise ValueError("inline TwiML exceeds Twilio's 4000-byte limit")
+    return twiml
+
+
 def build_inbound_bridge_twiml(
     *,
     openai_project_id: str,
@@ -380,6 +488,48 @@ def verify_twilio_webhook_signature(
         return False
     try:
         expected = compute_twilio_webhook_signature(
+            url=url,
+            params=params,
+            auth_token=auth_token,
+        )
+    except (TypeError, ValueError):
+        return False
+    return hmac.compare_digest(expected, signature)
+
+
+def compute_twilio_websocket_signature(
+    *,
+    url: str,
+    params: WebhookParameters,
+    auth_token: SecretInput,
+) -> str:
+    """Compute Twilio's request signature for a WebSocket upgrade URL."""
+
+    exact_url = _validate_websocket_url(url)
+    token = _require_secret(auth_token, "TWILIO_AUTH_TOKEN")
+    canonical = exact_url
+    for name, values in _group_webhook_parameters(params):
+        for value in values:
+            canonical += name + value
+    digest = hmac.new(
+        token.encode("utf-8"),
+        canonical.encode("utf-8"),
+        hashlib.sha1,
+    ).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def verify_twilio_websocket_signature(
+    *,
+    url: str,
+    params: WebhookParameters,
+    signature: str | None,
+    auth_token: SecretInput,
+) -> bool:
+    if not isinstance(signature, str) or not signature:
+        return False
+    try:
+        expected = compute_twilio_websocket_signature(
             url=url,
             params=params,
             auth_token=auth_token,
@@ -781,6 +931,25 @@ def _validate_webhook_url(value: str) -> str:
     return exact_url
 
 
+def _validate_websocket_url(value: str) -> str:
+    exact_url = _require_text(value, "Twilio WebSocket URL", preserve_whitespace=True)
+    _reject_unsafe_url_characters(exact_url, "Twilio WebSocket URL")
+    try:
+        parsed = urlsplit(exact_url)
+        if parsed.port == 0 or parsed.netloc.endswith(":"):
+            raise ValueError
+    except ValueError:
+        raise ValueError("Twilio WebSocket URL is not valid") from None
+    if parsed.scheme != "wss" or not parsed.hostname:
+        raise ValueError("Twilio WebSocket URL must be an absolute WSS URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Twilio WebSocket URL cannot contain user information")
+    if parsed.fragment:
+        raise ValueError("Twilio WebSocket URL cannot contain a fragment")
+    _validate_hostname(parsed.hostname, "Twilio WebSocket URL")
+    return exact_url
+
+
 def _group_webhook_parameters(
     params: WebhookParameters,
 ) -> list[tuple[str, tuple[str, ...]]]:
@@ -902,12 +1071,15 @@ __all__ = [
     "TwilioClient",
     "build_correlation_signature",
     "build_inbound_bridge_twiml",
+    "build_inbound_media_stream_twiml",
     "build_outbound_bridge_twiml",
+    "build_outbound_media_stream_twiml",
     "build_outbound_voice_event_signature",
     "build_outbound_voice_url",
     "build_status_callback_url",
     "build_status_event_signature",
     "compute_twilio_webhook_signature",
+    "compute_twilio_websocket_signature",
     "normalize_e164",
     "validate_twilio_account_sid",
     "validate_twilio_call_sid",
@@ -915,4 +1087,5 @@ __all__ = [
     "verify_outbound_voice_event_signature",
     "verify_status_event_signature",
     "verify_twilio_webhook_signature",
+    "verify_twilio_websocket_signature",
 ]

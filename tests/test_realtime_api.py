@@ -13,7 +13,9 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from pydantic import SecretStr
+from starlette.websockets import WebSocketDisconnect
 
 from agent_hotline.api import create_app
 from agent_hotline.openai_realtime import (
@@ -23,10 +25,14 @@ from agent_hotline.openai_realtime import (
 )
 from agent_hotline.providers import FakeCallProvider
 from agent_hotline.settings import Settings
-from agent_hotline.telephony_security import verify_correlation_signature
+from agent_hotline.telephony_security import (
+    build_correlation_signature,
+    verify_correlation_signature,
+)
 from agent_hotline.twilio import (
     build_outbound_voice_event_signature,
     compute_twilio_webhook_signature,
+    compute_twilio_websocket_signature,
 )
 
 PUBLIC_BASE_URL = "https://hotline.example.test"
@@ -44,6 +50,7 @@ OPENAI_WEBHOOK_PATH = "/v1/openai/realtime/webhook"
 TWILIO_INBOUND_PATH = "/v1/twilio/voice/incoming"
 TWILIO_OUTBOUND_PATH = "/v1/twilio/voice/outbound"
 TWILIO_STATUS_PATH = "/v1/twilio/status"
+TWILIO_MEDIA_PATH = "/v1/twilio/media"
 
 SECURITY_HEADERS = {
     "cache-control": "no-store",
@@ -102,6 +109,7 @@ class FakeRealtimeManager:
         self.outbound_bind_calls: list[dict[str, str]] = []
         self.outbound_should_dial = True
         self.outbound_bind_error: Exception | None = None
+        self.media_stream_calls: list[Any] = []
         self.close_calls = 0
 
     async def handle_webhook(
@@ -152,6 +160,9 @@ class FakeRealtimeManager:
 
     async def close(self) -> None:
         self.close_calls += 1
+
+    async def run_media_stream(self, stream: Any) -> None:
+        self.media_stream_calls.append(stream.start)
 
 
 @dataclass(slots=True)
@@ -532,6 +543,179 @@ async def test_twilio_outbound_route_binds_parent_idempotently_and_stops_termina
     assert CALLBACK_TOKEN not in first.text + replay.text + terminal.text
     assert_security_headers(first)
     assert_security_headers(terminal)
+
+
+@pytest.mark.asyncio
+async def test_twilio_outbound_media_mode_returns_authenticated_bidirectional_stream(
+    realtime_api: RealtimeAPIHarness,
+) -> None:
+    realtime_api.settings.twilio_bridge_mode = "media_stream"
+    event_id = "evt_outbound_media_route"
+    event_signature = build_outbound_voice_event_signature(
+        CALLBACK_TOKEN,
+        event_id=event_id,
+    )
+    path = f"{TWILIO_OUTBOUND_PATH}?" + urlencode(
+        {"event_id": event_id, "event_sig": event_signature}
+    )
+    pairs = [
+        ("CallSid", TWILIO_CALL_SID),
+        ("AccountSid", TWILIO_ACCOUNT_SID),
+        ("From", TWILIO_PHONE_NUMBER),
+        ("To", OWNER_PHONE_NUMBER),
+        ("Direction", "outbound-api"),
+    ]
+    body, headers = signed_twilio_form(path, pairs)
+
+    response = await realtime_api.client.post(path, content=body, headers=headers)
+
+    assert response.status_code == 200
+    stream = ElementTree.fromstring(response.content).find("./Connect/Stream")
+    assert stream is not None
+    assert stream.attrib == {"url": f"wss://hotline.example.test{TWILIO_MEDIA_PATH}"}
+    parameters = {
+        item.attrib["name"]: item.attrib["value"] for item in stream.findall("./Parameter")
+    }
+    assert parameters["HotlineEventId"] == event_id
+    assert parameters["HotlineCallSid"] == TWILIO_CALL_SID
+    assert verify_correlation_signature(
+        CALLBACK_TOKEN,
+        direction="outbound",
+        call_sid=TWILIO_CALL_SID,
+        event_id=event_id,
+        signature=parameters["HotlineSignature"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_twilio_inbound_media_mode_issues_idempotent_call_bound_admission(
+    realtime_api: RealtimeAPIHarness,
+) -> None:
+    realtime_api.settings.twilio_bridge_mode = "media_stream"
+    pairs = [
+        ("CallSid", TWILIO_CALL_SID),
+        ("AccountSid", TWILIO_ACCOUNT_SID),
+        ("From", OWNER_PHONE_NUMBER),
+        ("To", TWILIO_PHONE_NUMBER),
+        ("Direction", "inbound"),
+    ]
+    body, headers = signed_twilio_form(TWILIO_INBOUND_PATH, pairs)
+
+    first = await realtime_api.client.post(TWILIO_INBOUND_PATH, content=body, headers=headers)
+    replay = await realtime_api.client.post(TWILIO_INBOUND_PATH, content=body, headers=headers)
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.text == first.text
+    stream = ElementTree.fromstring(first.content).find("./Connect/Stream")
+    assert stream is not None
+    assert stream.attrib == {"url": f"wss://hotline.example.test{TWILIO_MEDIA_PATH}"}
+    parameters = {
+        item.attrib["name"]: item.attrib["value"] for item in stream.findall("./Parameter")
+    }
+    assert await realtime_api.app.state.store.get_session_by_interaction(TWILIO_CALL_SID) is None
+    assert parameters["HotlineDirection"] == "inbound"
+    assert "HotlineEventId" not in parameters
+    expires_at_epoch = int(parameters["HotlineExpires"])
+    assert verify_correlation_signature(
+        CALLBACK_TOKEN,
+        direction="inbound",
+        call_sid=TWILIO_CALL_SID,
+        event_id=None,
+        caller_phone=OWNER_PHONE_NUMBER,
+        admission_nonce=parameters["HotlineAdmission"],
+        expires_at_epoch=expires_at_epoch,
+        signature=parameters["HotlineSignature"],
+    )
+    await realtime_api.app.state.store.consume_carrier_admission(
+        TWILIO_CALL_SID,
+        caller_phone=OWNER_PHONE_NUMBER,
+        admission_nonce=parameters["HotlineAdmission"],
+        expires_at_epoch=expires_at_epoch,
+        provider_call_id=TWILIO_CALL_SID,
+    )
+    assert_security_headers(first)
+
+
+def test_twilio_media_websocket_verifies_handshake_and_call_correlation(tmp_path: Path) -> None:
+    settings = configured_settings(
+        tmp_path / "twilio-media-api.sqlite3",
+        twilio_bridge_mode="media_stream",
+    )
+    manager = FakeRealtimeManager()
+    app = create_app(
+        settings=settings,
+        provider=FakeCallProvider(),
+        realtime_manager=manager,  # type: ignore[arg-type]
+    )
+    signature = compute_twilio_websocket_signature(
+        url=f"wss://hotline.example.test{TWILIO_MEDIA_PATH}",
+        params=None,
+        auth_token=TWILIO_AUTH_TOKEN,
+    )
+    correlation = build_correlation_signature(
+        CALLBACK_TOKEN,
+        direction="outbound",
+        call_sid=TWILIO_CALL_SID,
+        event_id="evt_media_websocket",
+    )
+    stream_sid = "MZ" + ("c" * 32)
+    with (
+        TestClient(app) as client,
+        client.websocket_connect(
+            TWILIO_MEDIA_PATH,
+            headers={"x-twilio-signature": signature},
+        ) as websocket,
+    ):
+        websocket.send_json({"event": "connected", "protocol": "Call", "version": "1.0.0"})
+        websocket.send_json(
+            {
+                "event": "start",
+                "sequenceNumber": "1",
+                "streamSid": stream_sid,
+                "start": {
+                    "accountSid": TWILIO_ACCOUNT_SID,
+                    "callSid": TWILIO_CALL_SID,
+                    "streamSid": stream_sid,
+                    "tracks": ["inbound"],
+                    "mediaFormat": {
+                        "encoding": "audio/x-mulaw",
+                        "sampleRate": 8000,
+                        "channels": 1,
+                    },
+                    "customParameters": {
+                        "HotlineDirection": "outbound",
+                        "HotlineCallSid": TWILIO_CALL_SID,
+                        "HotlineEventId": "evt_media_websocket",
+                        "HotlineSignature": correlation,
+                    },
+                },
+            }
+        )
+        websocket.receive()
+
+    assert len(manager.media_stream_calls) == 1
+    assert manager.media_stream_calls[0].call_sid == TWILIO_CALL_SID
+    assert manager.media_stream_calls[0].event_id == "evt_media_websocket"
+    assert manager.media_stream_calls[0].direction == "outbound"
+
+
+def test_twilio_media_websocket_is_closed_when_bridge_mode_is_sip(tmp_path: Path) -> None:
+    settings = configured_settings(tmp_path / "twilio-media-disabled.sqlite3")
+    app = create_app(
+        settings=settings,
+        provider=FakeCallProvider(),
+        realtime_manager=FakeRealtimeManager(),  # type: ignore[arg-type]
+    )
+
+    with (
+        TestClient(app) as client,
+        pytest.raises(WebSocketDisconnect) as disconnected,
+        client.websocket_connect(TWILIO_MEDIA_PATH),
+    ):
+        pass
+
+    assert disconnected.value.code == 1008
 
 
 @pytest.mark.parametrize(

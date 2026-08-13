@@ -45,6 +45,7 @@ def _settings(**overrides: Any) -> Settings:
         ("openai_realtime_model", "gpt-realtime-2.1"),
         ("openai_realtime_voice", "marin"),
         ("openai_realtime_reasoning_effort", "low"),
+        ("twilio_bridge_mode", "sip"),
     ],
 )
 def test_openai_realtime_defaults_are_the_production_profile(
@@ -76,6 +77,18 @@ def test_openai_realtime_runtime_is_ready_with_openai_and_twilio_prerequisites()
         **_OPENAI_READY_VALUES,
         **_TWILIO_READY_VALUES,
         **_LOCAL_READY_VALUES,
+    }
+
+    assert _settings(**values).openai_realtime_runtime_ready is True
+
+
+def test_media_stream_mode_does_not_require_an_openai_webhook_secret() -> None:
+    values = {
+        **_OPENAI_READY_VALUES,
+        **_TWILIO_READY_VALUES,
+        **_LOCAL_READY_VALUES,
+        "openai_webhook_secret": "",
+        "twilio_bridge_mode": "media_stream",
     }
 
     assert _settings(**values).openai_realtime_runtime_ready is True

@@ -144,6 +144,7 @@ class Settings(BaseSettings):
     twilio_account_sid: str | None = None
     twilio_auth_token: SecretStr = SecretStr("")
     twilio_phone_number: str | None = None
+    twilio_bridge_mode: Literal["sip", "media_stream"] = "sip"
 
     owner_phone_number: SecretStr = SecretStr("")
     owner_confirmation_pin: SecretStr = SecretStr("")
@@ -245,9 +246,7 @@ class Settings(BaseSettings):
     def validate_realtime_model(cls, value: str) -> str:
         value = value.strip()
         if value not in {"gpt-realtime-2", "gpt-realtime-2.1"}:
-            raise ValueError(
-                "OPENAI_REALTIME_MODEL must be gpt-realtime-2 or gpt-realtime-2.1"
-            )
+            raise ValueError("OPENAI_REALTIME_MODEL must be gpt-realtime-2 or gpt-realtime-2.1")
         return value
 
     @field_validator("hotline_owner_name")
@@ -274,15 +273,21 @@ class Settings(BaseSettings):
 
     @property
     def openai_realtime_configured(self) -> bool:
-        return all(
+        common_ready = all(
             (
                 self.openai_api_key.get_secret_value(),
-                self.openai_webhook_secret.get_secret_value(),
                 self.openai_project_id,
                 self.public_base_url,
                 self.hotline_sip_correlation_secret.get_secret_value(),
                 self.hotline_action_signing_secret.get_secret_value(),
                 self.owner_confirmation_pin.get_secret_value(),
+            )
+        )
+        return bool(
+            common_ready
+            and (
+                self.twilio_bridge_mode == "media_stream"
+                or self.openai_webhook_secret.get_secret_value()
             )
         )
 
@@ -378,6 +383,7 @@ class Settings(BaseSettings):
             "twilio_account_configured": bool(self.twilio_account_sid),
             "twilio_auth_token_configured": bool(self.twilio_auth_token.get_secret_value()),
             "twilio_number_configured": bool(self.twilio_phone_number),
+            "twilio_bridge_mode": self.twilio_bridge_mode,
             "twilio_configured": self.twilio_configured,
             "owner_number_configured": bool(self.owner_phone_number.get_secret_value()),
             "owner_confirmation_pin_configured": bool(

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, cast
 from urllib.parse import parse_qsl
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket
 from fastapi import Path as APIPath
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
@@ -43,6 +43,7 @@ from .coordinator import HotlineCoordinator
 from .dashboard import create_dashboard_router
 from .fallback_delivery import FallbackNotifier, create_fallback_notifier
 from .openai_realtime import (
+    IncomingCallError,
     OpenAIRealtimeError,
     OpenAIRealtimeManager,
     OpenAIWebhookVerificationError,
@@ -57,15 +58,20 @@ from .storage import (
     StorageError,
 )
 from .twilio import (
+    TWILIO_MEDIA_STREAM_PATH,
     build_inbound_bridge_twiml,
+    build_inbound_media_stream_twiml,
     build_outbound_bridge_twiml,
+    build_outbound_media_stream_twiml,
     normalize_e164,
     validate_twilio_account_sid,
     validate_twilio_call_sid,
     verify_outbound_voice_event_signature,
     verify_status_event_signature,
     verify_twilio_webhook_signature,
+    verify_twilio_websocket_signature,
 )
+from .twilio_media import TwilioMediaProtocolError, TwilioMediaStream
 from .watchdog import AgentFailureWatchdog
 
 logger = logging.getLogger(__name__)
@@ -466,6 +472,7 @@ def _install_routes(app: FastAPI) -> None:
             "openai_realtime_configured": settings.openai_realtime_configured,
             "openai_realtime_runtime_ready": settings.openai_realtime_runtime_ready,
             "twilio_configured": settings.twilio_configured,
+            "twilio_bridge_mode": settings.twilio_bridge_mode,
             "active_realtime_calls": (
                 realtime_manager.active_calls if realtime_manager is not None else 0
             ),
@@ -694,14 +701,22 @@ def _install_routes(app: FastAPI) -> None:
                     content='<?xml version="1.0" encoding="UTF-8"?><Response />',
                     media_type="application/xml",
                 )
-            twiml = build_outbound_bridge_twiml(
-                openai_project_id=settings.openai_project_id,
-                event_id=event_id,
-                correlation_secret=settings.hotline_sip_correlation_secret,
-                correlation_call_sid=call_sid,
-                max_call_duration_seconds=settings.hotline_max_call_duration_seconds,
-                dial_timeout_seconds=settings.hotline_outbound_ring_timeout_seconds,
-            )
+            if settings.twilio_bridge_mode == "media_stream":
+                twiml = build_outbound_media_stream_twiml(
+                    public_base_url=settings.public_base_url or "",
+                    event_id=event_id,
+                    correlation_secret=settings.hotline_sip_correlation_secret,
+                    correlation_call_sid=call_sid,
+                )
+            else:
+                twiml = build_outbound_bridge_twiml(
+                    openai_project_id=settings.openai_project_id,
+                    event_id=event_id,
+                    correlation_secret=settings.hotline_sip_correlation_secret,
+                    correlation_call_sid=call_sid,
+                    max_call_duration_seconds=settings.hotline_max_call_duration_seconds,
+                    dial_timeout_seconds=settings.hotline_outbound_ring_timeout_seconds,
+                )
         except (OpenAIRealtimeError, NotFoundError, ValueError) as exc:
             logger.warning(
                 "Outbound TwiML correlation failed error_type=%s",
@@ -712,6 +727,54 @@ def _install_routes(app: FastAPI) -> None:
                 detail="Outbound call could not be correlated",
             ) from exc
         return Response(content=twiml, media_type="application/xml")
+
+    @app.websocket(TWILIO_MEDIA_STREAM_PATH)
+    async def twilio_media_stream(websocket: WebSocket) -> None:
+        settings = cast(Settings, websocket.app.state.settings)
+        if settings.twilio_bridge_mode != "media_stream":
+            await websocket.close(code=1008, reason="media bridge is disabled")
+            return
+        auth_token = settings.twilio_auth_token.get_secret_value()
+        if not auth_token or not settings.public_base_url:
+            await websocket.close(code=1008, reason="media verification unavailable")
+            return
+        external_url = (
+            "wss://" + settings.public_base_url.removeprefix("https://") + websocket.url.path
+        )
+        raw_query = websocket.scope.get("query_string", b"")
+        if raw_query:
+            try:
+                external_url += "?" + raw_query.decode("ascii")
+            except UnicodeDecodeError:
+                await websocket.close(code=1008, reason="invalid media query")
+                return
+        if not verify_twilio_websocket_signature(
+            url=external_url,
+            params=None,
+            signature=websocket.headers.get("x-twilio-signature"),
+            auth_token=auth_token,
+        ):
+            await websocket.close(code=1008, reason="invalid media signature")
+            return
+        await websocket.accept()
+        stream: TwilioMediaStream | None = None
+        try:
+            stream = await TwilioMediaStream.initialize(
+                websocket,
+                expected_account_sid=settings.twilio_account_sid or "",
+                correlation_secret=settings.hotline_sip_correlation_secret.get_secret_value(),
+            )
+            await _realtime_manager(websocket).run_media_stream(stream)
+        except (IncomingCallError, OpenAIRealtimeError, TwilioMediaProtocolError) as exc:
+            logger.warning(
+                "Twilio media stream ended error_type=%s",
+                type(exc).__name__,
+            )
+            if stream is None:
+                await websocket.close(code=1008, reason="invalid media stream")
+        finally:
+            if stream is not None:
+                await stream.close()
 
     @app.post(
         "/v1/twilio/voice/incoming",
@@ -757,22 +820,37 @@ def _install_routes(app: FastAPI) -> None:
         if settings.openai_project_id is None:
             raise HTTPException(status_code=503, detail="OpenAI project is not configured")
         try:
-            admission = await _store(request).issue_carrier_admission(
-                call_sid,
-                caller_phone=caller_phone,
-                ttl_seconds=settings.hotline_carrier_admission_ttl_seconds,
-            )
-            twiml = build_inbound_bridge_twiml(
-                openai_project_id=settings.openai_project_id,
-                call_sid=call_sid,
-                caller_phone=caller_phone,
-                admission_nonce=admission.admission_nonce,
-                expires_at_epoch=int(admission.expires_at.timestamp()),
-                public_base_url=settings.public_base_url or "",
-                correlation_secret=settings.hotline_sip_correlation_secret,
-                max_call_duration_seconds=settings.hotline_max_call_duration_seconds,
-                dial_timeout_seconds=settings.hotline_outbound_ring_timeout_seconds,
-            )
+            if settings.twilio_bridge_mode == "media_stream":
+                carrier_admission = await _store(request).issue_carrier_admission(
+                    call_sid,
+                    caller_phone=caller_phone,
+                    ttl_seconds=settings.hotline_carrier_admission_ttl_seconds,
+                )
+                twiml = build_inbound_media_stream_twiml(
+                    public_base_url=settings.public_base_url or "",
+                    call_sid=call_sid,
+                    caller_phone=caller_phone,
+                    admission_nonce=carrier_admission.admission_nonce,
+                    expires_at_epoch=int(carrier_admission.expires_at.timestamp()),
+                    correlation_secret=settings.hotline_sip_correlation_secret,
+                )
+            else:
+                carrier_admission = await _store(request).issue_carrier_admission(
+                    call_sid,
+                    caller_phone=caller_phone,
+                    ttl_seconds=settings.hotline_carrier_admission_ttl_seconds,
+                )
+                twiml = build_inbound_bridge_twiml(
+                    openai_project_id=settings.openai_project_id,
+                    call_sid=call_sid,
+                    caller_phone=caller_phone,
+                    admission_nonce=carrier_admission.admission_nonce,
+                    expires_at_epoch=int(carrier_admission.expires_at.timestamp()),
+                    public_base_url=settings.public_base_url or "",
+                    correlation_secret=settings.hotline_sip_correlation_secret,
+                    max_call_duration_seconds=settings.hotline_max_call_duration_seconds,
+                    dial_timeout_seconds=settings.hotline_outbound_ring_timeout_seconds,
+                )
         except (ConflictError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="Invalid Twilio call") from exc
         return Response(content=twiml, media_type="application/xml")
