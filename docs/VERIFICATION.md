@@ -6,9 +6,10 @@ barge-in, DTMF delivery, or live Codex control.
 
 ## Automated and mocked coverage
 
-The repository includes automated tests for settings, provider clients, Twilio signatures and
-TwiML, OpenAI webhook admission, Realtime tool dispatch, state transitions, fallback, MCP
-stdio, Codex integration boundaries, packaging, and plugin metadata.
+The repository includes automated tests for settings, provider clients, Twilio HTTP and WSS
+signatures, SIP and Media Streams TwiML, OpenAI webhook admission, direct PCMU bridging,
+Realtime tool dispatch, state transitions, fallback, MCP stdio, Codex integration boundaries,
+packaging, and plugin metadata.
 
 Run:
 
@@ -32,13 +33,17 @@ a fixture, mocked client, provider API probe, or console screenshot alone.
 Before a release is described as live-validated, record dated evidence for:
 
 - [ ] inbound Twilio signature, account, destination, direction, and caller-allowlist checks;
-- [ ] signed SIP correlation and verified OpenAI incoming-call webhook;
+- [ ] signed SIP correlation and verified OpenAI incoming-call webhook, if using `sip` mode;
+- [ ] authenticated WSS handshake, expiring inbound admission, outbound event correlation, and
+      two-way PCMU audio, if using `media_stream` mode;
 - [ ] outbound parent call creation, signed TwiML fetch with the allocated parent CallSid,
       ambiguous-response recovery, and its Twilio status callback;
-- [ ] inbound `<Dial action>` delivery of `DialCallStatus` to the signed status route;
+- [ ] inbound `<Dial action>` delivery of `DialCallStatus` to the signed status route, if using
+      `sip` mode;
 - [ ] server-side Realtime WebSocket connection and natural two-way audio;
 - [ ] interruption/barge-in and long-pause behavior without premature hangup;
-- [ ] exact server transcript plus drained SIP playback followed by a later owner speech turn;
+- [ ] exact server transcript plus confirmed drained playback followed by a later owner speech
+      turn;
 - [ ] DTMF PIN isolation from model output, tool arguments, transcript, and durable logs;
 - [ ] structured approve, deny, instruct, defer, timeout, failure, and no-answer outcomes;
 - [ ] bounded Codex task listing and inspection on inbound calls;

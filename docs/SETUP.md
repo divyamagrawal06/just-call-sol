@@ -1,7 +1,8 @@
 # Production setup
 
-This guide configures the OpenAI Realtime and Twilio production voice path. Use Python 3.12 or
-3.13 and keep all credentials outside source control.
+This guide configures the OpenAI Realtime and Twilio production voice path over OpenAI SIP or
+direct bidirectional Media Streams. Use Python 3.12 or 3.13 and keep all credentials outside
+source control.
 
 ## 1. Install
 
@@ -50,6 +51,7 @@ OPENAI_REALTIME_REASONING_EFFORT=low
 TWILIO_ACCOUNT_SID=
 TWILIO_AUTH_TOKEN=
 TWILIO_PHONE_NUMBER=+12025550124
+TWILIO_BRIDGE_MODE=sip
 
 OWNER_PHONE_NUMBER=+12025550123
 HOTLINE_OWNER_NAME=Owner
@@ -66,7 +68,8 @@ HOTLINE_OUTBOUND_RING_TIMEOUT_SECONDS=30
 
 Requirements:
 
-- `OPENAI_PROJECT_ID` is the `proj_...` project that receives the SIP calls.
+- `OPENAI_PROJECT_ID` is the `proj_...` project used for Realtime requests and SIP calls.
+- `TWILIO_BRIDGE_MODE` is `sip` (the default) or `media_stream`.
 - Both phone numbers use strict E.164 format.
 - `OWNER_CONFIRMATION_PIN` contains 6–12 ASCII digits and is never placed in the Realtime
   prompt or agent variables.
@@ -76,7 +79,8 @@ Requirements:
 
 `HOTLINE_MAX_ACTIVE_CALLS` is enforced during call admission and is intentionally fixed at
 `1`. `HOTLINE_MAX_CALL_DURATION_SECONDS` is enforced by the daemon, the outbound Twilio Call,
-and each SIP `<Dial>` bridge, including for inbound conversations and long pauses.
+and each SIP `<Dial>` bridge. Direct media calls remain bounded by daemon-side expiry and the
+outbound Call `TimeLimit`.
 `HOTLINE_OUTBOUND_RING_TIMEOUT_SECONDS` bounds both owner ringing and SIP bridge setup.
 
 ## 3. Configure OpenAI
@@ -84,21 +88,22 @@ and each SIP `<Dial>` bridge, including for inbound conversations and long pause
 In the same OpenAI project identified by `OPENAI_PROJECT_ID`:
 
 1. Create or select an API key with access to the configured Realtime model.
-2. Create a webhook pointing to:
+2. In `sip` mode, create a webhook pointing to:
 
    ```text
    https://hotline.example.com/v1/openai/realtime/webhook
    ```
 
-3. Put the resulting signing secret in `OPENAI_WEBHOOK_SECRET`.
-4. Confirm that the project can receive SIP calls at:
+3. In `sip` mode, put the resulting signing secret in `OPENAI_WEBHOOK_SECRET`.
+4. In `sip` mode, confirm that the project can receive SIP calls at:
 
    ```text
    sip:<project-id>@sip.api.openai.com;transport=tls
    ```
 
-The daemon verifies the exact raw OpenAI webhook body before accepting a call. It then opens
-an authenticated server-side Realtime WebSocket for the conversation and function tools.
+In `sip` mode the daemon verifies the exact raw OpenAI webhook body before accepting a call.
+In `media_stream` mode no OpenAI incoming-call webhook is used; the daemon opens the
+authenticated Realtime WebSocket itself and bridges PCMU audio in both directions.
 
 ## 4. Configure Twilio
 
@@ -109,7 +114,9 @@ POST https://hotline.example.com/v1/twilio/voice/incoming
 ```
 
 The daemon verifies Twilio's request signature, account, destination, direction, and caller
-allowlist before returning TwiML that bridges the call to OpenAI SIP.
+allowlist before returning TwiML. `sip` mode bridges the call to OpenAI SIP;
+`media_stream` mode returns a signed, call-bound `<Connect><Stream>` to
+`/v1/twilio/media`.
 
 Outbound calls are created by the Twilio REST API with a signed TwiML URL:
 
@@ -119,8 +126,8 @@ POST https://hotline.example.com/v1/twilio/voice/outbound?event_id=<event>&event
 
 Twilio fetches this route only after allocating the parent CallSid. The daemon verifies the
 Twilio form and event binding, atomically attaches that real parent ID to the durable session,
-and then returns the signed OpenAI SIP bridge. This also recovers a call whose Calls API
-response was lost.
+and then returns the selected signed bridge. This also recovers a call whose Calls API response
+was lost.
 
 The parent call separately reports lifecycle events to:
 
@@ -129,13 +136,18 @@ POST https://hotline.example.com/v1/twilio/status?event_id=<event>&event_sig=<bi
 ```
 
 as their event-bound parent-call status callback. The binding is an HMAC correlation value,
-not owner authority. Inbound TwiML uses the same route without that query as its Twilio-signed
-`<Dial action>` target and submits `DialCallStatus`. Neither callback is used as authority for
-a decision, and neither claims to represent an independent nested SIP-child callback.
+not owner authority. In `sip` mode, inbound TwiML uses the same route without that query as its
+Twilio-signed `<Dial action>` target and submits `DialCallStatus`. Neither callback is used as
+authority for a decision, and neither claims to represent an independent nested SIP-child
+callback.
 
-Outbound Call creation includes exact `TimeLimit` and `Timeout` parameters. Both inbound and
-outbound bridge TwiML repeat the same duration and setup limits as carrier-side defense in
-depth, so a lost daemon connection cannot turn into an unbounded carrier call.
+Outbound Call creation includes exact `TimeLimit` and `Timeout` parameters. SIP bridge TwiML
+repeats the same duration and setup limits as carrier-side defense in depth. A direct media
+call ends when its authenticated WebSocket closes and is also bounded by durable session expiry.
+
+Twilio trial accounts are not sufficient for this integration. Trial Call API requests cannot
+select an arbitrary instruction URL, and trial TwiML strips both `<Stream>` and `<Dial><Sip>`.
+Upgrading funds a prepaid usage balance; disable auto-recharge if manual top-ups are preferred.
 
 If a reverse proxy changes scheme, host, port, path, or form data before verification, Twilio
 signatures will fail. Preserve the original public URL and request body exactly.
@@ -149,6 +161,12 @@ POST /v1/openai/realtime/webhook
 POST /v1/twilio/voice/incoming
 POST /v1/twilio/voice/outbound
 POST /v1/twilio/status
+```
+
+When `TWILIO_BRIDGE_MODE=media_stream`, also allow:
+
+```text
+WSS  /v1/twilio/media
 ```
 
 When missed-call fallback is enabled, also allow:
@@ -224,5 +242,7 @@ validation.
 - [OpenAI Realtime server-side controls](https://developers.openai.com/api/docs/guides/realtime-server-controls)
 - [OpenAI Realtime voice activity detection](https://developers.openai.com/api/docs/guides/realtime-vad)
 - [Twilio Call resource](https://www.twilio.com/docs/voice/api/call-resource)
+- [Twilio Media Streams](https://www.twilio.com/docs/voice/media-streams)
+- [Twilio trial Voice limits](https://www.twilio.com/docs/usage/trials/try-out-voice)
 - [Twilio `<Dial>`](https://www.twilio.com/docs/voice/twiml/dial)
 - [Twilio `<Sip>`](https://www.twilio.com/docs/voice/twiml/sip)

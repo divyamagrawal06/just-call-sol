@@ -4,9 +4,9 @@ Agent Hotline gives Codex and Claude a real phone line to their owner. An agent 
 a blocker, incident, approval, interrupted job, or authentication handoff; the owner can call
 back to inspect Codex tasks and authorize a narrowly scoped task action.
 
-The production voice path is OpenAI Realtime over SIP, with Twilio carrying the PSTN leg.
-FastAPI and SQLite keep policy, correlation, audit state, decisions, and one-time action grants
-under application control.
+The production voice path supports OpenAI Realtime over SIP or a direct bidirectional Twilio
+Media Streams bridge, with Twilio carrying the PSTN leg. FastAPI and SQLite keep policy,
+correlation, audit state, decisions, and one-time action grants under application control.
 
 ## What ships
 
@@ -34,7 +34,7 @@ Voice is an interface, not an authority boundary.
 - PIN digits are transient server state. They are not sent to the model, tool arguments,
   transcript, or database.
 - Inbound callers must pass Twilio signature checks and the configured E.164 allowlist.
-- Signed SIP correlation binds the carrier leg to the accepted Realtime call.
+- Signed call correlation binds each SIP or Media Streams carrier leg to its accepted event.
 - Action grants are exact, expiring, and one-time. A changed target or state requires a new
   confirmation.
 - Repository evidence is bounded and untrusted. Exposing it makes that call evidence-only.
@@ -71,6 +71,7 @@ OPENAI_PROJECT_ID=
 TWILIO_ACCOUNT_SID=
 TWILIO_AUTH_TOKEN=
 TWILIO_PHONE_NUMBER=
+TWILIO_BRIDGE_MODE=sip
 
 OWNER_PHONE_NUMBER=
 OWNER_CONFIRMATION_PIN=
@@ -108,7 +109,7 @@ uv run agent-hotline result evt_... --watch
 
 ## Public route contract
 
-OpenAI and Twilio need these four provider webhook routes:
+OpenAI and Twilio need these provider routes in the default `sip` mode:
 
 ```text
 POST /v1/openai/realtime/webhook
@@ -116,6 +117,17 @@ POST /v1/twilio/voice/incoming
 POST /v1/twilio/voice/outbound
 POST /v1/twilio/status
 ```
+
+With `TWILIO_BRIDGE_MODE=media_stream`, publish the three Twilio HTTP routes plus:
+
+```text
+WSS  /v1/twilio/media
+```
+
+That mode opens the model connection directly and does not require the OpenAI incoming-call
+webhook. Twilio trial calls cannot exercise either production bridge: the trial Call API
+restricts custom instruction URLs and trial TwiML strips `<Stream>` and `<Dial><Sip>`. The
+minimum Twilio upgrade payment becomes usage balance; it is not an Agent Hotline fee.
 
 If missed-call fallback is enabled, its page, static assets, and two `/v1/fallback/*` endpoints
 also need to be reachable by the owner. Local escalation, event, repository, dashboard, health,

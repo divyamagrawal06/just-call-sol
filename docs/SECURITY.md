@@ -53,8 +53,10 @@ development.
 
 The daemon and carrier independently cap call lifetime. Outbound Twilio Call creation sets a
 maximum duration and ring timeout, and both inbound and outbound SIP `<Dial>` bridges set
-matching `timeLimit` and setup `timeout` values. Daemon maintenance also expires stale local
-sessions so a missing status callback cannot permanently consume the single active-call slot.
+matching `timeLimit` and setup `timeout` values. Direct media sessions are bounded by daemon
+expiry, and closing either authenticated WebSocket tears down the audio path. Daemon maintenance
+also expires stale local sessions so a missing status callback cannot permanently consume the
+single active-call slot.
 
 ## Inbound identity
 
@@ -66,9 +68,11 @@ The incoming Twilio route requires all of the following:
 - inbound direction;
 - caller number matching the owner or explicit E.164 allowlist.
 
-The returned TwiML adds signed, short-lived correlation data to the OpenAI SIP leg. The signed
-OpenAI incoming-call webhook must match that correlation. Direct SIP, replayed correlation, or
-an allowlist mismatch is rejected.
+In SIP mode, the returned TwiML adds signed, short-lived correlation data to the OpenAI leg and
+the signed incoming-call webhook must match it. In direct media mode, an expiring, one-time
+carrier admission is bound to the authenticated Twilio stream before the inbound event exists.
+Direct SIP, forged streams, replayed correlation, expired admission, or an allowlist mismatch
+is rejected.
 
 The allowlist grants access to a conversation and bounded read-only task discovery. It does
 not grant a decision, repository read, or write.
@@ -76,9 +80,9 @@ not grant a decision, repository read, or write.
 ## Exact confirmation
 
 The server, not the model, creates the authoritative readback. The Realtime controller binds a
-completed spoken response transcript to the expected text, waits for OpenAI's SIP output buffer
-to report that playback fully drained, and then observes a later owner speech turn before it
-will arm keypad verification.
+completed spoken response transcript to the expected text, waits for either OpenAI's SIP output
+buffer or a Twilio media mark to report that playback fully drained, and then observes a later
+owner speech turn before it will arm keypad verification.
 
 The owner enters the PIN by DTMF followed by `#`. Digits live only in the active controller,
 are compared in constant time, and are never passed to the model or persisted. Failed attempts

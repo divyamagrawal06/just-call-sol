@@ -10,9 +10,10 @@ flowchart LR
     D --> S["SQLite audit and state"]
     D --> C["Codex App Server adapter"]
     D -->|outbound REST call| T["Twilio PSTN carrier"]
-    T -->|SIP| O["OpenAI Realtime"]
+    T -->|SIP mode| O["OpenAI Realtime"]
+    T -->|media mode: PCMU WSS| D
     P["Owner phone"] <--> T
-    O <-->|server-side WebSocket and bounded tools| D
+    O <-->|Realtime WebSocket and bounded tools| D
     T -->|signed inbound TwiML request| D
     O -->|signed incoming-call webhook| D
 ```
@@ -36,22 +37,28 @@ events, sessions, decisions, action receipts, provider correlation, and fallback
 
 ### Twilio
 
-Twilio is the PSTN and SIP carrier:
+Twilio is the PSTN carrier and can use either OpenAI SIP or the daemon's direct Media Streams
+adapter:
 
 - outbound: the daemon creates a Twilio parent call with an event-bound TwiML URL; Twilio
-  returns the allocated parent CallSid to that verified route before it receives the SIP bridge;
+  returns the allocated parent CallSid to that verified route before it receives the selected
+  bridge;
 - inbound: Twilio calls the signed incoming-voice route, which returns the bridge TwiML;
-- status: the same signed route reconciles outbound parent-call events and the inbound
-  `<Dial action>` result. It is lifecycle evidence, never authority;
-- limits: the parent Call and both `<Dial>` bridges have carrier-enforced duration and setup
-  ceilings in addition to daemon-side session expiry.
+- status: the same signed route reconciles outbound parent-call events and, in SIP mode, the
+  inbound `<Dial action>` result. It is lifecycle evidence, never authority;
+- limits: the parent outbound Call and SIP `<Dial>` bridges have carrier-enforced ceilings in
+  addition to daemon-side session expiry;
+- direct media: signed WSS handshakes plus event-bound outbound or expiring-admission-bound
+  inbound stream parameters are validated before PCMU audio is forwarded to an authenticated
+  OpenAI Realtime WebSocket.
 
 Carrier status is lifecycle evidence, never approval.
 
 ### OpenAI Realtime
 
-After a signed incoming-call webhook is accepted, the daemon opens a server-side WebSocket to
-that Realtime call. The session receives:
+In SIP mode, the daemon opens a sideband WebSocket after accepting a signed OpenAI incoming-call
+webhook. In direct media mode, it opens a normal Realtime WebSocket and bridges Twilio PCMU
+audio itself. In either case, the session receives:
 
 - a bounded system prompt;
 - a compact, sanitized escalation snapshot or inbound task view;
@@ -66,7 +73,7 @@ report structured tool results.
 
 ## Public and private surfaces
 
-The four provider webhook routes are:
+The default SIP provider routes are:
 
 ```text
 POST /v1/openai/realtime/webhook
@@ -74,6 +81,9 @@ POST /v1/twilio/voice/incoming
 POST /v1/twilio/voice/outbound
 POST /v1/twilio/status
 ```
+
+Direct media mode replaces the OpenAI call webhook/SIP leg with `WSS /v1/twilio/media` while
+retaining the signed Twilio voice and status routes.
 
 Optional fallback uses `/fallback`, its two static assets, `/v1/fallback/open`, and
 `/v1/fallback/decision`. Everything else remains local or behind separate authentication. A
