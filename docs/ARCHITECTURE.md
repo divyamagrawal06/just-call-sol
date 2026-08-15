@@ -9,12 +9,12 @@ flowchart LR
     M -->|local bearer token| D["FastAPI coordinator"]
     D --> S["SQLite audit and state"]
     D --> C["Codex App Server adapter"]
-    D -->|outbound REST call| T["Twilio PSTN carrier"]
+    D -->|outbound REST call| T["Twilio or Vobiz carrier"]
     T -->|SIP mode| O["OpenAI Realtime"]
-    T -->|media mode: PCMU WSS| D
+    T -->|Twilio media mode: PCMU WSS| D
     P["Owner phone"] <--> T
     O <-->|Realtime WebSocket and bounded tools| D
-    T -->|signed inbound TwiML request| D
+    T -->|signed inbound XML request| D
     O -->|signed incoming-call webhook| D
 ```
 
@@ -35,10 +35,10 @@ FastAPI owns request authentication, caller admission, deduplication, state tran
 readback preparation, PIN verification, action grants, and local API boundaries. SQLite stores
 events, sessions, decisions, action receipts, provider correlation, and fallback state.
 
-### Twilio
+### PSTN carriers
 
-Twilio is the PSTN carrier and can use either OpenAI SIP or the daemon's direct Media Streams
-adapter:
+Twilio and Vobiz can carry the PSTN leg into OpenAI SIP. Twilio can instead use the daemon's
+direct Media Streams adapter:
 
 - outbound: the daemon creates a Twilio parent call with an event-bound TwiML URL; Twilio
   returns the allocated parent CallSid to that verified route before it receives the selected
@@ -51,6 +51,13 @@ adapter:
 - direct media: signed WSS handshakes plus event-bound outbound or expiring-admission-bound
   inbound stream parameters are validated before PCMU audio is forwarded to an authenticated
   OpenAI Realtime WebSocket.
+
+Vobiz follows the same durable shape with its REST call UUID and Vobiz XML callbacks. The daemon
+verifies a V3 or V2 provider URL-and-nonce HMAC on every callback and durably tracks each
+verified nonce against replay. Separate, domain-specific event-bound query signatures bind the
+outbound answer, ring, and hangup callbacks to the durable event. The answer callback can then
+bind the UUID and receive bridge XML. The authenticated inbound XML route creates a short-lived,
+one-use carrier admission before returning its signed SIP bridge.
 
 Carrier status is lifecycle evidence, never approval.
 
@@ -82,6 +89,15 @@ POST /v1/twilio/voice/outbound
 POST /v1/twilio/status
 ```
 
+The Vobiz SIP profile replaces the three Twilio HTTP routes with:
+
+```text
+POST /v1/vobiz/voice/incoming
+POST /v1/vobiz/voice/outbound
+POST /v1/vobiz/ring
+POST /v1/vobiz/hangup
+```
+
 Direct media mode replaces the OpenAI call webhook/SIP leg with `WSS /v1/twilio/media` while
 retaining the signed Twilio voice and status routes.
 
@@ -95,15 +111,15 @@ production reverse proxy must enforce that split; a raw development tunnel does 
 sequenceDiagram
     participant Agent as "Codex or Claude"
     participant Daemon as "Hotline daemon"
-    participant Twilio
+    participant Carrier as "Twilio or Vobiz"
     participant Realtime as "OpenAI Realtime"
     participant Owner
 
     Agent->>Daemon: contact_human(snapshot)
     Daemon->>Daemon: persist event and dedupe
-    Daemon->>Twilio: create parent PSTN call
+    Daemon->>Carrier: create parent PSTN call
     Daemon-->>Agent: durable event ID and calling status
-    Twilio->>Realtime: bridge to project SIP
+    Carrier->>Realtime: bridge to project SIP
     Realtime->>Daemon: signed incoming-call webhook
     Daemon->>Realtime: accept and open sideband WebSocket
     Realtime<<->>Owner: conversational audio
@@ -117,9 +133,9 @@ sequenceDiagram
 
 ## Inbound sequence
 
-Twilio first verifies the caller-facing phone leg. The incoming route checks Twilio's
-signature, account, called number, direction, and E.164 allowlist, then embeds signed
-correlation headers in the SIP bridge. The OpenAI webhook is where the durable inbound event
+The selected carrier first verifies the caller-facing phone leg. The incoming route checks the
+provider signature, account, called number, direction, and E.164 allowlist, then embeds signed
+correlation metadata in the SIP bridge. The OpenAI webhook is where the durable inbound event
 is correlated and accepted. Direct or uncorrelated SIP is rejected.
 
 An allowlisted caller may converse and use bounded read-only task inspection. Caller ID alone

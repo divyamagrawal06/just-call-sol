@@ -22,7 +22,7 @@ Expected output includes:
 This mode:
 
 - forces the fake transport;
-- creates no Twilio or OpenAI call;
+- creates no carrier or OpenAI call;
 - uses a generated mock-only PIN;
 - keeps Codex writes and real runbooks disabled;
 - executes only the deterministic mock database-RU runbook.
@@ -45,7 +45,7 @@ actual voice-path test.”
 
 ### 0:20–1:05 — inbound conversation
 
-Call the configured Twilio number from the owner phone.
+Call the configured carrier number from the owner phone.
 
 Ask:
 

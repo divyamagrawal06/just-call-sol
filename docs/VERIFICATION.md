@@ -6,10 +6,11 @@ barge-in, DTMF delivery, or live Codex control.
 
 ## Automated and mocked coverage
 
-The repository includes automated tests for settings, provider clients, Twilio HTTP and WSS
-signatures, SIP and Media Streams TwiML, OpenAI webhook admission, direct PCMU bridging,
+The repository includes automated tests for settings, provider clients, Twilio HTTP/WSS and
+Vobiz V2/V3 URL-and-nonce signatures, SIP/XML and Media Streams bridges, Vobiz REST call lifecycle,
+OpenAI webhook admission, direct PCMU bridging,
 Realtime tool dispatch, state transitions, fallback, MCP stdio, Codex integration boundaries,
-packaging, and plugin metadata.
+the authenticated Vapi tool adapter, packaging, and plugin metadata.
 
 Run:
 
@@ -26,13 +27,15 @@ fake-call decision and mock-runbook flow completed.
 
 ## Live status
 
-Live validation must be recorded against the operator's own OpenAI project, Twilio account,
-phone numbers, public HTTPS origin, and Codex installation. Do not mark an item complete from
+Live validation must be recorded against the operator's own OpenAI project, selected carrier
+account, phone numbers, public HTTPS origin, and Codex installation. Do not mark an item complete from
 a fixture, mocked client, provider API probe, or console screenshot alone.
 
 Before a release is described as live-validated, record dated evidence for:
 
 - [ ] inbound Twilio signature, account, destination, direction, and caller-allowlist checks;
+- [ ] or inbound Vobiz V3/V2 HMAC and nonce-replay checks, account, UUID, destination,
+      direction, and caller-allowlist checks when using Vobiz;
 - [ ] signed SIP correlation and verified OpenAI incoming-call webhook, if using `sip` mode;
 - [ ] authenticated WSS handshake, expiring inbound admission, outbound event correlation, and
       two-way PCMU audio, if using `media_stream` mode;
@@ -40,6 +43,10 @@ Before a release is described as live-validated, record dated evidence for:
       ambiguous-response recovery, and its Twilio status callback;
 - [ ] inbound `<Dial action>` delivery of `DialCallStatus` to the signed status route, if using
       `sip` mode;
+- [ ] Vobiz outbound XML fetch, event-bound UUID correlation, ring and hangup callbacks, and
+      DELETE termination when using Vobiz;
+- [ ] Vapi bearer/resource binding, duplicate tool receipt replay, and end-of-call cleanup when
+      using the optional Vapi adapter;
 - [ ] server-side Realtime WebSocket connection and natural two-way audio;
 - [ ] interruption/barge-in and long-pause behavior without premature hangup;
 - [ ] exact server transcript plus confirmed drained playback followed by a later owner speech

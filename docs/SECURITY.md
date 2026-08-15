@@ -24,10 +24,14 @@ Production uses independent values for:
 - fallback delivery authentication: `HOTLINE_FALLBACK_WEBHOOK_TOKEN`;
 - OpenAI webhook verification: `OPENAI_WEBHOOK_SECRET`;
 - Twilio request verification: `TWILIO_AUTH_TOKEN`;
+- Vobiz REST authentication and provider-defined callback signing: `VOBIZ_AUTH_TOKEN`;
+- Vapi function-bridge authentication: `VAPI_WEBHOOK_TOKEN`;
 - owner verification: `OWNER_CONFIRMATION_PIN`.
 
-Hotline service secrets must be at least 32 characters and pairwise distinct. Do not reuse an
-API key, webhook secret, auth token, or PIN for another role.
+The six Hotline-managed service secrets must be at least 32 characters and pairwise distinct.
+Do not reuse an API key, webhook secret, auth token, or PIN for another role. Vobiz's documented
+callback scheme intentionally uses its account auth token as the signing key; this is a provider
+contract, not a reusable Hotline service secret.
 
 ## Public ingress
 
@@ -40,18 +44,37 @@ POST /v1/twilio/voice/outbound
 POST /v1/twilio/status
 ```
 
-and, when enabled, the fallback page, assets, and two fallback API routes. Local escalation,
+or, for the Vobiz carrier profile, the OpenAI route plus:
+
+```text
+POST /v1/vobiz/voice/incoming
+POST /v1/vobiz/voice/outbound
+POST /v1/vobiz/ring
+POST /v1/vobiz/hangup
+```
+
+The optional Vapi bridge adds only `POST /v1/vapi/webhook`.
+
+When enabled, the fallback page, assets, and two fallback API routes are also public. Local escalation,
 event, repository, dashboard, health, database, MCP, and Codex-control surfaces stay private.
 
 OpenAI webhooks are verified against the exact raw body. Twilio form requests are verified
-against the original public URL and body. Provider handlers also apply bounded body sizes,
-rate limits, idempotency, and correlation checks. Put another request-size and rate-limit
-layer at the reverse proxy.
+against the original public URL and body. Every Vobiz form requires a base64-encoded
+HMAC-SHA256 signed with `VOBIZ_AUTH_TOKEN`: V3 signs `baseURL + "." + nonce`, while the V2
+fallback signs `baseURL + nonce`. The daemon prefers the
+`X-Vobiz-Signature-V3`/`X-Vobiz-Signature-V3-Nonce` pair, accepts the corresponding V2 pair,
+requires the provider's 20-digit nonce, compares signatures in constant time, and durably
+tracks verified nonces against replay. Query parameters are excluded from the provider HMAC,
+so the outbound answer, ring, and hangup routes additionally require separate domain-specific
+event bindings. Vapi requires a distinct bearer token, exact assistant and phone-number IDs,
+and an owner or explicitly allowlisted customer number. Provider handlers also apply bounded
+body sizes, rate limits, idempotency, and correlation checks. Put another request-size and
+rate-limit layer at the reverse proxy.
 
 A raw quick tunnel exposes the entire app origin and is suitable only for temporary
 development.
 
-The daemon and carrier independently cap call lifetime. Outbound Twilio Call creation sets a
+The daemon and carrier independently cap call lifetime. Outbound carrier Call creation sets a
 maximum duration and ring timeout, and both inbound and outbound SIP `<Dial>` bridges set
 matching `timeLimit` and setup `timeout` values. Direct media sessions are bounded by daemon
 expiry, and closing either authenticated WebSocket tears down the audio path. Daemon maintenance
@@ -60,19 +83,19 @@ single active-call slot.
 
 ## Inbound identity
 
-The incoming Twilio route requires all of the following:
+The incoming carrier route requires all of the following:
 
-- valid Twilio signature;
-- expected account SID;
+- valid Twilio signature or recent Vobiz HMAC;
+- expected carrier account;
 - expected destination number;
 - inbound direction;
 - caller number matching the owner or explicit E.164 allowlist.
 
-In SIP mode, the returned TwiML adds signed, short-lived correlation data to the OpenAI leg and
-the signed incoming-call webhook must match it. In direct media mode, an expiring, one-time
-carrier admission is bound to the authenticated Twilio stream before the inbound event exists.
-Direct SIP, forged streams, replayed correlation, expired admission, or an allowlist mismatch
-is rejected.
+In SIP mode, the returned TwiML or Vobiz XML adds signed, short-lived correlation data to the
+OpenAI leg and the signed incoming-call webhook must match it. In direct media mode, an
+expiring, one-time carrier admission is bound to the authenticated Twilio stream before the
+inbound event exists. Direct SIP, forged streams, replayed correlation, expired admission, or
+an allowlist mismatch is rejected.
 
 The allowlist grants access to a conversation and bounded read-only task discovery. It does
 not grant a decision, repository read, or write.
@@ -107,6 +130,10 @@ Two independent default-off gates limit side effects:
 
 - `HOTLINE_ALLOW_CODEX_WRITES` controls voice-initiated Codex task writes.
 - `HOTLINE_ALLOW_REAL_RUNBOOKS` controls registered real runbook executors.
+
+`HOTLINE_DEMO_AUTO_EXECUTE_ACTIONS` is a separate development-only shortcut that skips spoken
+PIN verification for an otherwise prepared and allowlisted Codex action. Configuration rejects
+it when `HOTLINE_ENV=production`; do not expose a demo daemon as a production control surface.
 
 The default registry contains only mock runbooks. No production cloud, database, deployment,
 or batch executor ships here. Enabling the real-runbook gate does not invent one.
