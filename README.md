@@ -1,10 +1,43 @@
 # Better Call Sol
 
-Better Call Sol is a voice control plane for Codex and Claude. It lets agents phone their owner
-about blockers, incidents, approvals, interrupted jobs, or authentication handoffs, while a
-FastAPI daemon and SQLite keep decisions and scoped action grants auditable. Live calls use
-OpenAI Realtime with Twilio or Vobiz; an authenticated Vapi bridge is available for the hosted
-demo path.
+**Your coding agent can reach you before a blocker turns into wasted time.**
+
+Better Call Sol gives Codex and Claude a real phone line to their owner. An agent can call with
+a compact incident brief when it needs a decision, approval, authentication handoff, or help
+recovering interrupted work. You can call back to inspect, steer, interrupt, or start bounded
+Codex tasks without handing a voice model unrestricted access to your machine.
+
+OpenAI Realtime provides the low-latency conversation: natural speech, interruption handling,
+turn-taking, and tool calls. Codex remains the coding runtime. A local FastAPI control plane
+connects the two, enforces policy, and records every event, decision, and one-time action grant
+in SQLite. Twilio or Vobiz carries the phone leg; Vapi can power a hosted demo path.
+
+## How Codex and OpenAI Realtime work together
+
+```text
+Codex or Claude -> local Hotline daemon -> Twilio/Vobiz -> OpenAI Realtime -> owner phone
+                         ^                      |
+                         +---- bounded tools ---+
+```
+
+1. **Codex raises the right signal.** The bundled MCP/plugin integration sends a sanitized,
+   structured brief to the local daemon instead of exposing the whole repository or terminal.
+2. **OpenAI Realtime runs the conversation.** It speaks and listens in real time, then calls only
+   the narrow tools supplied for that call. It never inherits Codex shell access, credentials,
+   or unrestricted filesystem access.
+3. **The daemon talks to Codex.** Tool calls return to the local control plane, which can list or
+   inspect tasks and—when policy allows—instruct, interrupt, spawn, or archive a specific Codex
+   task through the Codex app-server boundary.
+4. **Authority stays local.** Sensitive actions use exact readback, server-side confirmation,
+   short-lived scoped grants, and durable audit receipts. Silence, voicemail, or a plausible
+   model response is never treated as approval.
+
+The result is a practical human-in-the-loop control surface for long-running agent work: fast
+enough to use from your pocket, narrow enough to trust, and auditable enough to operate.
+
+## Demo
+
+[Watch Better Call Sol connect a live voice call to Codex.](https://youtu.be/5xuRL5zwR4c)
 
 ## Setup and run
 
