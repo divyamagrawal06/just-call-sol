@@ -22,6 +22,12 @@ _WINDOWS_USER_ENV_KEYS = (
     "TWILIO_ACCOUNT_SID",
     "TWILIO_AUTH_TOKEN",
     "TWILIO_PHONE_NUMBER",
+    "VOBIZ_AUTH_ID",
+    "VOBIZ_AUTH_TOKEN",
+    "VOBIZ_PHONE_NUMBER",
+    "VAPI_WEBHOOK_TOKEN",
+    "VAPI_ASSISTANT_ID",
+    "VAPI_PHONE_NUMBER_ID",
     "OWNER_PHONE_NUMBER",
     "OWNER_CONFIRMATION_PIN",
     "HOTLINE_OWNER_NAME",
@@ -36,6 +42,10 @@ _WINDOWS_USER_ENV_KEYS = (
     "HOTLINE_FALLBACK_MAX_PIN_ATTEMPTS",
     "HOTLINE_GIT_BIN",
     "HOTLINE_WORKSPACE_ROOTS",
+    "HOTLINE_TRANSPORT",
+    "HOTLINE_CARRIER",
+    "HOTLINE_ALLOW_CODEX_WRITES",
+    "HOTLINE_DEMO_AUTO_EXECUTE_ACTIONS",
     "PUBLIC_BASE_URL",
 )
 
@@ -114,9 +124,9 @@ class Settings(BaseSettings):
     hotline_log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     public_base_url: str | None = None
 
-    # OpenAI Realtime is the conversational runtime. A SIP carrier (Twilio by
-    # default) originates PSTN calls and forwards both inbound and outbound legs
-    # to the project-scoped OpenAI SIP endpoint.
+    # OpenAI Realtime is the conversational runtime. The selected SIP carrier
+    # originates PSTN calls and forwards both inbound and outbound legs to the
+    # project-scoped OpenAI SIP endpoint.
     openai_api_key: SecretStr = SecretStr("")
     openai_webhook_secret: SecretStr = SecretStr("")
     openai_project_id: str | None = None
@@ -146,6 +156,17 @@ class Settings(BaseSettings):
     twilio_phone_number: str | None = None
     twilio_bridge_mode: Literal["sip", "media_stream"] = "sip"
 
+    hotline_carrier: Literal["twilio", "vobiz"] = "twilio"
+    vobiz_auth_id: str | None = None
+    vobiz_auth_token: SecretStr = SecretStr("")
+    vobiz_phone_number: str | None = None
+
+    # Vapi owns the conversational/PSTN path while this daemon remains the
+    # authenticated, allowlisted Codex task-control backend.
+    vapi_webhook_token: SecretStr = SecretStr("")
+    vapi_assistant_id: str | None = None
+    vapi_phone_number_id: str | None = None
+
     owner_phone_number: SecretStr = SecretStr("")
     owner_confirmation_pin: SecretStr = SecretStr("")
     hotline_owner_name: str = Field(default="Owner", min_length=1, max_length=80)
@@ -154,6 +175,7 @@ class Settings(BaseSettings):
     codex_bin: str = "codex"
     codex_app_server_enabled: bool = True
     codex_app_server_cwd: Path | None = None
+    hotline_show_spawned_codex_tasks: bool = False
     # Semicolon-separated repository roots. An empty value safely falls back to
     # the daemon's single configured Codex cwd, not to the user's home directory.
     hotline_workspace_roots: str = ""
@@ -161,6 +183,7 @@ class Settings(BaseSettings):
 
     hotline_transport: Literal["openai_realtime", "fake", "disabled"] = "openai_realtime"
     hotline_allow_codex_writes: bool = False
+    hotline_demo_auto_execute_actions: bool = False
     hotline_allow_real_runbooks: bool = False
     hotline_allowlisted_callers: str = ""
     hotline_max_active_calls: int = Field(default=1, ge=1, le=1)
@@ -186,6 +209,10 @@ class Settings(BaseSettings):
         "openai_project_id",
         "twilio_account_sid",
         "twilio_phone_number",
+        "vobiz_auth_id",
+        "vobiz_phone_number",
+        "vapi_assistant_id",
+        "vapi_phone_number_id",
         mode="before",
     )
     @classmethod
@@ -209,6 +236,7 @@ class Settings(BaseSettings):
         "hotline_action_signing_secret",
         "hotline_fallback_signing_secret",
         "hotline_fallback_webhook_token",
+        "vapi_webhook_token",
     )
     @classmethod
     def validate_hotline_secret_strength(cls, value: SecretStr) -> SecretStr:
@@ -230,6 +258,20 @@ class Settings(BaseSettings):
     def validate_twilio_phone_number(cls, value: str | None) -> str | None:
         if value is not None and re.fullmatch(r"\+[1-9]\d{7,14}", value) is None:
             raise ValueError("TWILIO_PHONE_NUMBER must be strict E.164")
+        return value
+
+    @field_validator("vobiz_phone_number")
+    @classmethod
+    def validate_vobiz_phone_number(cls, value: str | None) -> str | None:
+        if value is not None and re.fullmatch(r"\+[1-9]\d{7,14}", value) is None:
+            raise ValueError("VOBIZ_PHONE_NUMBER must be strict E.164")
+        return value
+
+    @field_validator("vobiz_auth_id")
+    @classmethod
+    def validate_vobiz_auth_id(cls, value: str | None) -> str | None:
+        if value is not None and re.fullmatch(r"MA_[A-Za-z0-9]{4,64}", value) is None:
+            raise ValueError("VOBIZ_AUTH_ID must be an MA_-prefixed account ID")
         return value
 
     @field_validator("openai_project_id")
@@ -264,11 +306,16 @@ class Settings(BaseSettings):
                 self.hotline_action_signing_secret.get_secret_value(),
                 self.hotline_fallback_signing_secret.get_secret_value(),
                 self.hotline_fallback_webhook_token.get_secret_value(),
+                self.vapi_webhook_token.get_secret_value(),
             )
             if value
         ]
         if len(configured) != len(set(configured)):
             raise ValueError("Hotline service secrets must be pairwise distinct")
+        if self.hotline_env == "production" and self.hotline_demo_auto_execute_actions:
+            raise ValueError(
+                "HOTLINE_DEMO_AUTO_EXECUTE_ACTIONS cannot be enabled in production"
+            )
         return self
 
     @property
@@ -286,7 +333,10 @@ class Settings(BaseSettings):
         return bool(
             common_ready
             and (
-                self.twilio_bridge_mode == "media_stream"
+                (
+                    self.hotline_carrier == "twilio"
+                    and self.twilio_bridge_mode == "media_stream"
+                )
                 or self.openai_webhook_secret.get_secret_value()
             )
         )
@@ -306,6 +356,38 @@ class Settings(BaseSettings):
         )
 
     @property
+    def vobiz_configured(self) -> bool:
+        return all(
+            (
+                self.vobiz_auth_id,
+                self.vobiz_auth_token.get_secret_value(),
+                self.vobiz_phone_number,
+                self.owner_phone_number.get_secret_value(),
+                self.openai_project_id,
+                self.openai_webhook_secret.get_secret_value(),
+                self.public_base_url,
+                self.hotline_sip_correlation_secret.get_secret_value(),
+            )
+        )
+
+    @property
+    def carrier_configured(self) -> bool:
+        if self.hotline_carrier == "vobiz":
+            return bool(self.vobiz_configured)
+        return bool(self.twilio_configured)
+
+    @property
+    def vapi_configured(self) -> bool:
+        return all(
+            (
+                self.vapi_webhook_token.get_secret_value(),
+                self.vapi_assistant_id,
+                self.vapi_phone_number_id,
+                self.owner_phone_number.get_secret_value(),
+            )
+        )
+
+    @property
     def openai_sip_uri(self) -> str | None:
         if self.openai_project_id is None:
             return None
@@ -315,7 +397,7 @@ class Settings(BaseSettings):
     def openai_realtime_runtime_ready(self) -> bool:
         return bool(
             self.openai_realtime_configured
-            and self.twilio_configured
+            and self.carrier_configured
             and self.hotline_local_token.get_secret_value()
         )
 
@@ -380,11 +462,23 @@ class Settings(BaseSettings):
             "openai_realtime_reasoning_effort": self.openai_realtime_reasoning_effort,
             "openai_realtime_configured": self.openai_realtime_configured,
             "openai_realtime_runtime_ready": self.openai_realtime_runtime_ready,
+            "carrier": self.hotline_carrier,
+            "carrier_configured": self.carrier_configured,
             "twilio_account_configured": bool(self.twilio_account_sid),
             "twilio_auth_token_configured": bool(self.twilio_auth_token.get_secret_value()),
             "twilio_number_configured": bool(self.twilio_phone_number),
             "twilio_bridge_mode": self.twilio_bridge_mode,
             "twilio_configured": self.twilio_configured,
+            "vobiz_auth_id_configured": bool(self.vobiz_auth_id),
+            "vobiz_auth_token_configured": bool(self.vobiz_auth_token.get_secret_value()),
+            "vobiz_number_configured": bool(self.vobiz_phone_number),
+            "vobiz_configured": self.vobiz_configured,
+            "vapi_webhook_token_configured": bool(
+                self.vapi_webhook_token.get_secret_value()
+            ),
+            "vapi_assistant_id_configured": bool(self.vapi_assistant_id),
+            "vapi_phone_number_id_configured": bool(self.vapi_phone_number_id),
+            "vapi_configured": self.vapi_configured,
             "owner_number_configured": bool(self.owner_phone_number.get_secret_value()),
             "owner_confirmation_pin_configured": bool(
                 self.owner_confirmation_pin.get_secret_value()
@@ -393,6 +487,7 @@ class Settings(BaseSettings):
             "workspace_roots_configured": len(self.workspace_roots),
             "git_bin_configured": self.hotline_git_bin is not None,
             "codex_writes_enabled": self.hotline_allow_codex_writes,
+            "demo_auto_execute_actions": self.hotline_demo_auto_execute_actions,
             "real_runbooks_enabled": self.hotline_allow_real_runbooks,
         }
 

@@ -5,7 +5,7 @@ import json
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode
 from xml.etree import ElementTree
 
@@ -34,6 +34,13 @@ from agent_hotline.twilio import (
     compute_twilio_webhook_signature,
     compute_twilio_websocket_signature,
 )
+from agent_hotline.vobiz import (
+    build_answer_event_signature,
+    build_hangup_event_signature,
+    build_ring_event_signature,
+    compute_vobiz_webhook_signature,
+    decode_vobiz_correlation_headers,
+)
 
 PUBLIC_BASE_URL = "https://hotline.example.test"
 OPENAI_API_KEY = "sk-openai-realtime-api-test-secret"
@@ -43,6 +50,10 @@ TWILIO_ACCOUNT_SID = "AC" + ("a" * 32)
 TWILIO_AUTH_TOKEN = "twilio-auth-token-for-api-tests"
 TWILIO_PHONE_NUMBER = "+12025550100"
 TWILIO_CALL_SID = "CA" + ("b" * 32)
+VOBIZ_AUTH_ID = "MA_API12345"
+VOBIZ_AUTH_TOKEN = "vobiz-auth-token-for-realtime-api-tests"
+VOBIZ_PHONE_NUMBER = "+12025550124"
+VOBIZ_CALL_UUID = "550e8400-e29b-41d4-a716-446655440000"
 OWNER_PHONE_NUMBER = "+12025550199"
 OWNER_PIN = "246810"
 CALLBACK_TOKEN = "sip-correlation-signing-token-for-api-tests-123456"
@@ -51,6 +62,10 @@ TWILIO_INBOUND_PATH = "/v1/twilio/voice/incoming"
 TWILIO_OUTBOUND_PATH = "/v1/twilio/voice/outbound"
 TWILIO_STATUS_PATH = "/v1/twilio/status"
 TWILIO_MEDIA_PATH = "/v1/twilio/media"
+VOBIZ_INBOUND_PATH = "/v1/vobiz/voice/incoming"
+VOBIZ_OUTBOUND_PATH = "/v1/vobiz/voice/outbound"
+VOBIZ_RING_PATH = "/v1/vobiz/ring"
+VOBIZ_HANGUP_PATH = "/v1/vobiz/hangup"
 
 SECURITY_HEADERS = {
     "cache-control": "no-store",
@@ -196,6 +211,35 @@ async def realtime_api(tmp_path: Path) -> AsyncIterator[RealtimeAPIHarness]:
             )
 
 
+@pytest_asyncio.fixture
+async def vobiz_realtime_api(tmp_path: Path) -> AsyncIterator[RealtimeAPIHarness]:
+    settings = configured_settings(
+        tmp_path / "vobiz-realtime-api.sqlite3",
+        hotline_carrier="vobiz",
+        vobiz_auth_id=VOBIZ_AUTH_ID,
+        vobiz_auth_token=SecretStr(VOBIZ_AUTH_TOKEN),
+        vobiz_phone_number=VOBIZ_PHONE_NUMBER,
+    )
+    manager = FakeRealtimeManager()
+    app = create_app(
+        settings=settings,
+        provider=FakeCallProvider(),
+        realtime_manager=manager,  # type: ignore[arg-type]
+    )
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            yield RealtimeAPIHarness(
+                app=app,
+                client=client,
+                manager=manager,
+                settings=settings,
+            )
+
+
 def signed_twilio_form(
     path: str,
     pairs: list[tuple[str, str]],
@@ -210,6 +254,37 @@ def signed_twilio_form(
         "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
         "X-Twilio-Signature": signature,
     }
+
+
+def signed_vobiz_form(
+    path: str,
+    pairs: list[tuple[str, str]],
+    *,
+    nonce: str,
+    version: Literal[2, 3] = 3,
+) -> tuple[bytes, dict[str, str]]:
+    body = urlencode(pairs).encode("ascii")
+    signature = compute_vobiz_webhook_signature(
+        callback_url=f"{PUBLIC_BASE_URL}{path}",
+        nonce=nonce,
+        auth_token=VOBIZ_AUTH_TOKEN,
+        version=version,
+    )
+    return body, {
+        "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+        f"X-Vobiz-Signature-V{version}": signature,
+        f"X-Vobiz-Signature-V{version}-Nonce": nonce,
+    }
+
+
+def vobiz_sip_headers(response: httpx.Response) -> dict[str, str]:
+    user = ElementTree.fromstring(response.content).find("./Dial/User")
+    assert user is not None
+    raw_headers = {
+        f"X-VH-{name}": value
+        for name, value in (item.split("=", 1) for item in user.attrib["sipHeaders"].split(","))
+    }
+    return decode_vobiz_correlation_headers(raw_headers)
 
 
 def assert_security_headers(response: httpx.Response) -> None:
@@ -543,6 +618,417 @@ async def test_twilio_outbound_route_binds_parent_idempotently_and_stops_termina
     assert CALLBACK_TOKEN not in first.text + replay.text + terminal.text
     assert_security_headers(first)
     assert_security_headers(terminal)
+
+
+@pytest.mark.asyncio
+async def test_vobiz_outbound_binds_once_and_returns_signed_openai_sip_xml(
+    vobiz_realtime_api: RealtimeAPIHarness,
+) -> None:
+    event_id = "evt_vobiz_outbound_answer"
+    path = f"{VOBIZ_OUTBOUND_PATH}?" + urlencode(
+        {
+            "event_id": event_id,
+            "event_sig": build_answer_event_signature(
+                CALLBACK_TOKEN,
+                event_id=event_id,
+            ),
+        }
+    )
+    pairs = [
+        ("From", VOBIZ_PHONE_NUMBER),
+        ("To", OWNER_PHONE_NUMBER),
+        ("RequestUUID", VOBIZ_CALL_UUID),
+        ("CallUUID", VOBIZ_CALL_UUID),
+        ("Direction", "outbound"),
+        ("Event", "StartApp"),
+        ("CallStatus", "in-progress"),
+        ("auth_id", VOBIZ_AUTH_ID),
+    ]
+    body, headers = signed_vobiz_form(
+        path,
+        pairs,
+        nonce="11111111111111111111",
+    )
+
+    first = await vobiz_realtime_api.client.post(path, content=body, headers=headers)
+    retry = await vobiz_realtime_api.client.post(path, content=body, headers=headers)
+
+    assert first.status_code == 200
+    assert retry.status_code == 200
+    assert first.headers["content-type"].startswith("application/xml")
+    root = ElementTree.fromstring(first.content)
+    dial = root.find("./Dial")
+    user = root.find("./Dial/User")
+    assert dial is not None
+    assert dial.attrib == {"timeLimit": "1800", "timeout": "30"}
+    assert user is not None
+    assert user.text == (f"sip:{OPENAI_PROJECT_ID}@sip.api.openai.com:5061;transport=tls")
+    assert root.find("./Hangup") is not None
+    sip_headers = vobiz_sip_headers(first)
+    assert sip_headers.keys() == {
+        "x-hotline-direction",
+        "x-hotline-call-sid",
+        "x-hotline-event-id",
+        "x-hotline-signature",
+    }
+    assert sip_headers["x-hotline-direction"] == "outbound"
+    assert sip_headers["x-hotline-call-sid"] == VOBIZ_CALL_UUID
+    assert sip_headers["x-hotline-event-id"] == event_id
+    assert verify_correlation_signature(
+        CALLBACK_TOKEN,
+        direction="outbound",
+        call_sid=VOBIZ_CALL_UUID,
+        event_id=event_id,
+        signature=sip_headers["x-hotline-signature"],
+    )
+    assert vobiz_realtime_api.manager.outbound_bind_calls == [
+        {"event_id": event_id, "call_sid": VOBIZ_CALL_UUID}
+    ]
+    assert VOBIZ_AUTH_TOKEN not in first.text + retry.text
+    assert CALLBACK_TOKEN not in first.text + retry.text
+    assert_security_headers(first)
+    assert_security_headers(retry)
+
+
+@pytest.mark.asyncio
+async def test_vobiz_inbound_allowlist_issues_call_bound_admission_xml(
+    vobiz_realtime_api: RealtimeAPIHarness,
+) -> None:
+    pairs = [
+        ("CallUUID", VOBIZ_CALL_UUID),
+        ("From", OWNER_PHONE_NUMBER),
+        ("To", VOBIZ_PHONE_NUMBER),
+        ("Direction", "inbound"),
+        ("CallStatus", "ringing"),
+        ("auth_id", VOBIZ_AUTH_ID),
+    ]
+    body, headers = signed_vobiz_form(
+        VOBIZ_INBOUND_PATH,
+        pairs,
+        nonce="22222222222222222222",
+    )
+
+    first = await vobiz_realtime_api.client.post(
+        VOBIZ_INBOUND_PATH,
+        content=body,
+        headers=headers,
+    )
+    retry = await vobiz_realtime_api.client.post(
+        VOBIZ_INBOUND_PATH,
+        content=body,
+        headers=headers,
+    )
+
+    assert first.status_code == 200
+    assert retry.status_code == 200
+    sip_headers = vobiz_sip_headers(first)
+    assert sip_headers["x-hotline-direction"] == "inbound"
+    assert sip_headers["x-hotline-call-sid"] == VOBIZ_CALL_UUID
+    assert sip_headers["x-hotline-caller"] == OWNER_PHONE_NUMBER
+    expires_at_epoch = int(sip_headers["x-hotline-expires"])
+    assert verify_correlation_signature(
+        CALLBACK_TOKEN,
+        direction="inbound",
+        call_sid=VOBIZ_CALL_UUID,
+        event_id=None,
+        caller_phone=OWNER_PHONE_NUMBER,
+        admission_nonce=sip_headers["x-hotline-admission"],
+        expires_at_epoch=expires_at_epoch,
+        signature=sip_headers["x-hotline-signature"],
+    )
+    await vobiz_realtime_api.app.state.store.consume_carrier_admission(
+        VOBIZ_CALL_UUID,
+        caller_phone=OWNER_PHONE_NUMBER,
+        admission_nonce=sip_headers["x-hotline-admission"],
+        expires_at_epoch=expires_at_epoch,
+        provider_call_id=VOBIZ_CALL_UUID,
+    )
+
+    rejected_pairs = [(name, "+12025550888" if name == "From" else value) for name, value in pairs]
+    rejected_body, rejected_headers = signed_vobiz_form(
+        VOBIZ_INBOUND_PATH,
+        rejected_pairs,
+        nonce="22222222222222222223",
+    )
+    rejected = await vobiz_realtime_api.client.post(
+        VOBIZ_INBOUND_PATH,
+        content=rejected_body,
+        headers=rejected_headers,
+    )
+
+    assert rejected.status_code == 403
+    assert_security_headers(first)
+    assert_security_headers(rejected)
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_status"),
+    [
+        ("duplicate_request_uuid", 400),
+        ("wrong_destination", 403),
+        ("invalid_event_binding", 403),
+    ],
+)
+@pytest.mark.asyncio
+async def test_vobiz_outbound_rejects_ambiguous_form_identity_or_event_binding(
+    vobiz_realtime_api: RealtimeAPIHarness,
+    failure: str,
+    expected_status: int,
+) -> None:
+    event_id = "evt_vobiz_strict_outbound"
+    event_signature = build_answer_event_signature(
+        CALLBACK_TOKEN,
+        event_id=event_id,
+    )
+    if failure == "invalid_event_binding":
+        event_signature = "invalid-event-signature"
+    path = f"{VOBIZ_OUTBOUND_PATH}?" + urlencode(
+        {"event_id": event_id, "event_sig": event_signature}
+    )
+    pairs = [
+        ("From", VOBIZ_PHONE_NUMBER),
+        (
+            "To",
+            "+12025550777" if failure == "wrong_destination" else OWNER_PHONE_NUMBER,
+        ),
+        ("RequestUUID", VOBIZ_CALL_UUID),
+        ("CallUUID", VOBIZ_CALL_UUID),
+        ("Direction", "outbound"),
+        ("Event", "StartApp"),
+        ("CallStatus", "in-progress"),
+    ]
+    if failure == "duplicate_request_uuid":
+        pairs.append(("RequestUUID", VOBIZ_CALL_UUID))
+    nonces = {
+        "duplicate_request_uuid": "33333333333333333331",
+        "wrong_destination": "33333333333333333332",
+        "invalid_event_binding": "33333333333333333333",
+    }
+    body, headers = signed_vobiz_form(path, pairs, nonce=nonces[failure])
+
+    response = await vobiz_realtime_api.client.post(
+        path,
+        content=body,
+        headers=headers,
+    )
+
+    assert response.status_code == expected_status
+    assert vobiz_realtime_api.manager.outbound_bind_calls == []
+    assert_security_headers(response)
+
+
+@pytest.mark.asyncio
+async def test_vobiz_ring_reconciles_once_and_rejects_conflicting_nonce_reuse(
+    vobiz_realtime_api: RealtimeAPIHarness,
+) -> None:
+    event_id = "evt_vobiz_ring_status"
+    path = f"{VOBIZ_RING_PATH}?" + urlencode(
+        {
+            "event_id": event_id,
+            "event_sig": build_ring_event_signature(
+                CALLBACK_TOKEN,
+                event_id=event_id,
+            ),
+        }
+    )
+    pairs = [
+        ("From", VOBIZ_PHONE_NUMBER),
+        ("To", OWNER_PHONE_NUMBER),
+        ("RequestUUID", VOBIZ_CALL_UUID),
+        ("CallUUID", VOBIZ_CALL_UUID),
+        ("Direction", "outbound"),
+        ("Event", "Ring"),
+        ("CallStatus", "ringing"),
+        ("auth_id", VOBIZ_AUTH_ID),
+        ("timestamp", "2026-08-15T12:00:00Z"),
+    ]
+    body, headers = signed_vobiz_form(
+        path,
+        pairs,
+        nonce="44444444444444444444",
+    )
+
+    first = await vobiz_realtime_api.client.post(path, content=body, headers=headers)
+    retry = await vobiz_realtime_api.client.post(path, content=body, headers=headers)
+
+    assert first.status_code == 200
+    assert retry.status_code == 200
+    assert len(vobiz_realtime_api.manager.status_calls) == 1
+    status_call = vobiz_realtime_api.manager.status_calls[0]
+    assert status_call["call_sid"] == VOBIZ_CALL_UUID
+    assert status_call["status"] == "ringing"
+    assert status_call["correlated_event_id"] == event_id
+    receipt_id = status_call["receipt_id"]
+    assert isinstance(receipt_id, str)
+    assert len(receipt_id) == 48
+    assert all(character in "0123456789abcdef" for character in receipt_id)
+
+    conflicting_pairs = [
+        (name, "2026-08-15T12:00:01Z" if name == "timestamp" else value) for name, value in pairs
+    ]
+    conflicting_body = urlencode(conflicting_pairs).encode("ascii")
+    conflict = await vobiz_realtime_api.client.post(
+        path,
+        content=conflicting_body,
+        headers=headers,
+    )
+
+    assert conflict.status_code == 409
+    assert len(vobiz_realtime_api.manager.status_calls) == 1
+    assert_security_headers(first)
+    assert_security_headers(retry)
+    assert_security_headers(conflict)
+
+
+@pytest.mark.asyncio
+async def test_vobiz_hangup_reconciles_terminal_outbound_status(
+    vobiz_realtime_api: RealtimeAPIHarness,
+) -> None:
+    event_id = "evt_vobiz_hangup_status"
+    path = f"{VOBIZ_HANGUP_PATH}?" + urlencode(
+        {
+            "event_id": event_id,
+            "event_sig": build_hangup_event_signature(
+                CALLBACK_TOKEN,
+                event_id=event_id,
+            ),
+        }
+    )
+    pairs = [
+        ("From", VOBIZ_PHONE_NUMBER),
+        ("To", OWNER_PHONE_NUMBER),
+        ("RequestUUID", VOBIZ_CALL_UUID),
+        ("CallUUID", VOBIZ_CALL_UUID),
+        ("Direction", "outbound"),
+        ("Event", "Hangup"),
+        ("CallStatus", "completed"),
+        ("auth_id", VOBIZ_AUTH_ID),
+    ]
+    body, headers = signed_vobiz_form(
+        path,
+        pairs,
+        nonce="55555555555555555555",
+    )
+
+    response = await vobiz_realtime_api.client.post(
+        path,
+        content=body,
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"accepted": True, "terminal": False}
+    assert len(vobiz_realtime_api.manager.status_calls) == 1
+    assert vobiz_realtime_api.manager.status_calls[0] == {
+        "call_sid": VOBIZ_CALL_UUID,
+        "status": "completed",
+        "receipt_id": vobiz_realtime_api.manager.status_calls[0]["receipt_id"],
+        "correlated_event_id": event_id,
+    }
+    assert_security_headers(response)
+
+
+@pytest.mark.parametrize("v3_mode", ["invalid", "incomplete"])
+@pytest.mark.asyncio
+async def test_vobiz_v2_fallback_is_disabled_when_any_v3_header_is_present(
+    vobiz_realtime_api: RealtimeAPIHarness,
+    v3_mode: str,
+) -> None:
+    event_id = f"evt_vobiz_signature_{v3_mode}"
+    path = f"{VOBIZ_RING_PATH}?" + urlencode(
+        {
+            "event_id": event_id,
+            "event_sig": build_ring_event_signature(
+                CALLBACK_TOKEN,
+                event_id=event_id,
+            ),
+        }
+    )
+    pairs = [
+        ("From", VOBIZ_PHONE_NUMBER),
+        ("To", OWNER_PHONE_NUMBER),
+        ("RequestUUID", VOBIZ_CALL_UUID),
+        ("Direction", "outbound"),
+        ("Event", "Ring"),
+        ("CallStatus", "ringing"),
+    ]
+    v2_nonce = {
+        "invalid": "66666666666666666661",
+        "incomplete": "66666666666666666662",
+    }[v3_mode]
+    body, headers = signed_vobiz_form(
+        path,
+        pairs,
+        nonce=v2_nonce,
+        version=2,
+    )
+    v3_nonce = {
+        "invalid": "77777777777777777771",
+        "incomplete": "77777777777777777772",
+    }[v3_mode]
+    headers["X-Vobiz-Signature-V3"] = (
+        "invalid-v3-signature"
+        if v3_mode == "invalid"
+        else compute_vobiz_webhook_signature(
+            callback_url=f"{PUBLIC_BASE_URL}{path}",
+            nonce=v3_nonce,
+            auth_token=VOBIZ_AUTH_TOKEN,
+            version=3,
+        )
+    )
+    if v3_mode == "invalid":
+        headers["X-Vobiz-Signature-V3-Nonce"] = v3_nonce
+
+    response = await vobiz_realtime_api.client.post(
+        path,
+        content=body,
+        headers=headers,
+    )
+
+    assert response.status_code == 403
+    assert vobiz_realtime_api.manager.status_calls == []
+    assert_security_headers(response)
+
+
+@pytest.mark.asyncio
+async def test_vobiz_accepts_v2_when_v3_pair_is_entirely_absent(
+    vobiz_realtime_api: RealtimeAPIHarness,
+) -> None:
+    event_id = "evt_vobiz_signature_v2"
+    path = f"{VOBIZ_RING_PATH}?" + urlencode(
+        {
+            "event_id": event_id,
+            "event_sig": build_ring_event_signature(
+                CALLBACK_TOKEN,
+                event_id=event_id,
+            ),
+        }
+    )
+    pairs = [
+        ("From", VOBIZ_PHONE_NUMBER),
+        ("To", OWNER_PHONE_NUMBER),
+        ("RequestUUID", VOBIZ_CALL_UUID),
+        ("Direction", "outbound"),
+        ("Event", "Ring"),
+        ("CallStatus", "ringing"),
+    ]
+    body, headers = signed_vobiz_form(
+        path,
+        pairs,
+        nonce="88888888888888888888",
+        version=2,
+    )
+
+    response = await vobiz_realtime_api.client.post(
+        path,
+        content=body,
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert len(vobiz_realtime_api.manager.status_calls) == 1
+    assert vobiz_realtime_api.manager.status_calls[0]["status"] == "ringing"
+    assert_security_headers(response)
 
 
 @pytest.mark.asyncio

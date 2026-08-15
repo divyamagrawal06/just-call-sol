@@ -60,12 +60,17 @@ from .settings import Settings
 from .storage import ActiveSessionError, ConflictError, SQLiteStore, StorageError
 from .telephony_security import verify_correlation_signature
 from .twilio_media import TwilioMediaStream
+from .vobiz import decode_vobiz_correlation_headers
 
 logger = logging.getLogger(__name__)
 
 _CALL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,299}$")
 _TWILIO_ACCOUNT_SID_RE = re.compile(r"^AC[0-9a-fA-F]{32}$")
 _TWILIO_CALL_SID_RE = re.compile(r"^CA[0-9a-fA-F]{32}$")
+_VOBIZ_CALL_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 _SIP_PHONE_RE = re.compile(r"(?:sip:|tel:)(\+[1-9]\d{6,14})(?:[@;>\s]|$)", re.IGNORECASE)
 _MAX_WEBSOCKET_MESSAGE_BYTES = 1024 * 1024
 _MAX_TOOL_ARGUMENT_BYTES = 16 * 1024
@@ -2267,10 +2272,13 @@ class OpenAIRealtimeManager:
         event_id: str,
         call_sid: str,
     ) -> tuple[ContactSession, bool]:
-        """Atomically bind Twilio's allocated parent before returning outbound TwiML."""
+        """Atomically bind the allocated carrier parent before returning bridge XML."""
 
-        if _TWILIO_CALL_SID_RE.fullmatch(call_sid) is None:
-            raise IncomingCallError("carrier parent CallSid is invalid", sip_status=481)
+        if not _is_valid_carrier_call_id(
+            call_sid,
+            carrier=self.settings.hotline_carrier,
+        ):
+            raise IncomingCallError("carrier parent ID is invalid", sip_status=481)
         event = await self.store.require_event(event_id)
         sessions = [
             candidate
@@ -2473,7 +2481,7 @@ class OpenAIRealtimeManager:
         receipt_id: str | None = None,
         correlated_event_id: str | None = None,
     ) -> dict[str, Any]:
-        """Reconcile a verified Twilio status callback without trusting it as authority."""
+        """Reconcile a verified carrier status callback without treating it as authority."""
 
         async with self._admission_lock:
             return await self._handle_carrier_status_locked(
@@ -2551,28 +2559,32 @@ class OpenAIRealtimeManager:
             "busy": WebhookStatus.BUSY,
             "no-answer": WebhookStatus.NO_ANSWER,
             "failed": WebhookStatus.FAILED,
+            "cancel": WebhookStatus.FAILED,
             "canceled": WebhookStatus.FAILED,
+            "cancelled": WebhookStatus.FAILED,
+            "timeout": WebhookStatus.FAILED,
         }
         try:
             terminal = status_map[normalized]
         except KeyError as exc:
             raise ValueError("unsupported carrier call status") from exc
+        carrier = self.settings.hotline_carrier
         interaction_id = session.interaction_id
         payload = ProviderWebhookPayload(
             webhook_id=(
-                f"twilio:{receipt_id}"
+                f"{carrier}:{receipt_id}"
                 if receipt_id
-                else "twilio:"
+                else f"{carrier}:"
                 + hashlib.sha256(f"{call_sid}:{normalized}".encode()).hexdigest()[:48]
             ),
             attempt_id=call_sid,
             interaction_id=interaction_id,
             status=terminal,
-            provider="twilio_openai_realtime",
+            provider=f"{carrier}_openai_realtime",
             failure_reason=(
                 "carrier reported call failure" if terminal is WebhookStatus.FAILED else None
             ),
-            metadata={"source": "twilio_status_callback"},
+            metadata={"source": f"{carrier}_status_callback"},
         )
         await self._terminate_call_paths(
             interaction_id,
@@ -2610,8 +2622,20 @@ class OpenAIRealtimeManager:
                 await task
 
     async def _admit_call(self, incoming: ParsedIncomingCall) -> RealtimeConversation:
+        correlation_headers = incoming.sip_headers
+        if self.settings.hotline_carrier == "vobiz":
+            try:
+                decoded_headers = decode_vobiz_correlation_headers(
+                    incoming.sip_headers
+                )
+            except (TypeError, ValueError) as exc:
+                raise IncomingCallError(
+                    "Vobiz SIP correlation is malformed",
+                    sip_status=403,
+                ) from exc
+            correlation_headers = {**incoming.sip_headers, **decoded_headers}
         correlation = _parse_correlation(
-            incoming.sip_headers,
+            correlation_headers,
             self.settings.hotline_sip_correlation_secret.get_secret_value(),
         )
         if correlation is None:
@@ -2621,18 +2645,22 @@ class OpenAIRealtimeManager:
             )
         session: Any | None = None
         attempt_id: str | None = correlation.call_sid
-        cleanup_required = _TWILIO_CALL_SID_RE.fullmatch(correlation.call_sid) is not None
+        cleanup_required = _is_valid_carrier_call_id(
+            correlation.call_sid,
+            carrier=self.settings.hotline_carrier,
+        )
         accepted = False
         if not cleanup_required:
             raise IncomingCallError(
-                "carrier parent CallSid is invalid",
+                "carrier parent ID is invalid",
                 sip_status=403,
             )
         try:
-            _validate_twilio_sip_identity(
-                incoming.sip_headers,
-                expected_account_sid=self.settings.twilio_account_sid or "",
-            )
+            if self.settings.hotline_carrier == "twilio":
+                _validate_twilio_sip_identity(
+                    incoming.sip_headers,
+                    expected_account_sid=self.settings.twilio_account_sid or "",
+                )
             if correlation.direction == "outbound":
                 assert correlation.event_id is not None
                 # Both provider legs are now known. Establish cleanup
@@ -2668,7 +2696,7 @@ class OpenAIRealtimeManager:
                     attempt_id,
                 ):
                     raise IncomingCallError(
-                        "outbound parent CallSid does not match",
+                        "outbound carrier parent does not match",
                         sip_status=481,
                     )
                 event = await self.store.require_event(correlation.event_id)
@@ -3337,6 +3365,22 @@ def _parse_incoming_call(event: Mapping[str, Any]) -> ParsedIncomingCall:
         call_id=call_id,
         sip_headers=headers,
     )
+
+
+def _is_valid_carrier_call_id(
+    value: str,
+    *,
+    carrier: Literal["twilio", "vobiz"],
+) -> bool:
+    """Accept only the selected carrier's canonical durable call identifier."""
+
+    if carrier == "twilio":
+        return _TWILIO_CALL_SID_RE.fullmatch(value) is not None
+    if carrier == "vobiz":
+        return _VOBIZ_CALL_UUID_RE.fullmatch(value) is not None and any(
+            character != "0" for character in value if character != "-"
+        )
+    return False
 
 
 def _validate_twilio_sip_identity(

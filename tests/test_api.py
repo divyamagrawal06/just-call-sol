@@ -1142,6 +1142,14 @@ async def test_thread_list_uses_warm_cache_for_exact_running_status_queries(
             status="idle",
             updated_at=0,
         ),
+        ThreadCandidate(
+            thread_id="thread-desktop-current",
+            name="Desktop task",
+            preview="This task is loaded by another Codex app-server process.",
+            cwd="C:/workspace/just-call-sol",
+            status="notLoaded",
+            updated_at=2,
+        ),
         *decoys,
         ThreadCandidate(
             thread_id="thread-active-beyond-cache",
@@ -1160,6 +1168,9 @@ async def test_thread_list_uses_warm_cache_for_exact_running_status_queries(
     running = await api.coordinator.list_threads(
         ThreadListRequest(event_id=event_id, query="running", limit=25)
     )
+    running_tasks = await api.coordinator.list_threads(
+        ThreadListRequest(event_id=event_id, query="running tasks", limit=25)
+    )
     in_progress = await api.coordinator.list_threads(
         ThreadListRequest(event_id=event_id, query="in progress")
     )
@@ -1171,10 +1182,21 @@ async def test_thread_list_uses_warm_cache_for_exact_running_status_queries(
         "thread-running",
         "thread-active-beyond-cache",
     ]
-    assert [item["thread_id"] for item in running["threads"]] == ["thread-running"]
-    assert [item["thread_id"] for item in in_progress["threads"]] == ["thread-running"]
+    assert [item["thread_id"] for item in running["threads"]] == [
+        "thread-running",
+        "thread-desktop-current",
+    ]
+    assert [item["thread_id"] for item in running_tasks["threads"]] == [
+        "thread-running",
+        "thread-desktop-current",
+    ]
+    assert [item["thread_id"] for item in in_progress["threads"]] == [
+        "thread-running",
+        "thread-desktop-current",
+    ]
+    assert "process-local" in str(running["status_note"])
     assert absent["threads"] == []
-    assert api.controller.list_limits[-2:] == [10, 10]
+    assert api.controller.list_limits[-3:] == [10, 10, 10]
     assert api.controller.searches[-2:] == [
         ("active", 10),
         ("definitely-absent", 10),
@@ -1185,7 +1207,7 @@ async def test_thread_list_uses_warm_cache_for_exact_running_status_queries(
         if record.name == "agent_hotline.coordinator"
         and record.getMessage().startswith("voice_list_threads_live_session_guard")
     ]
-    assert len(duration_messages) == 4
+    assert len(duration_messages) == 5
     assert all("duration_ms=" in message for message in duration_messages)
     assert all(event_id not in message for message in duration_messages)
     assert all("running" not in message for message in duration_messages)

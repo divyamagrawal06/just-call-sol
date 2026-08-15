@@ -6,6 +6,7 @@ import pytest
 
 from agent_hotline.contracts import ContactHumanRequest
 from agent_hotline.providers import (
+    CallPlacementOutcomeUnknownError,
     DisabledCallProvider,
     FakeCallProvider,
     OpenAIRealtimeCallProvider,
@@ -13,6 +14,7 @@ from agent_hotline.providers import (
 )
 from agent_hotline.settings import Settings
 from agent_hotline.twilio import TwilioCallResult
+from agent_hotline.vobiz import VobizAPIError, VobizClient
 
 
 def contact_request() -> ContactHumanRequest:
@@ -45,6 +47,25 @@ class RecordingTwilioClient:
 
     async def close(self) -> None:
         self.closed = True
+
+
+@dataclass(slots=True)
+class FailingVobizClient:
+    error: VobizAPIError
+
+    async def place_call(
+        self,
+        event_id: str,
+        request: ContactHumanRequest,
+    ) -> TwilioCallResult:
+        del event_id, request
+        raise self.error
+
+    async def end_call(self, call_uuid: str) -> None:
+        del call_uuid
+
+    async def close(self) -> None:
+        return None
 
 
 @pytest.mark.asyncio
@@ -112,3 +133,72 @@ def test_provider_factory_selects_only_supported_transports() -> None:
     assert isinstance(realtime, OpenAIRealtimeCallProvider)
     assert isinstance(fake, FakeCallProvider)
     assert isinstance(disabled, DisabledCallProvider)
+
+
+@pytest.mark.asyncio
+async def test_provider_factory_selects_vobiz_client_for_vobiz_carrier() -> None:
+    provider = create_call_provider(
+        Settings(
+            _env_file=None,
+            hotline_transport="openai_realtime",
+            hotline_carrier="vobiz",
+            vobiz_auth_id="MA_provider01",
+            vobiz_auth_token="vobiz-provider-factory-token",
+            vobiz_phone_number="+12025550100",
+            owner_phone_number="+12025550199",
+            public_base_url="https://hotline.example.test",
+            hotline_sip_correlation_secret="vobiz-provider-correlation-secret",
+        )
+    )
+
+    try:
+        assert isinstance(provider, OpenAIRealtimeCallProvider)
+        assert isinstance(provider.client, VobizClient)
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_vobiz_unknown_outcome_is_translated_without_exposing_details() -> None:
+    carrier_error = VobizAPIError(
+        "upstream response contained secret=vobiz-sensitive-value",
+        status_code=503,
+        outcome_unknown=True,
+    )
+    provider = OpenAIRealtimeCallProvider(
+        Settings(
+            _env_file=None,
+            hotline_transport="openai_realtime",
+            hotline_carrier="vobiz",
+        ),
+        client=FailingVobizClient(carrier_error),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(CallPlacementOutcomeUnknownError) as exc_info:
+        await provider.place_call("evt_vobiz_unknown", contact_request())
+
+    assert str(exc_info.value) == "carrier call creation has an unknown outcome"
+    assert "vobiz-sensitive-value" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is carrier_error
+
+
+@pytest.mark.asyncio
+async def test_vobiz_definitive_failure_remains_a_carrier_error() -> None:
+    carrier_error = VobizAPIError(
+        "Vobiz returned HTTP 400",
+        status_code=400,
+        outcome_unknown=False,
+    )
+    provider = OpenAIRealtimeCallProvider(
+        Settings(
+            _env_file=None,
+            hotline_transport="openai_realtime",
+            hotline_carrier="vobiz",
+        ),
+        client=FailingVobizClient(carrier_error),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(VobizAPIError) as exc_info:
+        await provider.place_call("evt_vobiz_rejected", contact_request())
+
+    assert exc_info.value is carrier_error

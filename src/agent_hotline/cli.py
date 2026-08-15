@@ -39,6 +39,7 @@ _MANAGED_SECRET_NAMES = (
     "HOTLINE_ACTION_SIGNING_SECRET",
     "HOTLINE_FALLBACK_SIGNING_SECRET",
     "HOTLINE_FALLBACK_WEBHOOK_TOKEN",
+    "VAPI_WEBHOOK_TOKEN",
 )
 _TERMINAL_RESULT_STATUSES = frozenset(
     {
@@ -130,6 +131,7 @@ async def _doctor_live(settings: Settings) -> int:
             OpenAIRealtimeClient,
         )
         from .twilio import TwilioAPIError, TwilioClient
+        from .vobiz import VobizAPIError, VobizClient
 
         if typed_settings.openai_api_key.get_secret_value():
             try:
@@ -147,7 +149,21 @@ async def _doctor_live(settings: Settings) -> int:
             console.print("[yellow]OpenAI Realtime API:[/yellow] key not configured")
             exit_code = 1
 
-        if typed_settings.twilio_configured:
+        if typed_settings.hotline_carrier == "vobiz" and typed_settings.vobiz_configured:
+            try:
+                async with VobizClient(typed_settings) as client:
+                    await client.probe()
+                console.print("[green]Vobiz API:[/green] reachable")
+            except (VobizAPIError, ValueError) as exc:
+                status_code = getattr(exc, "status_code", None)
+                console.print(
+                    f"[yellow]Vobiz API:[/yellow] {exc} (status={status_code or 'network'})"
+                )
+                exit_code = 1
+        elif typed_settings.hotline_carrier == "vobiz":
+            console.print("[yellow]Vobiz API:[/yellow] configuration incomplete")
+            exit_code = 1
+        elif typed_settings.twilio_configured:
             try:
                 async with TwilioClient(typed_settings) as client:
                     await client.probe()

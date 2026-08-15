@@ -137,8 +137,13 @@ _THREAD_ACTIONS: dict[str, tuple[ActionKind, RiskLevel]] = {
 }
 _THREAD_STATUS_QUERY_ALIASES: dict[str, frozenset[str]] = {
     "running": frozenset({"active"}),
+    "running tasks": frozenset({"active"}),
+    "running threads": frozenset({"active"}),
+    "current running tasks": frozenset({"active"}),
+    "current running threads": frozenset({"active"}),
     "in progress": frozenset({"active"}),
 }
+_THREAD_EXTERNAL_STATUS_UNKNOWN = frozenset({"notloaded", "unknown"})
 _VOICE_THREAD_STATUS_QUERY_LIMIT = 10
 _VOICE_THREAD_QUERY_SCAN_LIMIT = 100
 CallTerminationScheduler = Callable[[ContactSession], Awaitable[None]]
@@ -195,6 +200,7 @@ class HotlineCoordinator:
         )
         self._waiters: dict[str, asyncio.Event] = {}
         self._action_execution_locks: dict[str, asyncio.Lock] = {}
+        self._demo_action_locks: dict[str, asyncio.Lock] = {}
         self._placement_link_barriers: set[asyncio.Event] = set()
 
     def bind_call_termination_scheduler(
@@ -805,6 +811,12 @@ class HotlineCoordinator:
             ),
             claims={"event_id": event.event_id},
         )
+        if self.settings.hotline_demo_auto_execute_actions:
+            return await self._demo_auto_execute_prepared_action(
+                prepared,
+                nonce=nonce,
+                impact=impact,
+            )
         return PrepareActionResponse(
             action_id=prepared.action_id,
             action_hash=prepared.action_hash,
@@ -812,6 +824,137 @@ class HotlineCoordinator:
             risk=_contract_risk(prepared.risk.value),
             exact_readback=f"{impact} To confirm, say exactly: {phrase}",
             expires_at=prepared.expires_at,
+        )
+
+    async def _demo_auto_execute_prepared_action(
+        self,
+        prepared: PreparedAction,
+        *,
+        nonce: str,
+        impact: str,
+    ) -> PrepareActionResponse:
+        """Execute one narrowly prepared Codex action in explicit demo mode.
+
+        This path is rejected in production settings. It retains the normal
+        immutable action binding, durable one-time grant, execution receipt,
+        and per-action lock; only the spoken PIN/readback step is skipped.
+        """
+
+        lock = self._demo_action_locks.setdefault(prepared.action_id, asyncio.Lock())
+        async with lock:
+            action = await self.store.get_action(prepared.action_id)
+            if action is None:
+                raise NotFoundError(f"action {prepared.action_id!r} does not exist")
+
+            receipt = await self.store.get_action_execution(action.action_id)
+            if receipt is not None:
+                return self._demo_receipt_response(
+                    action,
+                    receipt,
+                    nonce=nonce,
+                    impact=impact,
+                    already_executed=(
+                        receipt.kind is TimelineKind.ACTION_EXECUTION_SUCCEEDED
+                    ),
+                )
+            if action.state is ActionState.CONSUMED:
+                message = (
+                    "This exact action's one-time grant was already claimed, but its "
+                    "completion is unknown. It was not retried."
+                )
+                return PrepareActionResponse(
+                    action_id=action.action_id,
+                    action_hash=action.action_hash,
+                    confirmation_nonce=nonce,
+                    risk=_contract_risk(action.risk.value),
+                    exact_readback=f"{impact} {message}",
+                    expires_at=action.expires_at,
+                    message_to_user=message,
+                    result={"status": "outcome_unknown", "retryable": False},
+                )
+            if action.state is ActionState.PREPARED:
+                grant = await self.store.confirm_action(
+                    action.action_id,
+                    owner_ref="owner_demo_auto_execute",
+                    confirmation_method=ConfirmationMethod.TRUSTED_LOCAL,
+                    confirmation_hash=action.confirmation_phrase_hash,
+                )
+            elif action.state is ActionState.CONFIRMED:
+                grant = await self.store.get_grant_for_action(action.action_id)
+                if grant is None:
+                    raise RuntimeError("confirmed demo action has no durable grant")
+            else:
+                message = (
+                    f"This demo action is {action.state.value} and cannot execute. "
+                    "No action was run."
+                )
+                return PrepareActionResponse(
+                    action_id=action.action_id,
+                    action_hash=action.action_hash,
+                    confirmation_nonce=nonce,
+                    risk=_contract_risk(action.risk.value),
+                    exact_readback=f"{impact} {message}",
+                    expires_at=action.expires_at,
+                    message_to_user=message,
+                    result={"status": action.state.value, "retryable": False},
+                )
+
+            execution = await self.execute_action(
+                ExecuteActionRequest(
+                    event_id=action.event_id,
+                    action_id=action.action_id,
+                    grant_id=grant.grant_id,
+                )
+            )
+            return PrepareActionResponse(
+                action_id=action.action_id,
+                action_hash=action.action_hash,
+                confirmation_nonce=nonce,
+                risk=_contract_risk(action.risk.value),
+                exact_readback=f"{impact} {execution.message_to_user}",
+                expires_at=action.expires_at,
+                executed=execution.executed,
+                already_executed=False,
+                grant_id=execution.grant_id,
+                operation_id=execution.operation_id,
+                message_to_user=execution.message_to_user,
+                result=execution.result,
+            )
+
+    @staticmethod
+    def _demo_receipt_response(
+        prepared: PreparedAction,
+        receipt: TimelineEntry,
+        *,
+        nonce: str,
+        impact: str,
+        already_executed: bool,
+    ) -> PrepareActionResponse:
+        succeeded = receipt.kind is TimelineKind.ACTION_EXECUTION_SUCCEEDED
+        stored_message = receipt.details.get("message_to_user")
+        message = (
+            stored_message
+            if isinstance(stored_message, str)
+            else ("The demo action completed." if succeeded else "The demo action failed.")
+        )
+        stored_operation_id = receipt.details.get("operation_id")
+        stored_result = receipt.details.get("result")
+        grant_id = receipt.details.get("grant_id")
+        return PrepareActionResponse(
+            action_id=prepared.action_id,
+            action_hash=prepared.action_hash,
+            confirmation_nonce=nonce,
+            risk=_contract_risk(prepared.risk.value),
+            exact_readback=f"{impact} {message}",
+            expires_at=prepared.expires_at,
+            executed=succeeded,
+            already_executed=succeeded and already_executed,
+            grant_id=grant_id if isinstance(grant_id, str) else None,
+            operation_id=(
+                stored_operation_id if isinstance(stored_operation_id, str) else None
+            ),
+            message_to_user=message,
+            result=dict(stored_result) if isinstance(stored_result, dict) else {},
         )
 
     async def _bind_thread_action(
@@ -990,7 +1133,13 @@ class HotlineCoordinator:
                 else:
                     result = await self._execute_thread_action(action)
                     operation_id = f"codex-{action.action_id}"
-                    message = f"Codex task action completed: {result['action']}."
+                    if result.get("turn_start_queued") is True:
+                        message = (
+                            "Codex task created; its first turn is starting in the "
+                            "background."
+                        )
+                    else:
+                        message = f"Codex task action completed: {result['action']}."
             except ThreadStateError as exc:
                 receipt = await self.store.record_action_execution(
                     action.action_id,
@@ -1194,10 +1343,22 @@ class HotlineCoordinator:
                     else request.limit
                 )
             )
+        status_note: str | None = None
         if query:
             if status_aliases is not None:
-                candidates = tuple(
+                locally_active = tuple(
                     item for item in candidates if item.status.casefold() in status_aliases
+                )
+                externally_observed = tuple(
+                    item
+                    for item in candidates
+                    if item.status.casefold() in _THREAD_EXTERNAL_STATUS_UNKNOWN
+                )
+                candidates = locally_active + externally_observed
+                status_note = (
+                    "Codex activity status is process-local. active is confirmed in the "
+                    "Better Call Sol process; notLoaded or unknown tasks may be active in "
+                    "the Codex desktop app or may be idle."
                 )
             else:
                 candidates = tuple(
@@ -1214,7 +1375,7 @@ class HotlineCoordinator:
                         )
                     ).casefold()
                 )
-        return {
+        response: dict[str, JsonValue] = {
             "threads": [
                 {
                     "thread_id": item.thread_id,
@@ -1247,6 +1408,9 @@ class HotlineCoordinator:
                 for item in candidates[: request.limit]
             ]
         }
+        if status_note is not None:
+            response["status_note"] = status_note
+        return response
 
     async def inspect_thread(self, request: ThreadInspectRequest) -> dict[str, JsonValue]:
         await self._require_live_voice_read_session(request.event_id)
@@ -1264,7 +1428,7 @@ class HotlineCoordinator:
                     turn_summaries.append(
                         {
                             "turn_id": _json_scalar(turn.get("id")),
-                            "status": _json_scalar(turn.get("status")),
+                            "status": _json_status(turn.get("status")),
                         }
                     )
         return {
@@ -1276,7 +1440,7 @@ class HotlineCoordinator:
                 known_secrets=self._known_secrets(),
             ),
             "workspace": Path(str(thread.get("cwd") or ".")).name,
-            "status": _json_scalar(thread.get("status")),
+            "status": _json_status(thread.get("status")),
             "recent_turns": turn_summaries,
         }
 
@@ -1631,11 +1795,14 @@ class HotlineCoordinator:
             )
         else:
             raise ValueError("unsupported thread action")
-        return {
+        payload: dict[str, JsonValue] = {
             "action": result.action,
             "thread_id": result.thread_id,
             "turn_id": result.turn_id,
         }
+        if result.response.get("turn_start_queued") is True:
+            payload["turn_start_queued"] = True
+        return payload
 
     async def _wait_for_result(
         self,
@@ -2404,3 +2571,11 @@ def _json_scalar(value: object) -> JsonValue:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return str(value)[:500]
+
+
+def _json_status(value: object) -> JsonValue:
+    if isinstance(value, Mapping):
+        status_type = value.get("type")
+        if isinstance(status_type, str):
+            return status_type[:100]
+    return _json_scalar(value)

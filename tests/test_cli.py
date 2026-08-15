@@ -195,6 +195,7 @@ def test_posix_init_secrets_merges_unknown_settings_and_is_idempotent(
             "generated-sip-correlation-token",
             "generated-fallback-signing-token",
             "generated-fallback-webhook-token",
+            "generated-vapi-webhook-token",
         )
     )
     generation_calls: list[int] = []
@@ -213,7 +214,7 @@ def test_posix_init_secrets_merges_unknown_settings_and_is_idempotent(
     assert first.exit_code == 0
     assert second.exit_code == 0
     assert first_content == second_content
-    assert generation_calls == [32, 32, 32]
+    assert generation_calls == [32, 32, 32, 32]
     assert "# User-owned provider settings must remain byte-for-byte.\n" in first_content
     assert "export OPENAI_API_KEY='keep-openai-key'\n" in first_content
     assert "UNKNOWN_SETTING=keep-this-value\n" in first_content
@@ -222,6 +223,7 @@ def test_posix_init_secrets_merges_unknown_settings_and_is_idempotent(
     assert "HOTLINE_SIP_CORRELATION_SECRET=generated-sip-correlation-token\n" in first_content
     assert "HOTLINE_FALLBACK_SIGNING_SECRET=generated-fallback-signing-token\n" in first_content
     assert "HOTLINE_FALLBACK_WEBHOOK_TOKEN=generated-fallback-webhook-token\n" in first_content
+    assert "VAPI_WEBHOOK_TOKEN=generated-vapi-webhook-token\n" in first_content
     for name in cli._MANAGED_SECRET_NAMES:
         assert first_content.count(f"{name}=") == 1
     if cli.os.name != "nt":
@@ -232,6 +234,7 @@ def test_posix_init_secrets_merges_unknown_settings_and_is_idempotent(
         "generated-sip-correlation-token",
         "generated-fallback-signing-token",
         "generated-fallback-webhook-token",
+        "generated-vapi-webhook-token",
     ):
         assert secret not in first.output
         assert secret not in second.output

@@ -29,6 +29,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol, cast
+from urllib.parse import quote
 
 from .codex_protocol import (
     AmbiguousThreadError,
@@ -66,6 +67,43 @@ _BOUNDED_THREAD_TURN_LIMIT = 10
 _DEFAULT_VOICE_CANDIDATE_CACHE_TTL_SECONDS = 15.0
 _DEFAULT_VOICE_LIST_TIMEOUT_SECONDS = 25.0
 _THREAD_ID_PATTERN = re.compile(r"^(?:thread-[A-Za-z0-9._:-]+|[0-9a-fA-F]{8}-[0-9a-fA-F-]{20,})$")
+_ALL_THREAD_SOURCE_KINDS = (
+    "cli",
+    "vscode",
+    "exec",
+    "appServer",
+    "subAgent",
+    "subAgentReview",
+    "subAgentCompact",
+    "subAgentThreadSpawn",
+    "subAgentOther",
+    "unknown",
+)
+
+
+def open_codex_desktop_thread(thread_id: str) -> None:
+    """Open one persisted Codex task in the desktop app on Windows."""
+
+    if not _THREAD_ID_PATTERN.fullmatch(thread_id):
+        raise ValueError("thread_id is not a supported Codex task identifier")
+    if os.name != "nt":
+        raise OSError("automatic Codex desktop navigation is only supported on Windows")
+    explorer = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "explorer.exe"
+    if not explorer.is_file():
+        raise OSError("Windows Explorer URL launcher is unavailable")
+    # Explorer reliably forwards the URI to the interactive packaged app even
+    # when the Hotline daemon itself was launched in the background. ShellExecute
+    # via os.startfile can return successfully without activating Codex there.
+    subprocess.run(
+        [str(explorer), f"codex://threads/{quote(thread_id, safe='')}"],
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=10.0,
+    )
+    # Explorer returns before Codex Desktop has consumed the deep link.
+    time.sleep(1.0)
 
 # This is intentionally narrower than the full app-server protocol.  Do not add
 # command/exec, process/spawn, thread/shellCommand, fs/*, or dynamic tool calls.
@@ -1166,12 +1204,18 @@ class SafeThreadController:
         max_instruction_chars: int = 12_000,
         voice_candidate_cache_ttl_seconds: float = (_DEFAULT_VOICE_CANDIDATE_CACHE_TTL_SECONDS),
         voice_list_timeout_seconds: float = _DEFAULT_VOICE_LIST_TIMEOUT_SECONDS,
+        spawned_thread_opener: Callable[[str], None] | None = None,
+        spawn_turn_start_wait_seconds: float = 2.0,
     ) -> None:
         if not workspace_roots:
             raise ValueError("at least one workspace root is required")
         if max_instruction_chars <= 0:
             raise ValueError("max_instruction_chars must be positive")
-        if voice_candidate_cache_ttl_seconds <= 0 or voice_list_timeout_seconds <= 0:
+        if (
+            voice_candidate_cache_ttl_seconds <= 0
+            or voice_list_timeout_seconds <= 0
+            or spawn_turn_start_wait_seconds <= 0
+        ):
             raise ValueError("voice candidate cache timing must be positive")
         self.client = client
         self.workspace_roots = tuple(
@@ -1180,6 +1224,8 @@ class SafeThreadController:
         self.max_instruction_chars = max_instruction_chars
         self.voice_candidate_cache_ttl_seconds = voice_candidate_cache_ttl_seconds
         self.voice_list_timeout_seconds = voice_list_timeout_seconds
+        self.spawned_thread_opener = spawned_thread_opener
+        self.spawn_turn_start_wait_seconds = spawn_turn_start_wait_seconds
         self._voice_candidate_cache: tuple[ThreadCandidate, ...] = ()
         self._voice_candidate_cache_expires_at = 0.0
         self._voice_candidate_cache_epoch = 0
@@ -1187,6 +1233,16 @@ class SafeThreadController:
         self._voice_candidate_refresh_task: (
             asyncio.Task[tuple[ThreadCandidate, ...] | None] | None
         ) = None
+        self._spawn_navigation_tasks: set[asyncio.Task[None]] = set()
+        self._last_spawn_navigation_state = "idle"
+
+    def spawn_navigation_status(self) -> dict[str, JSONValue]:
+        """Return non-sensitive diagnostics for Desktop task activation."""
+
+        return {
+            "state": self._last_spawn_navigation_state,
+            "pending": len(self._spawn_navigation_tasks),
+        }
 
     async def list_candidates(
         self, *, limit: int = 100, archived: bool = False
@@ -1315,6 +1371,7 @@ class SafeThreadController:
                 search_term=search_term,
                 sort_key="updated_at",
                 sort_direction="desc",
+                source_kinds=_ALL_THREAD_SOURCE_KINDS,
                 request_timeout=request_timeout,
             )
         finally:
@@ -1361,11 +1418,6 @@ class SafeThreadController:
         if not needle:
             raise ThreadNotFoundError("thread reference is empty")
         folded = needle.casefold()
-        candidates = await self._voice_candidates()
-
-        exact_id = [candidate for candidate in candidates if candidate.thread_id == needle]
-        if len(exact_id) == 1:
-            return exact_id[0]
         if _THREAD_ID_PATTERN.fullmatch(needle):
             try:
                 response = await self.client.thread_read(needle, include_turns=False)
@@ -1378,6 +1430,11 @@ class SafeThreadController:
                     candidate = self._candidate_from_thread(thread)
                     if candidate is not None and candidate.thread_id == needle:
                         return candidate
+
+        candidates = await self._voice_candidates()
+        exact_id = [candidate for candidate in candidates if candidate.thread_id == needle]
+        if len(exact_id) == 1:
+            return exact_id[0]
 
         candidates = await self.search_candidates(needle, limit=25)
 
@@ -1475,13 +1532,38 @@ class SafeThreadController:
         if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
             raise CodexAppServerProtocolError("thread/start omitted thread.id")
         thread_id = cast(str, thread["id"])
-        try:
-            turn = await self.client.turn_start(
+        completion_subscription = self.client.subscribe("turn/completed", max_queue=100)
+        turn_start_task = asyncio.create_task(
+            self.client.turn_start(
                 thread_id,
                 instruction,
                 effort=effort,
+            ),
+            name=f"agent-hotline-start-spawned-turn-{thread_id}",
+        )
+        try:
+            async with asyncio.timeout(self.spawn_turn_start_wait_seconds):
+                turn = await asyncio.shield(turn_start_task)
+        except TimeoutError:
+            self._last_spawn_navigation_state = "starting_turn"
+            continuation = asyncio.create_task(
+                self._finish_deferred_spawn(
+                    thread_id=thread_id,
+                    turn_start_task=turn_start_task,
+                    completion_subscription=completion_subscription,
+                ),
+                name=f"agent-hotline-finish-spawned-turn-{thread_id}",
+            )
+            self._spawn_navigation_tasks.add(continuation)
+            continuation.add_done_callback(self._spawn_navigation_tasks.discard)
+            return ThreadControlResult(
+                action="spawned",
+                thread_id=thread_id,
+                turn_id=None,
+                response={"thread": thread, "turn_start_queued": True},
             )
         except Exception as exc:
+            await completion_subscription.close()
             try:
                 await self.client.thread_archive(thread_id)
             except Exception as archive_exc:
@@ -1493,12 +1575,116 @@ class SafeThreadController:
                 "root task creation failed; the empty task was archived"
             ) from exc
         turn_id = _turn_id_from_response(turn)
+        if self.spawned_thread_opener is not None and turn_id is not None:
+            self._last_spawn_navigation_state = "waiting_for_durable_turn"
+            navigation_task = asyncio.create_task(
+                self._open_spawned_thread_when_durable(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    completion_subscription=completion_subscription,
+                )
+            )
+            self._spawn_navigation_tasks.add(navigation_task)
+            navigation_task.add_done_callback(self._spawn_navigation_tasks.discard)
+        else:
+            await completion_subscription.close()
         return ThreadControlResult(
             action="spawned",
             thread_id=thread_id,
             turn_id=turn_id,
             response=turn,
         )
+
+    async def _finish_deferred_spawn(
+        self,
+        *,
+        thread_id: str,
+        turn_start_task: asyncio.Task[dict[str, JSONValue]],
+        completion_subscription: NotificationSubscription,
+    ) -> None:
+        """Finish a slow turn submission after the voice tool response returns."""
+
+        try:
+            turn = await turn_start_task
+        except asyncio.CancelledError:
+            await completion_subscription.close()
+            raise
+        except Exception as exc:
+            await completion_subscription.close()
+            with contextlib.suppress(Exception):
+                await self.client.thread_archive(thread_id)
+            self.invalidate_voice_candidate_cache()
+            self._last_spawn_navigation_state = "turn_start_failed"
+            logger.warning(
+                "Deferred spawned Codex turn failed thread_id=%s error_type=%s",
+                thread_id,
+                type(exc).__name__,
+            )
+            return
+
+        turn_id = _turn_id_from_response(turn)
+        if self.spawned_thread_opener is None or turn_id is None:
+            await completion_subscription.close()
+            self._last_spawn_navigation_state = "turn_started"
+            return
+        self._last_spawn_navigation_state = "waiting_for_durable_turn"
+        await self._open_spawned_thread_when_durable(
+            thread_id=thread_id,
+            turn_id=turn_id,
+            completion_subscription=completion_subscription,
+        )
+
+    async def _open_spawned_thread_when_durable(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str,
+        completion_subscription: NotificationSubscription,
+    ) -> None:
+        """Open a spawned task once its first turn is durable and safe to load."""
+
+        try:
+            completion_matched = False
+            async with completion_subscription, asyncio.timeout(3600.0):
+                async for notification in completion_subscription:
+                    params = notification.params
+                    if not isinstance(params, Mapping):
+                        continue
+                    completed_thread_id = params.get("threadId")
+                    completed_turn_id = params.get("turnId")
+                    thread_payload = params.get("thread")
+                    turn_payload = params.get("turn")
+                    if not isinstance(completed_thread_id, str) and isinstance(
+                        thread_payload, Mapping
+                    ):
+                        completed_thread_id = thread_payload.get("id")
+                    if not isinstance(completed_turn_id, str) and isinstance(
+                        turn_payload, Mapping
+                    ):
+                        completed_turn_id = turn_payload.get("id")
+                    if completed_thread_id == thread_id and completed_turn_id == turn_id:
+                        completion_matched = True
+                        break
+            if not completion_matched:
+                self._last_spawn_navigation_state = "cancelled"
+                return
+            self._last_spawn_navigation_state = "opening"
+            opener = self.spawned_thread_opener
+            if opener is not None:
+                await asyncio.to_thread(opener, thread_id)
+            self._last_spawn_navigation_state = "opened"
+        except TimeoutError:
+            self._last_spawn_navigation_state = "timed_out"
+            logger.warning("Timed out waiting to open spawned Codex task in Desktop")
+        except asyncio.CancelledError:
+            self._last_spawn_navigation_state = "cancelled"
+            raise
+        except Exception as exc:
+            self._last_spawn_navigation_state = "failed"
+            logger.warning(
+                "Codex task was spawned but desktop navigation failed: %s",
+                type(exc).__name__,
+            )
 
     async def send_instruction(self, reference: str, instruction: str) -> ThreadControlResult:
         """Start on an idle thread or steer its one known active turn."""
@@ -1576,6 +1762,13 @@ class SafeThreadController:
                 raise ThreadStateError("idle thread unexpectedly exposes an in-progress turn")
             operation = "start"
             turn_id = None
+        elif status == "notLoaded":
+            if active_turn_ids:
+                raise ThreadStateError(
+                    "unloaded thread unexpectedly exposes an in-progress turn"
+                )
+            operation = "resume_start"
+            turn_id = None
         else:
             raise ThreadStateError(f"thread {candidate.thread_id} cannot be prepared in {status!r}")
         cwd = cast(str, thread["cwd"])
@@ -1593,7 +1786,7 @@ class SafeThreadController:
 
         _require_identifier(plan.thread_id, "thread_id")
         text = self._validate_instruction(plan.instruction)
-        if plan.operation not in {"start", "steer"}:
+        if plan.operation not in {"start", "steer", "resume_start"}:
             raise ValueError("unsupported prepared instruction operation")
         response = await self._read_bounded_thread_state(plan.thread_id)
         thread = response.get("thread")
@@ -1620,9 +1813,30 @@ class SafeThreadController:
             )
             action = "steered"
             result_turn_id = plan.turn_id
-        else:
+        elif plan.operation == "start":
             if status != "idle" or active_turn_ids or plan.turn_id is not None:
                 raise ThreadStateError("confirmed idle task is no longer idle")
+            result = await self.client.turn_start(plan.thread_id, text)
+            action = "started"
+            result_turn_id = _turn_id_from_response(result)
+        else:
+            if status != "notLoaded" or active_turn_ids or plan.turn_id is not None:
+                raise ThreadStateError("confirmed unloaded task is no longer unloaded")
+            resumed = await self.client.thread_resume(
+                plan.thread_id,
+                exclude_turns=True,
+            )
+            resumed_thread = resumed.get("thread")
+            if not isinstance(resumed_thread, dict):
+                raise CodexAppServerProtocolError("thread/resume omitted thread")
+            resumed_cwd = resumed_thread.get("cwd")
+            if not isinstance(resumed_cwd, str) or self.canonicalize_workspace(
+                resumed_cwd
+            ) != self.canonicalize_workspace(plan.cwd):
+                raise ThreadStateError("resumed task moved to a different workspace")
+            if _thread_status(resumed_thread) != "idle":
+                raise ThreadStateError("resumed task is not idle")
+            self.invalidate_voice_candidate_cache()
             result = await self.client.turn_start(plan.thread_id, text)
             action = "started"
             result_turn_id = _turn_id_from_response(result)
@@ -1865,4 +2079,5 @@ __all__ = [
     "CodexAppServerClient",
     "NotificationSubscription",
     "SafeThreadController",
+    "open_codex_desktop_thread",
 ]

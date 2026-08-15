@@ -29,6 +29,18 @@ _TWILIO_READY_VALUES: dict[str, object] = {
     "hotline_sip_correlation_secret": "correlation-ready-sentinel-1234567890",
 }
 
+_VOBIZ_READY_VALUES: dict[str, object] = {
+    "hotline_carrier": "vobiz",
+    "vobiz_auth_id": "MA_READY1234",
+    "vobiz_auth_token": "vobiz-auth-ready-sentinel",
+    "vobiz_phone_number": "+12025550124",
+    "owner_phone_number": "+12025550123",
+    "openai_project_id": "proj_ready123",
+    "openai_webhook_secret": "whsec-openai-ready-sentinel",
+    "public_base_url": "https://hotline.example.test",
+    "hotline_sip_correlation_secret": "correlation-ready-sentinel-1234567890",
+}
+
 _LOCAL_READY_VALUES: dict[str, object] = {
     "hotline_local_token": "local-ready-sentinel-12345678901234",
 }
@@ -94,6 +106,21 @@ def test_media_stream_mode_does_not_require_an_openai_webhook_secret() -> None:
     assert _settings(**values).openai_realtime_runtime_ready is True
 
 
+def test_openai_realtime_runtime_is_ready_with_vobiz_prerequisites() -> None:
+    values = {
+        **_OPENAI_READY_VALUES,
+        **_VOBIZ_READY_VALUES,
+        **_LOCAL_READY_VALUES,
+    }
+
+    settings = _settings(**values)
+
+    assert settings.hotline_carrier == "vobiz"
+    assert settings.vobiz_configured is True
+    assert settings.carrier_configured is True
+    assert settings.openai_realtime_runtime_ready is True
+
+
 def test_openai_realtime_allows_only_one_active_call() -> None:
     assert _settings().hotline_max_active_calls == 1
     with pytest.raises(ValidationError, match="less than or equal to 1"):
@@ -119,6 +146,34 @@ def test_twilio_is_not_configured_when_a_prerequisite_is_missing(missing: str) -
     values = {**_TWILIO_READY_VALUES, missing: ""}
 
     assert _settings(**values).twilio_configured is False
+
+
+@pytest.mark.parametrize(
+    "missing",
+    tuple(key for key in _VOBIZ_READY_VALUES if key != "hotline_carrier"),
+)
+def test_vobiz_is_not_configured_when_a_prerequisite_is_missing(missing: str) -> None:
+    values = {**_VOBIZ_READY_VALUES, missing: ""}
+
+    settings = _settings(**values)
+
+    assert settings.vobiz_configured is False
+    assert settings.carrier_configured is False
+
+
+def test_production_rejects_demo_auto_execution() -> None:
+    with pytest.raises(ValidationError, match="cannot be enabled in production"):
+        _settings(
+            hotline_env="production",
+            hotline_demo_auto_execute_actions=True,
+        )
+
+
+def test_vapi_and_hotline_secrets_must_be_independent() -> None:
+    shared = "shared-webhook-secret-sentinel-1234567890"
+
+    with pytest.raises(ValidationError, match="pairwise distinct"):
+        _settings(hotline_sip_correlation_secret=shared, vapi_webhook_token=shared)
 
 
 def test_diagnostics_report_presence_without_exposing_configuration_values() -> None:

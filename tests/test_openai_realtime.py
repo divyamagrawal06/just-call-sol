@@ -67,6 +67,7 @@ from agent_hotline.storage import (
 )
 from agent_hotline.telephony_security import build_correlation_signature
 from agent_hotline.twilio_media import TwilioMediaEvent, TwilioMediaStart
+from agent_hotline.vobiz import encode_vobiz_sip_header_value
 
 OPENAI_API_KEY = "sk-openai-realtime-test-secret"
 OPENAI_WEBHOOK_SECRET = "whsec-openai-realtime-test-secret"
@@ -77,6 +78,7 @@ ALLOWLISTED_PHONE = "+12025550124"
 TWILIO_CALL_SID = "CA" + ("b" * 32)
 TWILIO_CHILD_CALL_SID = "CA" + ("c" * 32)
 TWILIO_ACCOUNT_SID = "AC" + ("a" * 32)
+VOBIZ_CALL_UUID = "550e8400-e29b-41d4-a716-446655440000"
 
 
 def configured_settings(**overrides: object) -> Settings:
@@ -1626,6 +1628,194 @@ async def test_outbound_signed_parent_correlates_distinct_twilio_child_leg(
     assert linked.state is SessionState.CONNECTED
     current_event = await store.require_event(event.event_id)
     assert current_event.state is EventState.AWAITING_DECISION
+
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_vobiz_outbound_uuid_uses_signed_durable_correlation_without_twilio_identity(
+    store: SQLiteStore,
+) -> None:
+    settings = configured_settings(hotline_carrier="vobiz")
+    event = EscalationEvent(
+        kind="approval",
+        summary="The Vobiz carrier leg is ready.",
+        question="Approve the exact outbound operation?",
+    )
+    await store.create_event(event)
+    await store.transition_event(event.event_id, EventState.QUEUED)
+    await store.transition_event(event.event_id, EventState.DIALING)
+    session = await store.create_session(
+        ContactSession(
+            event_id=event.event_id,
+            direction=ContactDirection.OUTBOUND_ESCALATION,
+            state=SessionState.DIALING,
+            attempt_id=VOBIZ_CALL_UUID,
+            provider="openai_realtime",
+        )
+    )
+    signature = build_correlation_signature(
+        CALLBACK_TOKEN,
+        direction="outbound",
+        call_sid=VOBIZ_CALL_UUID,
+        event_id=event.event_id,
+    )
+    payload = incoming_webhook(
+        call_id="call_vobiz_outbound_openai",
+        event_id="evt_vobiz_outbound_webhook",
+        extra_headers={
+            "X-VH-HotlineDirection": encode_vobiz_sip_header_value("outbound"),
+            "X-VH-HotlineCallSid": encode_vobiz_sip_header_value(VOBIZ_CALL_UUID),
+            "X-VH-HotlineEventId": encode_vobiz_sip_header_value(event.event_id),
+            "X-VH-HotlineSignature": encode_vobiz_sip_header_value(signature),
+        },
+    )
+    payload["data"]["sip_headers"] = [
+        header
+        for header in payload["data"]["sip_headers"]
+        if not header["name"].casefold().startswith("x-twilio-")
+    ]
+    client = FakeControlClient()
+    sockets = FakeSocketFactory()
+    manager = OpenAIRealtimeManager(
+        settings=settings,
+        store=store,
+        coordinator=real_coordinator(settings, store),
+        client=cast(Any, client),
+        socket_factory=sockets,
+    )
+
+    result = await manager.handle_webhook(
+        webhook_bytes(payload),
+        verified_headers("wh_vobiz_outbound"),
+    )
+    await wait_until(lambda: bool(sockets.connections))
+
+    assert result.accepted and result.event_id == event.event_id
+    assert client.rejected == []
+    linked = await store.get_session(session.session_id)
+    assert linked is not None
+    assert linked.attempt_id == VOBIZ_CALL_UUID
+    assert linked.interaction_id == "call_vobiz_outbound_openai"
+    assert linked.state is SessionState.CONNECTED
+
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_twilio_signed_correlation_still_requires_twilio_sip_identity(
+    store: SQLiteStore,
+) -> None:
+    settings = configured_settings(hotline_carrier="twilio")
+    payload = await admitted_incoming_webhook(
+        store,
+        call_id="call_twilio_missing_identity",
+        event_id="evt_twilio_missing_identity",
+    )
+    payload["data"]["sip_headers"] = [
+        header
+        for header in payload["data"]["sip_headers"]
+        if not header["name"].casefold().startswith("x-twilio-")
+    ]
+    client = FakeControlClient()
+    manager = OpenAIRealtimeManager(
+        settings=settings,
+        store=store,
+        coordinator=real_coordinator(settings, store),
+        client=cast(Any, client),
+        socket_factory=FakeSocketFactory(),
+    )
+
+    result = await manager.handle_webhook(
+        webhook_bytes(payload),
+        verified_headers("wh_twilio_missing_identity"),
+    )
+
+    assert result.handled and not result.accepted
+    assert result.reason == "verified Twilio SIP identity is required"
+    assert client.accepted == []
+    assert client.rejected == [("call_twilio_missing_identity", 403)]
+
+    await manager.close()
+
+
+@pytest.mark.parametrize(
+    "call_id",
+    [
+        "550e8400e29b41d4a716446655440000",
+        "550e8400-e29b-41d4-a716-44665544000z",
+        "550e8400-e29b-41d4-a716-446655440000/extra",
+        "00000000-0000-0000-0000-000000000000",
+        TWILIO_CALL_SID,
+    ],
+)
+@pytest.mark.asyncio
+async def test_vobiz_parent_binding_rejects_noncanonical_or_cross_carrier_ids(
+    store: SQLiteStore,
+    call_id: str,
+) -> None:
+    settings = configured_settings(hotline_carrier="vobiz")
+    manager = OpenAIRealtimeManager(
+        settings=settings,
+        store=store,
+        coordinator=real_coordinator(settings, store),
+        client=cast(Any, FakeControlClient()),
+        socket_factory=FakeSocketFactory(),
+    )
+
+    with pytest.raises(realtime.IncomingCallError, match="carrier parent ID is invalid"):
+        await manager.bind_outbound_carrier_parent(
+            event_id="evt_unused_after_invalid_carrier_id",
+            call_sid=call_id,
+        )
+
+    await manager.close()
+
+
+@pytest.mark.parametrize("carrier_status", ["completed", "cancel", "timeout"])
+@pytest.mark.asyncio
+async def test_vobiz_terminal_status_emits_carrier_specific_provider_evidence(
+    store: SQLiteStore,
+    carrier_status: str,
+) -> None:
+    settings = configured_settings(hotline_carrier="vobiz")
+    event = EscalationEvent(
+        kind="status",
+        summary="The Vobiz carrier status is terminal.",
+        blocking=False,
+    )
+    await store.create_event(event)
+    await store.transition_event(event.event_id, EventState.QUEUED)
+    await store.transition_event(event.event_id, EventState.DIALING)
+    await store.create_session(
+        ContactSession(
+            event_id=event.event_id,
+            direction=ContactDirection.OUTBOUND_ESCALATION,
+            state=SessionState.DIALING,
+            attempt_id=VOBIZ_CALL_UUID,
+            provider="openai_realtime",
+        )
+    )
+    manager = OpenAIRealtimeManager(
+        settings=settings,
+        store=store,
+        coordinator=real_coordinator(settings, store),
+        client=cast(Any, FakeControlClient()),
+        socket_factory=FakeSocketFactory(),
+    )
+
+    result = await manager.handle_carrier_status(
+        call_sid=VOBIZ_CALL_UUID,
+        status=carrier_status,
+        receipt_id=f"receipt_vobiz_{carrier_status}",
+        correlated_event_id=event.event_id,
+    )
+
+    assert result["accepted"] is True
+    webhook = await store.get_webhook(f"vobiz:receipt_vobiz_{carrier_status}")
+    assert webhook is not None
+    assert webhook.provider == "vobiz_openai_realtime"
+    assert webhook.metadata == {"source": "vobiz_status_callback"}
 
     await manager.close()
 

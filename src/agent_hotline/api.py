@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mappin
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from urllib.parse import parse_qsl
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket
@@ -25,7 +25,11 @@ from pydantic import ValidationError
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import __version__
-from .codex_app_server import CodexAppServerClient, SafeThreadController
+from .codex_app_server import (
+    CodexAppServerClient,
+    SafeThreadController,
+    open_codex_desktop_thread,
+)
 from .codex_bridge import VoiceApprovalHandler, register_voice_callbacks
 from .contracts import (
     ContactHumanRequest,
@@ -72,10 +76,30 @@ from .twilio import (
     verify_twilio_websocket_signature,
 )
 from .twilio_media import TwilioMediaProtocolError, TwilioMediaStream
+from .vapi import VapiAdapter
+from .vobiz import (
+    VOBIZ_HANGUP_CALLBACK_PATH,
+    VOBIZ_INBOUND_VOICE_PATH,
+    VOBIZ_OUTBOUND_VOICE_PATH,
+    VOBIZ_RING_CALLBACK_PATH,
+    build_inbound_bridge_xml,
+    build_outbound_bridge_xml,
+    validate_vobiz_auth_id,
+    validate_vobiz_call_uuid,
+    verify_answer_event_signature,
+    verify_hangup_event_signature,
+    verify_ring_event_signature,
+    verify_vobiz_webhook_headers,
+)
+from .vobiz import (
+    normalize_e164 as normalize_vobiz_e164,
+)
 from .watchdog import AgentFailureWatchdog
 
 logger = logging.getLogger(__name__)
 _MAX_BODY_BYTES = 64 * 1024
+_VAPI_MAX_BODY_BYTES = 512 * 1024
+_VAPI_WEBHOOK_PATH = "/v1/vapi/webhook"
 _CODEX_THREAD_PREWARM_TIMEOUT_SECONDS = 60.0
 _FALLBACK_ASSET_DIRECTORY = Path(__file__).with_name("fallback_assets")
 _FALLBACK_SECURITY_HEADERS = {
@@ -94,19 +118,30 @@ _FALLBACK_SECURITY_HEADERS = {
 class BodySizeLimitMiddleware:
     """Enforce a hard request-body bound for both fixed and chunked requests."""
 
-    def __init__(self, app: ASGIApp, max_bytes: int = _MAX_BODY_BYTES) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        max_bytes: int = _MAX_BODY_BYTES,
+        vapi_max_bytes: int = _VAPI_MAX_BODY_BYTES,
+    ) -> None:
         self.app = app
         self.max_bytes = max_bytes
+        self.vapi_max_bytes = vapi_max_bytes
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+        max_bytes = (
+            self.vapi_max_bytes
+            if scope.get("path") == _VAPI_WEBHOOK_PATH
+            else self.max_bytes
+        )
         headers = dict(scope.get("headers") or [])
         raw_length = headers.get(b"content-length")
         if raw_length is not None:
             try:
-                if int(raw_length) > self.max_bytes:
+                if int(raw_length) > max_bytes:
                     await _send_too_large(send)
                     return
             except ValueError:
@@ -123,7 +158,7 @@ class BodySizeLimitMiddleware:
             if message["type"] != "http.request":
                 continue
             received += len(message.get("body", b""))
-            if received > self.max_bytes:
+            if received > max_bytes:
                 await _send_too_large(send)
                 return
             more_body = bool(message.get("more_body", False))
@@ -178,7 +213,7 @@ async def _runtime_lifespan(app: FastAPI) -> AsyncIterator[None]:
         and not settings.openai_realtime_runtime_ready
     ):
         raise RuntimeError(
-            "OpenAI Realtime transport requires complete OpenAI, Twilio, public URL, "
+            "OpenAI Realtime transport requires complete OpenAI, carrier, public URL, "
             "owner, PIN, local-token, and independent signing-secret configuration"
         )
     settings.ensure_runtime_directory()
@@ -215,9 +250,14 @@ async def _runtime_lifespan(app: FastAPI) -> AsyncIterator[None]:
             cleanup.push_async_callback(codex.close)
             controller_roots = configured_roots or ((explicit_cwd,) if explicit_cwd else ())
             if controller_roots:
+                controller_kwargs: dict[str, Any] = {
+                    "workspace_roots": list(controller_roots)
+                }
+                if settings.hotline_show_spawned_codex_tasks:
+                    controller_kwargs["spawned_thread_opener"] = open_codex_desktop_thread
                 controller = SafeThreadController(
                     codex,
-                    workspace_roots=list(controller_roots),
+                    **controller_kwargs,
                 )
             else:
                 logger.warning(
@@ -294,6 +334,11 @@ async def _runtime_lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.codex = codex
         app.state.coordinator = coordinator
         app.state.realtime_manager = realtime_manager
+        app.state.vapi_adapter = VapiAdapter(
+            settings=settings,
+            store=store,
+            coordinator=coordinator,
+        )
         yield
 
 
@@ -431,6 +476,11 @@ def _injected_lifespan(
             app.state.codex = None
             app.state.coordinator = coordinator
             app.state.realtime_manager = resolved_realtime_manager
+            app.state.vapi_adapter = VapiAdapter(
+                settings=settings,
+                store=resolved_store,
+                coordinator=coordinator,
+            )
             yield
 
     return lifespan
@@ -464,20 +514,27 @@ def _install_routes(app: FastAPI) -> None:
             }
         else:
             codex_status = None
+        controller = _coordinator(request).controller
         return {
             "status": "ok",
             "version": __version__,
             "database": str(await store.pragma("journal_mode")),
             "transport": settings.hotline_transport,
+            "carrier": settings.hotline_carrier,
             "openai_realtime_configured": settings.openai_realtime_configured,
             "openai_realtime_runtime_ready": settings.openai_realtime_runtime_ready,
             "twilio_configured": settings.twilio_configured,
             "twilio_bridge_mode": settings.twilio_bridge_mode,
+            "vobiz_configured": settings.vobiz_configured,
+            "vapi_configured": settings.vapi_configured,
             "active_realtime_calls": (
                 realtime_manager.active_calls if realtime_manager is not None else 0
             ),
             "secure_fallback_configured": settings.secure_fallback_configured,
             "codex_app_server": codex_status,
+            "codex_spawn_navigation": (
+                controller.spawn_navigation_status() if controller is not None else None
+            ),
         }
 
     @app.get("/readyz")
@@ -642,6 +699,238 @@ def _install_routes(app: FastAPI) -> None:
                 detail="Realtime call admission is temporarily unavailable",
             ) from exc
         return asdict(result)
+
+    @app.post(
+        _VAPI_WEBHOOK_PATH,
+        include_in_schema=False,
+        dependencies=[Depends(_rate_limit_public), Depends(_require_vapi_token)],
+    )
+    async def vapi_webhook(request: Request) -> dict[str, Any]:
+        """Receive Vapi tool calls and terminal call events at one endpoint."""
+
+        try:
+            payload = await request.json()
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            # Vapi requires HTTP 200 tool responses even when the payload cannot
+            # be acted upon; an empty result prevents a retry storm.
+            return {"accepted": False, "results": []}
+        return await _vapi_adapter(request).handle(payload)
+
+    @app.post(
+        VOBIZ_OUTBOUND_VOICE_PATH,
+        include_in_schema=False,
+        dependencies=[Depends(_rate_limit_public)],
+    )
+    async def vobiz_outbound_voice(request: Request) -> Response:
+        settings = _settings(request)
+        async with _verified_vobiz_form(request, settings) as callback:
+            _pairs, parameters, _receipt_id, processed = callback
+            event_id, event_signature = _required_vobiz_event_binding(request)
+            if not verify_answer_event_signature(
+                settings.hotline_sip_correlation_secret,
+                event_id=event_id,
+                signature=event_signature,
+            ):
+                raise HTTPException(status_code=403, detail="Invalid callback correlation")
+            call_uuid = _vobiz_outbound_call_uuid(parameters)
+            _verify_vobiz_account(parameters, settings)
+            _verify_vobiz_call_identity(
+                parameters,
+                settings,
+                direction="outbound",
+            )
+            event = _single_vobiz_form_value(parameters, "Event", maximum=50)
+            status = _vobiz_call_status(parameters)
+            if event != "StartApp" or status != "in-progress":
+                raise HTTPException(status_code=400, detail="Invalid Vobiz answer event")
+            if settings.openai_project_id is None:
+                raise HTTPException(status_code=503, detail="OpenAI project is not configured")
+            try:
+                if not processed:
+                    _session, should_dial = await _realtime_manager(
+                        request
+                    ).bind_outbound_carrier_parent(
+                        event_id=event_id,
+                        call_sid=call_uuid,
+                    )
+                    if not should_dial:
+                        return Response(
+                            content=_empty_vobiz_xml(),
+                            media_type="application/xml",
+                        )
+                xml = build_outbound_bridge_xml(
+                    openai_project_id=settings.openai_project_id,
+                    event_id=event_id,
+                    correlation_secret=settings.hotline_sip_correlation_secret,
+                    correlation_call_uuid=call_uuid,
+                    max_call_duration_seconds=settings.hotline_max_call_duration_seconds,
+                    dial_timeout_seconds=settings.hotline_outbound_ring_timeout_seconds,
+                )
+            except (OpenAIRealtimeError, NotFoundError, ValueError) as exc:
+                logger.warning(
+                    "Outbound Vobiz XML correlation failed error_type=%s",
+                    type(exc).__name__,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail="Outbound call could not be correlated",
+                ) from exc
+            return Response(content=xml, media_type="application/xml")
+
+    @app.post(
+        VOBIZ_INBOUND_VOICE_PATH,
+        include_in_schema=False,
+        dependencies=[Depends(_rate_limit_public)],
+    )
+    async def vobiz_incoming_voice(request: Request) -> Response:
+        settings = _settings(request)
+        async with _verified_vobiz_form(request, settings) as callback:
+            _pairs, parameters, _receipt_id, _processed = callback
+            _reject_vobiz_event_binding(request)
+            call_uuid = _vobiz_inbound_call_uuid(parameters)
+            _verify_vobiz_account(parameters, settings)
+            caller_phone = _verify_vobiz_call_identity(
+                parameters,
+                settings,
+                direction="inbound",
+            )
+            event = _optional_single_vobiz_form_value(
+                parameters,
+                "Event",
+                maximum=50,
+            )
+            if event is not None and event != "StartApp":
+                raise HTTPException(status_code=400, detail="Invalid Vobiz answer event")
+            status = _vobiz_call_status(parameters)
+            if status not in {"ringing", "in-progress"}:
+                raise HTTPException(status_code=400, detail="Invalid Vobiz answer event")
+            if settings.openai_project_id is None:
+                raise HTTPException(status_code=503, detail="OpenAI project is not configured")
+            try:
+                carrier_admission = await _store(request).issue_carrier_admission(
+                    call_uuid,
+                    caller_phone=caller_phone,
+                    ttl_seconds=settings.hotline_carrier_admission_ttl_seconds,
+                )
+                xml = build_inbound_bridge_xml(
+                    openai_project_id=settings.openai_project_id,
+                    call_uuid=call_uuid,
+                    caller_phone=caller_phone,
+                    admission_nonce=carrier_admission.admission_nonce,
+                    expires_at_epoch=int(carrier_admission.expires_at.timestamp()),
+                    correlation_secret=settings.hotline_sip_correlation_secret,
+                    max_call_duration_seconds=settings.hotline_max_call_duration_seconds,
+                    dial_timeout_seconds=settings.hotline_outbound_ring_timeout_seconds,
+                )
+            except (ConflictError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="Invalid Vobiz call") from exc
+            return Response(content=xml, media_type="application/xml")
+
+    @app.post(
+        VOBIZ_RING_CALLBACK_PATH,
+        include_in_schema=False,
+        dependencies=[Depends(_rate_limit_public)],
+    )
+    async def vobiz_ring_callback(request: Request) -> dict[str, Any]:
+        settings = _settings(request)
+        async with _verified_vobiz_form(request, settings) as callback:
+            _pairs, parameters, receipt_id, processed = callback
+            event_id, event_signature = _required_vobiz_event_binding(request)
+            if not verify_ring_event_signature(
+                settings.hotline_sip_correlation_secret,
+                event_id=event_id,
+                signature=event_signature,
+            ):
+                raise HTTPException(status_code=403, detail="Invalid callback correlation")
+            call_uuid = _vobiz_outbound_call_uuid(parameters)
+            _verify_vobiz_account(parameters, settings)
+            _verify_vobiz_call_identity(
+                parameters,
+                settings,
+                direction="outbound",
+            )
+            event = _single_vobiz_form_value(parameters, "Event", maximum=50)
+            status = _vobiz_call_status(parameters)
+            if event != "Ring" or status != "ringing":
+                raise HTTPException(status_code=400, detail="Invalid Vobiz ring event")
+            if processed:
+                return {"accepted": True, "terminal": False}
+            return await _reconcile_vobiz_status(
+                request,
+                call_uuid=call_uuid,
+                status=status,
+                receipt_id=receipt_id,
+                event_id=event_id,
+            )
+
+    @app.post(
+        VOBIZ_HANGUP_CALLBACK_PATH,
+        include_in_schema=False,
+        dependencies=[Depends(_rate_limit_public)],
+    )
+    async def vobiz_hangup_callback(request: Request) -> dict[str, Any]:
+        settings = _settings(request)
+        async with _verified_vobiz_form(request, settings) as callback:
+            _pairs, parameters, receipt_id, processed = callback
+            direction = _single_vobiz_form_value(
+                parameters,
+                "Direction",
+                maximum=32,
+            ).casefold()
+            event_id: str | None = None
+            if direction == "outbound":
+                event_id, event_signature = _required_vobiz_event_binding(request)
+                if not verify_hangup_event_signature(
+                    settings.hotline_sip_correlation_secret,
+                    event_id=event_id,
+                    signature=event_signature,
+                ):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Invalid callback correlation",
+                    )
+                call_uuid = _vobiz_outbound_call_uuid(parameters)
+            elif direction == "inbound":
+                _reject_vobiz_event_binding(request)
+                call_uuid = _vobiz_inbound_call_uuid(parameters)
+            else:
+                raise HTTPException(status_code=400, detail="Invalid Vobiz direction")
+            _verify_vobiz_account(parameters, settings)
+            _verify_vobiz_call_identity(
+                parameters,
+                settings,
+                direction=cast(Any, direction),
+            )
+            event = _optional_single_vobiz_form_value(
+                parameters,
+                "Event",
+                maximum=50,
+            )
+            if (direction == "outbound" and event != "Hangup") or (
+                direction == "inbound" and event not in {None, "Hangup"}
+            ):
+                raise HTTPException(status_code=400, detail="Invalid Vobiz hangup event")
+            status = _vobiz_call_status(parameters)
+            if status not in {
+                "completed",
+                "busy",
+                "no-answer",
+                "failed",
+                "cancel",
+                "canceled",
+                "cancelled",
+                "timeout",
+            }:
+                raise HTTPException(status_code=400, detail="Invalid Vobiz hangup status")
+            if processed:
+                return {"accepted": True, "terminal": False}
+            return await _reconcile_vobiz_status(
+                request,
+                call_uuid=call_uuid,
+                status=status,
+                receipt_id=receipt_id,
+                event_id=event_id,
+            )
 
     @app.post(
         "/v1/twilio/voice/outbound",
@@ -940,6 +1229,20 @@ async def _require_local_token(
     _verify_bearer(authorization, expected, unavailable_status=503)
 
 
+async def _require_vapi_token(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> None:
+    settings = _settings(request)
+    if not settings.vapi_configured:
+        raise HTTPException(
+            status_code=503,
+            detail="Vapi resource binding is not configured",
+        )
+    expected = settings.vapi_webhook_token.get_secret_value()
+    _verify_bearer(authorization, expected, unavailable_status=503)
+
+
 async def _rate_limit_public(request: Request) -> None:
     client = request.client.host if request.client else "unknown"
     limiter = cast(SlidingWindowLimiter, request.app.state.public_limiter)
@@ -980,6 +1283,10 @@ def _coordinator(request: Request) -> HotlineCoordinator:
     return cast(HotlineCoordinator, request.app.state.coordinator)
 
 
+def _vapi_adapter(request: Request) -> VapiAdapter:
+    return cast(VapiAdapter, request.app.state.vapi_adapter)
+
+
 def _settings(request: Request) -> Settings:
     return cast(Settings, request.app.state.settings)
 
@@ -998,10 +1305,256 @@ def _realtime_manager(request: Request) -> OpenAIRealtimeManager:
     return manager
 
 
+@asynccontextmanager
+async def _verified_vobiz_form(
+    request: Request,
+    settings: Settings,
+) -> AsyncIterator[tuple[list[tuple[str, str]], dict[str, list[str]], str, bool]]:
+    if settings.hotline_carrier != "vobiz":
+        raise HTTPException(status_code=404, detail="Carrier route is not enabled")
+    auth_token = settings.vobiz_auth_token.get_secret_value()
+    if not auth_token or not settings.public_base_url:
+        raise HTTPException(status_code=503, detail="Vobiz webhook verification is unavailable")
+    content_type = request.headers.get("content-type", "").partition(";")[0].strip().casefold()
+    if content_type != "application/x-www-form-urlencoded":
+        raise HTTPException(status_code=415, detail="Vobiz webhook must be form encoded")
+    raw_body = await request.body()
+    try:
+        encoded = raw_body.decode("utf-8")
+        pairs = parse_qsl(
+            encoded,
+            keep_blank_values=True,
+            strict_parsing=True,
+            max_num_fields=100,
+        )
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Vobiz webhook form is invalid") from exc
+    if any(not name or len(name) > 100 or len(value) > 4000 for name, value in pairs):
+        raise HTTPException(status_code=400, detail="Vobiz webhook form is invalid")
+
+    external_url = f"{settings.public_base_url}{request.url.path}"
+    raw_query = request.scope.get("query_string", b"")
+    if raw_query:
+        try:
+            external_url += "?" + raw_query.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Webhook query is invalid") from exc
+    verification = verify_vobiz_webhook_headers(
+        callback_url=external_url,
+        auth_token=auth_token,
+        signature_v3=request.headers.get("x-vobiz-signature-v3"),
+        nonce_v3=request.headers.get("x-vobiz-signature-v3-nonce"),
+        signature_v2=request.headers.get("x-vobiz-signature-v2"),
+        nonce_v2=request.headers.get("x-vobiz-signature-v2-nonce"),
+    )
+    if verification is None:
+        raise HTTPException(status_code=403, detail="Vobiz webhook signature is invalid")
+
+    parameters: dict[str, list[str]] = {}
+    for name, value in pairs:
+        parameters.setdefault(name, []).append(value)
+    canonical_pairs = json.dumps(pairs, ensure_ascii=False, separators=(",", ":"))
+    fingerprint = hashlib.sha256(canonical_pairs.encode()).hexdigest()
+    receipt_key = f"vobiz:{verification.version}:{verification.nonce}"
+    receipt_id = hashlib.sha256(
+        f"{request.url.path}\n{receipt_key}\n{canonical_pairs}".encode()
+    ).hexdigest()[:48]
+    try:
+        claim = await _store(request).claim_ingress_receipt(
+            receipt_key,
+            kind=f"vobiz_v{verification.version}",
+            subject_id=request.url.path,
+            fingerprint=fingerprint,
+        )
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail="Vobiz callback nonce was reused") from exc
+
+    try:
+        yield pairs, parameters, receipt_id, claim.processed
+    except BaseException:
+        if not claim.processed:
+            await _store(request).release_ingress_receipt(receipt_key)
+        raise
+    else:
+        if not claim.processed:
+            await _store(request).complete_ingress_receipt(receipt_key)
+
+
+def _required_vobiz_event_binding(request: Request) -> tuple[str, str]:
+    event_values = request.query_params.getlist("event_id")
+    signature_values = request.query_params.getlist("event_sig")
+    if len(event_values) != 1 or len(signature_values) != 1:
+        raise HTTPException(status_code=400, detail="Invalid callback correlation")
+    if not event_values[0] or not signature_values[0]:
+        raise HTTPException(status_code=400, detail="Invalid callback correlation")
+    return event_values[0], signature_values[0]
+
+
+def _reject_vobiz_event_binding(request: Request) -> None:
+    if request.query_params.getlist("event_id") or request.query_params.getlist("event_sig"):
+        raise HTTPException(status_code=400, detail="Invalid callback correlation")
+
+
+def _single_vobiz_form_value(
+    parameters: Mapping[str, list[str]],
+    name: str,
+    *,
+    maximum: int,
+) -> str:
+    values = parameters.get(name, [])
+    if len(values) != 1:
+        raise HTTPException(status_code=400, detail=f"Vobiz {name} is missing or duplicated")
+    value = values[0]
+    if not value or len(value) > maximum or value != value.strip():
+        raise HTTPException(status_code=400, detail=f"Vobiz {name} is invalid")
+    return value
+
+
+def _optional_single_vobiz_form_value(
+    parameters: Mapping[str, list[str]],
+    name: str,
+    *,
+    maximum: int,
+) -> str | None:
+    if name not in parameters:
+        return None
+    return _single_vobiz_form_value(parameters, name, maximum=maximum)
+
+
+def _vobiz_outbound_call_uuid(parameters: Mapping[str, list[str]]) -> str:
+    try:
+        request_uuid = validate_vobiz_call_uuid(
+            _single_vobiz_form_value(parameters, "RequestUUID", maximum=100)
+        )
+        call_uuid_raw = _optional_single_vobiz_form_value(
+            parameters,
+            "CallUUID",
+            maximum=100,
+        )
+        if call_uuid_raw is not None:
+            call_uuid = validate_vobiz_call_uuid(call_uuid_raw)
+            if not _safe_equal(call_uuid, request_uuid):
+                raise ValueError("Vobiz call identifiers do not match")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid Vobiz call UUID") from exc
+    return request_uuid
+
+
+def _vobiz_inbound_call_uuid(parameters: Mapping[str, list[str]]) -> str:
+    try:
+        return validate_vobiz_call_uuid(
+            _single_vobiz_form_value(parameters, "CallUUID", maximum=100)
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid Vobiz call UUID") from exc
+
+
+def _verify_vobiz_account(parameters: Mapping[str, list[str]], settings: Settings) -> None:
+    configured = validate_vobiz_auth_id(settings.vobiz_auth_id)
+    supplied: list[str] = []
+    for name in ("auth_id", "ParentAuthID"):
+        value = _optional_single_vobiz_form_value(parameters, name, maximum=100)
+        if value is not None:
+            supplied.append(value)
+    try:
+        if supplied and any(
+            not _safe_equal(validate_vobiz_auth_id(value), configured) for value in supplied
+        ):
+            raise ValueError("Vobiz account does not match")
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="Vobiz account is not authorized") from exc
+
+
+def _verify_vobiz_call_identity(
+    parameters: Mapping[str, list[str]],
+    settings: Settings,
+    *,
+    direction: Literal["inbound", "outbound"],
+) -> str:
+    try:
+        supplied_direction = _single_vobiz_form_value(
+            parameters,
+            "Direction",
+            maximum=32,
+        ).casefold()
+        from_number = normalize_vobiz_e164(
+            _single_vobiz_form_value(parameters, "From", maximum=32)
+        )
+        to_number = normalize_vobiz_e164(
+            _single_vobiz_form_value(parameters, "To", maximum=32)
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid Vobiz call identity") from exc
+    if supplied_direction != direction:
+        raise HTTPException(status_code=403, detail="Vobiz call is not authorized")
+    configured_number = settings.vobiz_phone_number or ""
+    if direction == "outbound":
+        if not _safe_equal(from_number, configured_number) or not _safe_equal(
+            to_number,
+            settings.owner_phone_number.get_secret_value(),
+        ):
+            raise HTTPException(status_code=403, detail="Vobiz call is not authorized")
+        return to_number
+
+    if not _safe_equal(to_number, configured_number):
+        raise HTTPException(status_code=403, detail="Vobiz call is not authorized")
+    allowed_callers = (
+        settings.owner_phone_number.get_secret_value(),
+        *settings.allowlisted_callers,
+    )
+    normalized_allowlist: list[str] = []
+    for allowed in allowed_callers:
+        try:
+            normalized_allowlist.append(normalize_vobiz_e164(allowed))
+        except (TypeError, ValueError):
+            continue
+    if not any(_safe_equal(from_number, allowed) for allowed in normalized_allowlist):
+        raise HTTPException(status_code=403, detail="Vobiz call is not authorized")
+    return from_number
+
+
+def _vobiz_call_status(parameters: Mapping[str, list[str]]) -> str:
+    return _single_vobiz_form_value(parameters, "CallStatus", maximum=50).casefold()
+
+
+def _empty_vobiz_xml() -> str:
+    return '<?xml version="1.0" encoding="UTF-8"?><Response />'
+
+
+async def _reconcile_vobiz_status(
+    request: Request,
+    *,
+    call_uuid: str,
+    status: str,
+    receipt_id: str,
+    event_id: str | None,
+) -> dict[str, Any]:
+    try:
+        arguments: dict[str, str | None] = {
+            "call_sid": call_uuid,
+            "status": status,
+            "receipt_id": receipt_id,
+        }
+        if event_id is not None:
+            arguments["correlated_event_id"] = event_id
+        return await _realtime_manager(request).handle_carrier_status(**arguments)
+    except (OpenAIRealtimeError, ValueError) as exc:
+        logger.warning(
+            "Vobiz status reconciliation failed error_type=%s",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Carrier status could not be reconciled",
+        ) from exc
+
+
 async def _verified_twilio_form(
     request: Request,
     settings: Settings,
 ) -> tuple[list[tuple[str, str]], dict[str, list[str]]]:
+    if settings.hotline_carrier != "twilio":
+        raise HTTPException(status_code=404, detail="Carrier route is not enabled")
     auth_token = settings.twilio_auth_token.get_secret_value()
     if not auth_token or not settings.public_base_url:
         raise HTTPException(status_code=503, detail="Twilio webhook verification is unavailable")

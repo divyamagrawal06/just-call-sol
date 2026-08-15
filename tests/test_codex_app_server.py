@@ -503,6 +503,7 @@ async def test_thread_and_turn_wrappers_use_0144_6_field_names() -> None:
         search_term="training",
         sort_key="updated_at",
         sort_direction="desc",
+        source_kinds=["cli", "appServer"],
     )
     await client.thread_read("thread-a")
     await client.thread_turns_list("thread-a", limit=5)
@@ -517,6 +518,7 @@ async def test_thread_and_turn_wrappers_use_0144_6_field_names() -> None:
     assert list_params["searchTerm"] == "training"
     assert list_params["sortKey"] == "updated_at"
     assert list_params["cwd"] == ["C:\\one", "C:\\two"]
+    assert list_params["sourceKinds"] == ["cli", "appServer"]
     assert method_messages(server, "thread/read")[0]["params"] == {
         "threadId": "thread-a",
         "includeTurns": True,
@@ -594,6 +596,18 @@ async def test_voice_candidate_prewarm_is_unfiltered_sanitized_and_short_lived(
         "archived": False,
         "sortKey": "updated_at",
         "sortDirection": "desc",
+        "sourceKinds": [
+            "cli",
+            "vscode",
+            "exec",
+            "appServer",
+            "subAgent",
+            "subAgentReview",
+            "subAgentCompact",
+            "subAgentThreadSpawn",
+            "subAgentOther",
+            "unknown",
+        ],
     }
     assert smaller == cached[:1]
     assert cached[0].thread_id == "thread-private-identifier"
@@ -930,6 +944,10 @@ async def test_safe_controller_disambiguates_and_steers_exact_active_turn(
     await client.start()
     controller = SafeThreadController(client, workspace_roots=[allowed])
 
+    resolved_by_id = await controller.resolve_thread("thread-training")
+    assert resolved_by_id.thread_id == "thread-training"
+    assert method_messages(server, "thread/list") == []
+
     resolved = await controller.resolve_thread("training-run")
     assert resolved.thread_id == "thread-training"
     with pytest.raises(AmbiguousThreadError):
@@ -1017,15 +1035,40 @@ async def test_safe_controller_starts_root_only_inside_allowed_workspace(
     allowed.mkdir()
     outside = tmp_path / "outside"
     outside.mkdir()
+    lifecycle: list[str] = []
     server = FakeCodexServer()
-    server.handlers["thread/start"] = lambda _message: {"thread": {"id": "root-thread"}}
-    server.handlers["turn/start"] = lambda _message: {"turn": {"id": "root-turn"}}
+    server.handlers["thread/start"] = lambda _message: (
+        lifecycle.append("thread-start") or {"thread": {"id": "root-thread"}}
+    )
+    def start_turn(_message: dict[str, object]) -> dict[str, object]:
+        lifecycle.append("turn-start")
+        server.notify(
+            "turn/completed",
+            {"threadId": "other-thread", "turn": {"id": "other-turn"}},
+        )
+        server.notify(
+            "turn/completed",
+            {"threadId": "root-thread", "turn": {"id": "root-turn"}},
+        )
+        return {"turn": {"id": "root-turn"}}
+
+    server.handlers["turn/start"] = start_turn
     client = CodexAppServerClient(
         _process_factory=FakeProcessFactory(server),
         codex_executable="codex.exe",
     )
     await client.start()
-    controller = SafeThreadController(client, workspace_roots=[allowed])
+    opened: list[str] = []
+
+    def open_spawned_thread(thread_id: str) -> None:
+        lifecycle.append("desktop-open")
+        opened.append(thread_id)
+
+    controller = SafeThreadController(
+        client,
+        workspace_roots=[allowed],
+        spawned_thread_opener=open_spawned_thread,
+    )
 
     with pytest.raises(UnsafeWorkspaceError, match="outside configured roots"):
         await controller.spawn_root(task="Investigate", cwd=outside)
@@ -1041,6 +1084,77 @@ async def test_safe_controller_starts_root_only_inside_allowed_workspace(
     assert result.turn_id == "root-turn"
     assert method_messages(server, "thread/start")[0]["params"]["cwd"] == str(allowed.resolve())
     assert method_messages(server, "turn/start")[0]["params"]["effort"] == "low"
+    for _ in range(100):
+        navigation = controller.spawn_navigation_status()
+        if opened and navigation == {"state": "opened", "pending": 0}:
+            break
+        await asyncio.sleep(0.01)
+    assert opened == ["root-thread"]
+    assert method_messages(server, "thread/read") == []
+    assert lifecycle == ["thread-start", "turn-start", "desktop-open"]
+    assert navigation == {"state": "opened", "pending": 0}
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_safe_controller_returns_while_slow_spawned_turn_starts_in_background(
+    tmp_path: Path,
+) -> None:
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    turn_start_request_ids: list[int | str] = []
+    server = FakeCodexServer()
+    server.handlers["thread/start"] = lambda _message: {
+        "thread": {"id": "deferred-root"}
+    }
+
+    def start_turn(message: dict[str, object]) -> object:
+        request_id = message["id"]
+        assert isinstance(request_id, (int, str))
+        turn_start_request_ids.append(request_id)
+        return NO_RESPONSE
+
+    server.handlers["turn/start"] = start_turn
+    client = CodexAppServerClient(
+        _process_factory=FakeProcessFactory(server),
+        codex_executable="codex.exe",
+    )
+    await client.start()
+    opened: list[str] = []
+    controller = SafeThreadController(
+        client,
+        workspace_roots=[allowed],
+        spawned_thread_opener=opened.append,
+        spawn_turn_start_wait_seconds=0.01,
+    )
+
+    result = await controller.spawn_root(task="Deploy the site", cwd=allowed)
+
+    assert result.action == "spawned"
+    assert result.thread_id == "deferred-root"
+    assert result.turn_id is None
+    assert result.response["turn_start_queued"] is True
+    assert controller.spawn_navigation_status() == {
+        "state": "starting_turn",
+        "pending": 1,
+    }
+
+    assert len(turn_start_request_ids) == 1
+    server.respond_result(
+        turn_start_request_ids[0],
+        {"turn": {"id": "deferred-turn"}},
+    )
+    server.notify(
+        "turn/completed",
+        {"threadId": "deferred-root", "turn": {"id": "deferred-turn"}},
+    )
+    for _ in range(100):
+        navigation = controller.spawn_navigation_status()
+        if opened and navigation == {"state": "opened", "pending": 0}:
+            break
+        await asyncio.sleep(0.01)
+    assert opened == ["deferred-root"]
+    assert navigation == {"state": "opened", "pending": 0}
     await client.close()
 
 
@@ -1077,6 +1191,49 @@ async def test_safe_controller_resumes_unloaded_thread_before_new_turn(
 
     assert result.action == "started"
     assert result.turn_id == "next-turn"
+    resume_message = method_messages(server, "thread/resume")[0]
+    turn_message = method_messages(server, "turn/start")[0]
+    assert server.messages.index(resume_message) < server.messages.index(turn_message)
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_prepared_instruction_resumes_unloaded_thread_only_during_execution(
+    tmp_path: Path,
+) -> None:
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    stored = {
+        "id": "stored-thread",
+        "name": "stored",
+        "preview": "Stored task",
+        "cwd": str(allowed),
+        "status": {"type": "notLoaded"},
+        "updatedAt": 10,
+        "turns": [],
+    }
+    resumed = {**stored, "status": {"type": "idle"}}
+    server = FakeCodexServer()
+    server.handlers["thread/list"] = lambda _message: {"data": [stored]}
+    server.handlers["thread/read"] = lambda _message: {"thread": stored}
+    server.handlers["thread/turns/list"] = lambda _message: {"data": []}
+    server.handlers["thread/resume"] = lambda _message: {"thread": resumed}
+    server.handlers["turn/start"] = lambda _message: {"turn": {"id": "next-turn"}}
+    client = CodexAppServerClient(
+        _process_factory=FakeProcessFactory(server),
+        codex_executable="codex.exe",
+    )
+    await client.start()
+    controller = SafeThreadController(client, workspace_roots=[allowed])
+
+    plan = await controller.prepare_instruction("stored", "Continue safely.")
+
+    assert plan.operation == "resume_start"
+    assert method_messages(server, "thread/resume") == []
+
+    result = await controller.execute_instruction(plan)
+
+    assert result.action == "started"
     resume_message = method_messages(server, "thread/resume")[0]
     turn_message = method_messages(server, "turn/start")[0]
     assert server.messages.index(resume_message) < server.messages.index(turn_message)

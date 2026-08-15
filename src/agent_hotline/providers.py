@@ -8,6 +8,7 @@ from typing import Protocol
 from .contracts import ContactHumanRequest
 from .settings import Settings
 from .twilio import TwilioAPIError, TwilioClient
+from .vobiz import VobizAPIError, VobizClient
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,17 +30,25 @@ class CallProvider(Protocol):
 
 
 class OpenAIRealtimeCallProvider:
-    """Originate PSTN through Twilio; OpenAI Realtime handles the SIP conversation."""
+    """Originate PSTN through the selected carrier and bridge it to OpenAI SIP."""
 
-    def __init__(self, settings: Settings, client: TwilioClient | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        client: TwilioClient | VobizClient | None = None,
+    ) -> None:
         self.settings = settings
-        self.client = client or TwilioClient(settings)
+        self.client = client or (
+            VobizClient(settings)
+            if settings.hotline_carrier == "vobiz"
+            else TwilioClient(settings)
+        )
         self._owns_client = client is None
 
     async def place_call(self, event_id: str, request: ContactHumanRequest) -> CallAttempt:
         try:
             result = await self.client.place_call(event_id, request)
-        except TwilioAPIError as exc:
+        except (TwilioAPIError, VobizAPIError) as exc:
             if exc.outcome_unknown:
                 raise CallPlacementOutcomeUnknownError(
                     "carrier call creation has an unknown outcome"

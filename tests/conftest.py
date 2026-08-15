@@ -11,6 +11,8 @@ _SETTINGS_ENV_PREFIXES = (
     "HOTLINE_",
     "OPENAI_",
     "TWILIO_",
+    "VAPI_",
+    "VOBIZ_",
     "OWNER_",
 )
 _SETTINGS_ENV_NAMES = frozenset({"PUBLIC_BASE_URL"})
