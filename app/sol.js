@@ -1,4 +1,4 @@
-/* JUST CALL SOL — page behaviors.
+/* BETTER CALL SOL — page behaviors.
    Ransom composer + PRNG lifted from arlan.me/vault/ransom-note; CRT treatment per
    arlan.me/vault/midjourney; typer engine in typer.js. All MIT → free to copy. */
 
@@ -22,6 +22,17 @@
     O: [[191,"O_1"],[222,"O_2"],[264,"O_3"],[210,"O_4"],[228,"O_5"],[158,"O_6"]],
   };
 
+  // The shipped sprite subset predates the new name, so B, E, and R use original CSS
+  // cut-paper variants instead of adding restricted source-pack files to the repository.
+  const CUTOUT = [
+    [170, "lowercase"],
+    [198, "roundel"],
+    [178, "neon"],
+    [146, "label"],
+    [206, "tabloid"],
+    [184, "signal"],
+  ];
+
   // mulberry32 + string hash — the vault's deterministic seed pair, verbatim, so a
   // given phrase + roll always reproduces the same note.
   function mulberry32(seed) {
@@ -43,11 +54,12 @@
     return h >>> 0;
   }
 
-  const PHRASE = "JUST CALL SOL";
+  const PHRASE = "BETTER CALL SOL";
   // playground defaults from the vault entry: tilt 8°, bounce 0.06, scale mix 0.12
   const TILT = 8, BOUNCE = 0.06, SCALE_MIX = 0.12, OVERLAP = 0.1;
 
   let roll = 0;
+  let fitRansom = () => {};
 
   function composeRansom() {
     const host = document.getElementById("ransom");
@@ -55,36 +67,55 @@
     host.innerHTML = "";
     const rng = mulberry32(hashSeed(PHRASE) + roll);
     const lastVariant = {}; // avoid the same cutout twice in a row for a repeated letter
+    const wordRatios = [];
 
     for (const word of PHRASE.split(" ")) {
       const w = document.createElement("span");
       w.className = "rword";
+      let wordRatio = 0;
       [...word].forEach((ch, i) => {
-        const variants = RANSOM[ch];
+        const sprites = RANSOM[ch];
+        const variants = sprites || CUTOUT;
         let pick = Math.floor(rng() * variants.length);
         if (variants.length > 1 && pick === lastVariant[ch]) {
           pick = (pick + 1 + Math.floor(rng() * (variants.length - 1))) % variants.length;
         }
         lastVariant[ch] = pick;
-        const [, file] = variants[pick];
-        const img = document.createElement("img");
-        img.src = `assets/ransom/${file}.webp`;
-        img.alt = "";
-        img.draggable = false;
+        const [width, token] = variants[pick];
+        const piece = sprites ? document.createElement("img") : document.createElement("span");
+        piece.classList.add("rpiece");
+        piece.style.setProperty("--rw", (width / 220).toFixed(3));
+        if (sprites) {
+          piece.src = `assets/ransom/${token}.webp`;
+          piece.alt = "";
+          piece.draggable = false;
+        } else {
+          piece.classList.add("ransom-glyph", `ransom-glyph--${token}`);
+          piece.textContent = ch;
+          piece.setAttribute("aria-hidden", "true");
+        }
         const tilt = (rng() * 2 - 1) * TILT;
         const bounce = (rng() * 2 - 1) * BOUNCE;
         const scale = 1 + (rng() * 2 - 1) * SCALE_MIX;
-        img.style.transform = `rotate(${tilt.toFixed(1)}deg) translateY(${(bounce * 100).toFixed(1)}%) scale(${scale.toFixed(2)})`;
-        if (i > 0) img.style.marginLeft = `calc(var(--rh, 96px) * ${(-(rng() * OVERLAP)).toFixed(3)})`;
-        img.style.zIndex = String(1 + Math.floor(rng() * 8));
-        img.style.position = "relative";
-        w.appendChild(img);
+        piece.style.transform = `rotate(${tilt.toFixed(1)}deg) translateY(${(bounce * 100).toFixed(1)}%) scale(${scale.toFixed(2)})`;
+        if (i > 0) piece.style.marginLeft = `calc(var(--rh, 96px) * ${(-(rng() * OVERLAP)).toFixed(3)})`;
+        piece.style.zIndex = String(1 + Math.floor(rng() * 8));
+        piece.style.position = "relative";
+        w.appendChild(piece);
+        wordRatio += width / 220;
       });
       host.appendChild(w);
+      wordRatios.push(wordRatio);
     }
-    // scale the note to the container: 3 words across ~2 lines
-    host.style.setProperty("--rh", "clamp(58px, 11vw, 116px)");
-    host.querySelectorAll("img").forEach((img) => { img.style.height = "var(--rh)"; });
+
+    // Keep the longer brand name inside the note at every width and after every re-cut.
+    const widestWord = Math.max(...wordRatios);
+    fitRansom = () => {
+      const target = Math.min(116, Math.max(42, window.innerWidth * 0.11));
+      const fitted = (host.clientWidth * 0.86) / widestWord;
+      host.style.setProperty("--rh", `${Math.max(26, Math.min(target, fitted)).toFixed(1)}px`);
+    };
+    fitRansom();
   }
 
   composeRansom();
@@ -92,6 +123,7 @@
     roll += 1;
     composeRansom();
   });
+  window.addEventListener("resize", () => fitRansom(), { passive: true });
 
   /* ── the typer, on scroll ─────────────────────────────────────────── */
 

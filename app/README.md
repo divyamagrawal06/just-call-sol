@@ -1,6 +1,6 @@
-# Just Call Sol site
+# Better Call Sol site
 
-This folder contains the static product page for Agent Hotline, branded as “Just Call Sol.”
+This folder contains the static product page for Agent Hotline, branded as “Better Call Sol.”
 There is no build step.
 
 ```powershell

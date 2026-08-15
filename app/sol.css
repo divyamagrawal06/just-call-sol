@@ -1,4 +1,4 @@
-/* JUST CALL SOL — a hostage situation for coding agents.
+/* BETTER CALL SOL — a hostage situation for coding agents.
    Effects lifted directly from the arlan.me vault (MIT → free to copy):
    ransom-note cutouts, the typer, CRT ASCII treatment, emboss, chromatic glow. */
 
@@ -236,13 +236,75 @@ h2.typed {
   align-items: baseline;
 }
 
-.ransom img {
+.ransom .rpiece {
   display: block;
   height: var(--rh, 96px);
-  width: auto;
   filter: drop-shadow(0 2px 2px rgba(25, 22, 17, 0.28));
   user-select: none;
   -webkit-user-drag: none;
+}
+
+.ransom img.rpiece { width: auto; }
+
+.ransom .ransom-glyph {
+  display: grid;
+  width: calc(var(--rh, 96px) * var(--rw, .8));
+  place-items: center;
+  overflow: hidden;
+  font-size: calc(var(--rh, 96px) * .8);
+  font-weight: 900;
+  line-height: 1;
+  box-shadow: inset 0 0 0 1px rgba(25, 22, 17, .16);
+  clip-path: polygon(3% 2%, 98% 0, 100% 94%, 95% 100%, 1% 97%, 0 8%);
+}
+
+.ransom-glyph--lowercase {
+  color: #dec7fa;
+  background: #32144f;
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: calc(var(--rh, 96px) * .92);
+  font-weight: 400;
+  text-transform: lowercase;
+}
+
+.ransom-glyph--roundel {
+  color: #f5d3d8;
+  background: #c73748;
+  font-family: "Arial Black", Impact, sans-serif;
+  -webkit-text-stroke: 1px #7d1425;
+  clip-path: polygon(1% 6%, 96% 0, 100% 92%, 91% 98%, 4% 100%, 0 11%);
+}
+
+.ransom-glyph--neon {
+  color: #ff4e90;
+  background: #17131d;
+  font-family: "Arial Narrow", Arial, sans-serif;
+  font-weight: 400;
+  text-shadow: 0 0 .08em #ff4e90;
+}
+
+.ransom-glyph--label {
+  color: #7d251b;
+  background: #efc976;
+  font-family: Georgia, "Times New Roman", serif;
+  border: calc(var(--rh, 96px) * .045) solid #db6689;
+}
+
+.ransom-glyph--tabloid {
+  color: #f7e8d1;
+  background: #d82e33;
+  font-family: Impact, "Arial Black", sans-serif;
+  -webkit-text-stroke: 1px #17131d;
+  text-shadow: .04em .04em 0 #17131d;
+}
+
+.ransom-glyph--signal {
+  color: #80a8ff;
+  background: #111d63;
+  font-family: Impact, "Arial Black", sans-serif;
+  font-style: italic;
+  -webkit-text-stroke: 1px #d8e1ff;
+  text-shadow: .05em .05em 0 #334dba;
 }
 
 /* the URGENT stamp, half off the note */
