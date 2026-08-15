@@ -35,10 +35,6 @@ Codex or Claude -> local Hotline daemon -> Twilio/Vobiz -> OpenAI Realtime -> ow
 The result is a practical human-in-the-loop control surface for long-running agent work: fast
 enough to use from your pocket, narrow enough to trust, and auditable enough to operate.
 
-## Demo
-
-[Watch Better Call Sol connect a live voice call to Codex.](https://youtu.be/5xuRL5zwR4c)
-
 ## Setup and run
 
 Requires Python 3.12 or 3.13 and [`uv`](https://docs.astral.sh/uv/).

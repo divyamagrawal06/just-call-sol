@@ -362,6 +362,29 @@ h2.typed {
 .reroll:hover { transform: translate(-1px, -1px); box-shadow: 4px 4px 0 var(--ink); }
 .reroll:active { transform: translate(1.5px, 1.5px); box-shadow: 1px 1px 0 var(--ink); }
 
+.case-links {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 22px;
+}
+
+.case-link {
+  display: inline-block;
+  border: 1.5px solid var(--ink);
+  padding: 8px 14px;
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  text-decoration: none;
+  box-shadow: 2px 2px 0 var(--ink);
+  transition: transform .15s var(--ease-amo), box-shadow .15s var(--ease-amo);
+}
+.case-link:hover { transform: translate(-1px, -1px) rotate(0deg); box-shadow: 4px 4px 0 var(--ink); }
+.case-link:active { transform: translate(1px, 1px) rotate(0deg); box-shadow: 1px 1px 0 var(--ink); }
+.case-link--repo { color: var(--paper-hi); background: var(--ink); transform: rotate(.7deg); }
+
 /* ── the letter ─────────────────────────────────────────────────────── */
 
 .letter {
@@ -815,5 +838,5 @@ h2.typed {
 
 @media (prefers-reduced-motion: reduce) {
   .crt::after { animation: none; }
-  .reroll, .copy-btn { transition: none; }
+  .reroll, .case-link, .copy-btn { transition: none; }
 }
