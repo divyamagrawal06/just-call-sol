@@ -162,9 +162,12 @@ Codex task writes are additionally blocked unless `HOTLINE_ALLOW_CODEX_WRITES=tr
 runbook executors are independently blocked unless `HOTLINE_ALLOW_REAL_RUNBOOKS=true`. The
 built-in runbooks are mocks, so the second gate does not make them touch real infrastructure.
 
-Codex command and turn-permission callbacks can return only exact, one-turn approvals. Codex
-file-change callbacks always decline because the callback does not include a complete patch
-that can be represented and read back losslessly.
+Codex command and turn-permission callbacks can return only exact, one-turn approvals. A separate
+synchronous Codex `PermissionRequest` plugin hook brings the same phone decision path to ordinary
+Desktop and CLI tasks for bounded shell and MCP requests. It emits `allow` only for a verified,
+exact scope match, emits `deny` only for a verified denial, and otherwise lets the normal local
+prompt continue. App Server file-change callbacks always decline, and the plugin hook abstains on
+`apply_patch`, because a patch is not a practical lossless PSTN readback.
 
 ## Repository evidence
 

@@ -1,6 +1,6 @@
 {
   "name": "agent-hotline",
-  "version": "0.2.0",
+  "version": "0.2.0+codex.20260824132732",
   "description": "Call an owner through OpenAI Realtime and return bounded, verified decisions to Codex or Claude.",
   "author": {
     "name": "Agent Hotline contributors"

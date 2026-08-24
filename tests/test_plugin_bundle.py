@@ -49,7 +49,7 @@ def test_plugin_bundle_identity_and_version_are_consistent() -> None:
     )
 
     assert plugin["name"] == SKILL_ROOT.name == skill["name"] == "agent-hotline"
-    assert plugin["version"] == project["project"]["version"] == "0.2.0"
+    assert plugin["version"] == project["project"]["version"] == "0.2.0+codex.20260824132732"
     assert plugin["description"] == marketplace_plugin["description"]
     assert marketplace_plugin["source"] == {
         "source": "local",
@@ -65,6 +65,25 @@ def test_plugin_bundle_identity_and_version_are_consistent() -> None:
         "short_description",
         "default_prompt",
     }
+
+
+def test_plugin_bundles_a_synchronous_bounded_permission_hook() -> None:
+    hook_config = json.loads((PLUGIN_ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    permission_groups = hook_config["hooks"]["PermissionRequest"]
+
+    assert len(permission_groups) == 1
+    assert permission_groups[0]["matcher"] == "^Bash$|^mcp__"
+    handlers = permission_groups[0]["hooks"]
+    assert handlers == [
+        {
+            "type": "command",
+            "command": "agent-hotline-codex-hook",
+            "commandWindows": "agent-hotline-codex-hook",
+            "timeout": 660,
+            "statusMessage": "Calling your owner for approval",
+        }
+    ]
+    assert "async" not in handlers[0]
 
 
 def test_skill_bundle_is_realtime_twilio_first_conversational_and_safe() -> None:

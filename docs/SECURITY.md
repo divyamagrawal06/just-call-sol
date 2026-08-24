@@ -138,9 +138,12 @@ it when `HOTLINE_ENV=production`; do not expose a demo daemon as a production co
 The default registry contains only mock runbooks. No production cloud, database, deployment,
 or batch executor ships here. Enabling the real-runbook gate does not invent one.
 
-Codex command and permission callbacks are limited to exact one-turn responses. File-change
-callbacks always decline because the current callback omits the patch needed for a lossless
-readback.
+Codex command and permission callbacks are limited to exact one-turn responses. The synchronous
+Codex `PermissionRequest` hook returns `allow` only after a verified, resolved approval whose
+durable instruction exactly equals the canonical bounded request; all mismatch and failure paths
+return no decision and preserve the local prompt. Verified denial can return `deny`. App Server
+file-change callbacks always decline because that callback omits the patch, and the hook abstains
+on `apply_patch` because a lossless patch readback is not practical over PSTN.
 
 ## Repository and agent context
 

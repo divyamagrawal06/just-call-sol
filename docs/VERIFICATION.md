@@ -55,7 +55,11 @@ Before a release is described as live-validated, record dated evidence for:
 - [ ] structured approve, deny, instruct, defer, timeout, failure, and no-answer outcomes;
 - [ ] bounded Codex task listing and inspection on inbound calls;
 - [ ] a scoped Codex write with the default-off gate deliberately enabled;
-- [ ] file-change callback denial;
+- [ ] a trusted `PermissionRequest` hook calls on a bounded shell approval and returns a verified
+      exact one-shot allow or deny to the originating Codex task;
+- [ ] hook timeout, daemon failure, malformed scope, and `apply_patch` preserve the normal local
+      approval prompt;
+- [ ] App Server file-change callback denial;
 - [ ] daemon restart or sideband loss during an active Realtime call, with both provider legs
       terminated and no tool-output replay;
 - [ ] proof that the original MCP waiter socket does not masquerade as surviving restart;

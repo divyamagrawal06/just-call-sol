@@ -1,0 +1,19 @@
+{
+  "description": "Call the owner when Codex needs a bounded permission decision.",
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "matcher": "^Bash$|^mcp__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agent-hotline-codex-hook",
+            "commandWindows": "agent-hotline-codex-hook",
+            "timeout": 660,
+            "statusMessage": "Calling your owner for approval"
+          }
+        ]
+      }
+    ]
+  }
+}

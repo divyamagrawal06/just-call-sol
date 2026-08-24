@@ -28,6 +28,19 @@ The daemon must be running:
 uv run agent-hotline serve
 ```
 
+## Automatic Codex permission calls
+
+The Codex plugin bundles a synchronous `PermissionRequest` hook. In a new Codex task, run
+`/hooks`, review it, and trust its current definition. When an ordinary Codex task is about to
+show a bounded `Bash` or MCP permission prompt, the hook calls the owner and waits for the
+structured result.
+
+Only a `resolved` approval from a verified identity whose durable instruction exactly matches the
+canonical request returns a one-shot `allow`. A verified denial returns `deny`. An unanswered,
+timed-out, failed, malformed, redacted, oversized, changed, or unsupported request returns no hook
+decision, so Codex shows its normal local approval prompt. The hook does not grant session or
+persistent policy access and does not auto-approve `apply_patch`.
+
 ## MCP tools
 
 | Tool | Purpose | Authority |
@@ -86,9 +99,9 @@ With the Codex App Server adapter enabled and roots allowlisted, an inbound voic
 The write operations require `HOTLINE_ALLOW_CODEX_WRITES=true`, exact server readback, a later
 owner response, a fresh keypad PIN, and a one-time action grant.
 
-App Server callbacks for exact command execution and turn-scoped permissions can ask the owner
-for a one-turn decision. File-change approval callbacks always decline because the current
-callback does not provide the complete patch needed for an exact readback.
+App Server callbacks for exact command execution and turn-scoped permissions can also ask the
+owner for a one-turn decision. App Server file-change approval callbacks always decline because
+that callback does not provide the complete patch needed for an exact readback.
 
 ## Claude capabilities
 

@@ -34,8 +34,13 @@
 - Never expose raw shell or generic execution.
 - Keep `HOTLINE_ALLOW_CODEX_WRITES` and `HOTLINE_ALLOW_REAL_RUNBOOKS` separate and off by
   default.
+- For a Codex `PermissionRequest` hook, return `allow` only for a verified resolved approval whose
+  durable instruction exactly equals the canonical bounded request. Return `deny` only for a
+  verified resolved denial. On every other result, emit no decision so the local prompt remains.
+- Never grant session or persistent scope from the phone hook. Abstain on `apply_patch`, unknown
+  tool shapes, lossy sanitization, oversized scopes, daemon failure, timeout, or no answer.
 - Treat built-in runbooks as mocks. No production infrastructure executor ships.
-- Always decline Codex file-change callbacks until the protocol supplies a complete,
+- Always decline Codex App Server file-change callbacks until the protocol supplies a complete,
   losslessly representable patch.
 
 ## Context and client boundaries

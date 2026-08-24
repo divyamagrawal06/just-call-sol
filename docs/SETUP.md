@@ -14,6 +14,12 @@ uv run agent-hotline init-secrets
 uv run agent-hotline install-clients --client all
 ```
 
+Start a new Codex task, run `/hooks`, review the bundled Agent Hotline `PermissionRequest` hook,
+and trust it. Codex skips unreviewed plugin command hooks. Keep the daemon running whenever you
+want ordinary Codex shell or MCP permission prompts to call the owner automatically. A verified
+exact response can allow or deny one invocation; an unresolved call simply leaves the normal
+local approval prompt in place. `apply_patch` approvals are intentionally left local.
+
 `init-secrets` stores six independent service secrets:
 
 - `HOTLINE_LOCAL_TOKEN`

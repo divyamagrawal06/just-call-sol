@@ -56,6 +56,7 @@ def test_wheel_and_sdist_contain_runtime_and_integration_assets(tmp_path: Path) 
         names = set(archive.namelist())
         _assert_no_removed_voice_or_demo_artifacts(names)
         assert "agent_hotline/mcp_server.py" in names
+        assert "agent_hotline/codex_hooks.py" in names
         assert "agent_hotline/cli.py" in names
         assert "agent_hotline/py.typed" in names
         assert "agent_hotline/dashboard_assets/index.html" in names
@@ -66,6 +67,7 @@ def test_wheel_and_sdist_contain_runtime_and_integration_assets(tmp_path: Path) 
             "agent_hotline/_distribution/plugins/agent-hotline/.codex-plugin/plugin.json" in names
         )
         assert "agent_hotline/_distribution/plugins/agent-hotline/.mcp.json" in names
+        assert "agent_hotline/_distribution/plugins/agent-hotline/hooks/hooks.json" in names
         assert (
             "agent_hotline/_distribution/plugins/agent-hotline/"
             "skills/agent-hotline/SKILL.md" in names
@@ -87,10 +89,12 @@ def test_wheel_and_sdist_contain_runtime_and_integration_assets(tmp_path: Path) 
         console_scripts = dict(parser["console_scripts"])
         assert console_scripts["agent-hotline"] == "agent_hotline.cli:app"
         assert console_scripts["agent-hotline-claude-hook"] == "agent_hotline.claude_hooks:main"
+        assert console_scripts["agent-hotline-codex-hook"] == "agent_hotline.codex_hooks:main"
         assert console_scripts["agent-hotline-mcp"] == "agent_hotline.mcp_server:main"
         assert set(console_scripts) == {
             "agent-hotline",
             "agent-hotline-claude-hook",
+            "agent-hotline-codex-hook",
             "agent-hotline-mcp",
         }
 

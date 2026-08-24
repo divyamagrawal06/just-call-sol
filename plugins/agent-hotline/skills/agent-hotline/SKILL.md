@@ -61,7 +61,11 @@ workspace, or state changes.
 
 - Codex task inspection is bounded to allowlisted roots.
 - Codex task writes require the separate default-off `HOTLINE_ALLOW_CODEX_WRITES` gate.
-- Codex file-change approval callbacks always decline.
+- The trusted Codex `PermissionRequest` hook may call automatically for bounded `Bash` and MCP
+  approvals. It can return only a verified exact one-shot allow or a verified denial; otherwise
+  leave the normal Codex prompt in place.
+- Codex App Server file-change approval callbacks always decline, and the hook abstains on
+  `apply_patch`.
 - Claude can call the owner through MCP but has no deep inbound session-control adapter.
 - Built-in runbooks are mocks; no real infrastructure runbooks ship.
 - Real runbook execution has its own default-off `HOTLINE_ALLOW_REAL_RUNBOOKS` gate.

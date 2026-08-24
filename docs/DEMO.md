@@ -105,9 +105,12 @@ The voice agent must:
 7. execute once and report the actual tool result;
 8. record the final instruction and action result for the waiting agent.
 
-Do not demo a file-change callback; it always declines by design. Do not claim to control AWS,
-databases, deployments, or batch systems: the repository ships no real infrastructure
-runbooks.
+For an automatic approval demo, first trust the plugin hook through `/hooks`, keep the daemon
+running, and make a normal Codex task request a bounded shell permission. The task should display
+`Calling your owner for approval`; a verified exact approval resumes that one invocation. A
+timeout or failed call should reveal the ordinary local prompt instead. Do not demo `apply_patch`;
+it stays local by design. Do not claim to control AWS, databases, deployments, or batch systems:
+the repository ships no real infrastructure runbooks.
 
 ## Abort conditions
 

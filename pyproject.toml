@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-hotline"
-version = "0.2.0"
+version = "0.2.0+codex.20260824132732"
 description = "A bidirectional voice control plane for Codex and Claude agents."
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
@@ -42,6 +42,7 @@ dev = [
 [project.scripts]
 agent-hotline = "agent_hotline.cli:app"
 agent-hotline-claude-hook = "agent_hotline.claude_hooks:main"
+agent-hotline-codex-hook = "agent_hotline.codex_hooks:main"
 agent-hotline-mcp = "agent_hotline.mcp_server:main"
 
 [tool.hatch.build.targets.wheel]
